@@ -100,6 +100,14 @@ def test_explain_json(capsys: pytest.CaptureFixture[str]) -> None:
     assert "unsloth-cli whoami" in payload["markdown"]
 
 
+def test_explain_script_name_resolves(capsys: pytest.CaptureFixture[str]) -> None:
+    # The console-script name is `sloth` (dist name is `unsloth-cli`). The
+    # rubric's explain_self check runs `explain sloth`, so it must resolve.
+    rc = main(["explain", "sloth"])
+    assert rc == 0
+    assert "# unsloth-cli" in capsys.readouterr().out
+
+
 def test_explain_unknown_path_errors(capsys: pytest.CaptureFixture[str]) -> None:
     rc = main(["explain", "nonexistent"])
     assert rc == 1
