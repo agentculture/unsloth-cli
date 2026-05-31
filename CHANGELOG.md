@@ -17,6 +17,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   to the root entry. The agent-first rubric's `explain_self` check runs
   `explain <console-script-name>` (the script is `sloth`, not `unsloth-cli`), so
   the alias is load-bearing — without it the `lint` job's rubric gate fails.
+- Fixed the README Quickstart, which told users to run `uv run unsloth-cli
+  whoami/learn` — commands that fail because the only installed console script is
+  `sloth`. The examples now use `uv run sloth <verb>`, with a note on the
+  `sloth` (script) vs `unsloth-cli` (dist / argparse prog) split.
 
 ## [0.1.3] - 2026-05-31
 

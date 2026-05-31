@@ -18,10 +18,14 @@ Agent + CLI that simplifies fine-tuning with Unsloth, adding complementary actio
 ```bash
 uv sync
 uv run pytest -n auto                 # run the test suite
-uv run unsloth-cli whoami  # identity from culture.yaml
-uv run unsloth-cli learn   # self-teaching prompt (add --json)
+uv run sloth whoami                   # identity from culture.yaml
+uv run sloth learn                    # self-teaching prompt (add --json)
 uv run teken cli doctor . --strict    # the agent-first rubric gate CI runs
 ```
+
+The installed console script is `sloth` (the dist name is `unsloth-cli`); run
+`sloth <verb>` or `python -m sloth <verb>`. The CLI prints `unsloth-cli` in its
+help/`explain` text because that is the argparse program name.
 
 ## CLI
 

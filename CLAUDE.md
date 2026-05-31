@@ -26,9 +26,9 @@ Three different names, used in three different places — do not conflate them:
 
 Consequence: the real invocations are **`uv run sloth <verb>`** or
 **`uv run python -m sloth <verb>`**. `uv run unsloth-cli <verb>` **fails**
-(no such script) — the README's `uv run unsloth-cli …` examples are wrong; the
-help/`explain` text only *prints* `unsloth-cli` because that's the argparse
-`prog`. When you read `unsloth-cli whoami` in docs/output, run `sloth whoami`.
+(no such script) — the help/`explain` text only *prints* `unsloth-cli` because
+that's the argparse `prog`. When you read `unsloth-cli whoami` in CLI output,
+run `sloth whoami`.
 
 ## Commands
 
