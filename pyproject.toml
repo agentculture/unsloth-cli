@@ -1,6 +1,6 @@
 [project]
 name = "unsloth-cli"
-version = "0.1.3"
+version = "0.1.4"
 description = "Agent + CLI that simplifies fine-tuning with Unsloth, adding complementary actions so an agent can fine-tune models more easily."
 readme = "README.md"
 license = "MIT"

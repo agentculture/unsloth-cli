@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-05-31
+
+### Changed
+
+- Re-initialized CLAUDE.md from the bootstrap seed into a full runtime prompt via /init: documents the `sloth` (package/console-script/import) vs `unsloth-cli` (dist/argparse-prog) naming split, the four CLI contracts (dispatch + CliError, stdout/stderr output split, exit-code policy, explain catalog), the register() seam for adding verbs/noun groups, the agent-first rubric gate rules, and the merge-gating conventions (version-bump-every-PR, SonarCloud gate, cite-don't-import skills, zero runtime deps).
+
 ## [0.1.3] - 2026-05-31
 
 ### Changed

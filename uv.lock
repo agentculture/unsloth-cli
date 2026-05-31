@@ -155,37 +155,6 @@ wheels = [
 ]
 
 [[package]]
-name = "unsloth-cli"
-version = "0.1.3"
-source = { editable = "." }
-
-[package.dev-dependencies]
-dev = [
-    { name = "bandit" },
-    { name = "black" },
-    { name = "flake8" },
-    { name = "isort" },
-    { name = "pytest" },
-    { name = "pytest-cov" },
-    { name = "pytest-xdist" },
-    { name = "teken" },
-]
-
-[package.metadata]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "bandit", specifier = ">=1.7.5" },
-    { name = "black", specifier = ">=23.7.0" },
-    { name = "flake8", specifier = ">=6.1" },
-    { name = "isort", specifier = ">=5.12.0" },
-    { name = "pytest", specifier = ">=8.0" },
-    { name = "pytest-cov", specifier = ">=4.1" },
-    { name = "pytest-xdist", specifier = ">=3.0" },
-    { name = "teken", specifier = ">=0.8" },
-]
-
-[[package]]
 name = "execnet"
 version = "2.1.2"
 source = { registry = "https://pypi.org/simple" }
@@ -475,4 +444,35 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/25/95/3c3eff8e550c1347c85f2ea70f4996d96e051e38f33eda97d66d1a76794f/teken-0.8.0.tar.gz", hash = "sha256:8db4d3f04ee545e4837686e9054c64326b0b2e847b39134c88a976734590d7c4", size = 146990, upload-time = "2026-05-22T19:47:54.876Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/00/2c/ca005d32831d883b10215a1ea31c32197a3a410f6d4ea3516b3d3c6a1183/teken-0.8.0-py3-none-any.whl", hash = "sha256:385a529df5a76adfff56ba5ae191a1bf8a5573f3698da4cc5bf7a2b5ca7cc311", size = 73189, upload-time = "2026-05-22T19:47:53.959Z" },
+]
+
+[[package]]
+name = "unsloth-cli"
+version = "0.1.4"
+source = { editable = "." }
+
+[package.dev-dependencies]
+dev = [
+    { name = "bandit" },
+    { name = "black" },
+    { name = "flake8" },
+    { name = "isort" },
+    { name = "pytest" },
+    { name = "pytest-cov" },
+    { name = "pytest-xdist" },
+    { name = "teken" },
+]
+
+[package.metadata]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "bandit", specifier = ">=1.7.5" },
+    { name = "black", specifier = ">=23.7.0" },
+    { name = "flake8", specifier = ">=6.1" },
+    { name = "isort", specifier = ">=5.12.0" },
+    { name = "pytest", specifier = ">=8.0" },
+    { name = "pytest-cov", specifier = ">=4.1" },
+    { name = "pytest-xdist", specifier = ">=3.0" },
+    { name = "teken", specifier = ">=0.8" },
 ]
