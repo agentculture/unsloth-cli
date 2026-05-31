@@ -119,6 +119,10 @@ itself (distinct from the global `overview`, which describes the agent).
 ENTRIES: dict[tuple[str, ...], str] = {
     (): _ROOT,
     ("unsloth-cli",): _ROOT,
+    # The console-script / package name is `sloth` (the dist name is
+    # `unsloth-cli`). The agent-first rubric's `explain_self` check runs
+    # `explain <script-name>`, i.e. `explain sloth`, so alias it to the root.
+    ("sloth",): _ROOT,
     ("whoami",): _WHOAMI,
     ("learn",): _LEARN,
     ("explain",): _EXPLAIN,

@@ -11,6 +11,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Re-initialized CLAUDE.md from the bootstrap seed into a full runtime prompt via /init: documents the `sloth` (package/console-script/import) vs `unsloth-cli` (dist/argparse-prog) naming split, the four CLI contracts (dispatch + CliError, stdout/stderr output split, exit-code policy, explain catalog), the register() seam for adding verbs/noun groups, the agent-first rubric gate rules, and the merge-gating conventions (version-bump-every-PR, SonarCloud gate, cite-don't-import skills, zero runtime deps).
 
+### Fixed
+
+- Added a `("sloth",)` alias to the `explain` catalog so `explain sloth` resolves
+  to the root entry. The agent-first rubric's `explain_self` check runs
+  `explain <console-script-name>` (the script is `sloth`, not `unsloth-cli`), so
+  the alias is load-bearing — without it the `lint` job's rubric gate fails.
+
 ## [0.1.3] - 2026-05-31
 
 ### Changed

@@ -98,10 +98,12 @@ the three sources (this file, `_errors.py`, the catalog text) in agreement.
 
 `explain <path>...` is a **global** verb (not nested under a noun) that resolves
 a path *tuple* against `catalog.py::ENTRIES` (verbatim markdown keyed by
-command-path tuples; `()` and `("unsloth-cli",)` both map to the root). Unknown
-paths raise `CliError`. **Every registered verb/noun must have a catalog entry**
-— `tests/test_cli.py::test_every_catalog_path_resolves` walks `known_paths()`
-and the rubric checks coverage.
+command-path tuples; `()`, `("unsloth-cli",)`, and `("sloth",)` all map to the
+root). Unknown paths raise `CliError`. **Every registered verb/noun must have a
+catalog entry** — `tests/test_cli.py::test_every_catalog_path_resolves` walks
+`known_paths()` and the rubric checks coverage. The `("sloth",)` alias is
+load-bearing: the rubric's `explain_self` check runs `explain <console-script>`,
+i.e. `explain sloth`, so dropping it turns the lint gate red.
 
 ### Adding a verb or noun group (the main extension seam)
 
