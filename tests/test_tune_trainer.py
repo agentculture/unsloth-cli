@@ -241,6 +241,11 @@ class TestRealFlowWithFakes:
         backend, events = _make_fake_backend()
         monkeypatch.setattr(_trainer, "_load_backend", lambda: backend)
 
+        # Inject a fake ``datasets`` module so the lazy ``from datasets import Dataset``
+        # inside _run_real resolves without needing the real (heavy) package installed.
+        fake_module, _, _ = _fake_datasets_module()
+        monkeypatch.setitem(sys.modules, "datasets", fake_module)
+
         result = run_training(config, dry_run=False)
 
         # model loaded with the configured base model
@@ -305,7 +310,12 @@ def _fake_datasets_module():
 
 
 class TestDatasetWrapping:
-    """_run_real must wrap train_records with Dataset.from_list before SFTTrainer."""
+    """_run_real must wrap train_records with Dataset.from_list before SFTTrainer.
+
+    H1 coverage (issue #9): these tests confirm the Dataset.from_list wrapping half of
+    honesty condition h1 — that ``_run_real`` passes a ``datasets.Dataset`` (not a raw
+    ``list[dict]``) to ``SFTTrainer``.  Do NOT duplicate; they already cover this fully.
+    """
 
     def test_sft_trainer_receives_dataset_wrapped_value(self, tmp_path: Path, monkeypatch) -> None:
         config = _config(tmp_path)
@@ -352,7 +362,13 @@ class TestDatasetWrapping:
 
 
 class TestNoAcceleratorError:
-    """NotImplementedError from the ML backend must surface as CliError(code=2)."""
+    """NotImplementedError from the ML backend must surface as CliError(code=2).
+
+    H1 coverage (issue #9): these tests cover the ``_run_real`` side of honesty condition h1
+    — specifically that a ``NotImplementedError("cannot find any torch accelerator")`` maps
+    to ``CliError.code == 2`` with the NGC container image in the remediation string.
+    Do NOT duplicate; they already cover this fully.
+    """
 
     def _make_no_gpu_backend(self) -> SimpleNamespace:
         """Backend whose model-load raises the unsloth no-accelerator error."""
