@@ -14,10 +14,16 @@ Flow::
    (model, method) request. An out-of-scope request (e.g. full fine-tuning of a
    large dense model) emits its warning EXPLICITLY to stderr via
    :func:`emit_diagnostic` and is then hard-refused with ``CliError(code=1)``.
-4. **dry-run | train** — :func:`~sloth.tune._trainer.run_training` resolves the
-   plan. ``--dry-run`` returns the plan without importing torch; a real run
-   delegates to the trainer, which loads the backend, trains the adapter, and
-   writes ``training_metadata.json`` next to the adapter output.
+4. **dry-run | train** — three branches depending on execution context:
+
+   * ``--dry-run``: resolve the plan on the host (no GPU, no docker) and also
+     print the docker command that would run the real job.
+   * ``--in-container`` (hidden, recursion guard): running *inside* the NGC
+     container — delegates directly to :func:`~sloth.tune._trainer.run_training`
+     without launching another container.
+   * default (host real run): call :func:`~sloth.tune.container.launch` to
+     orchestrate the NGC container, forwarding the same args plus
+     ``--in-container``.
 
 This module imports no torch/unsloth — the heavy stack lives only inside the
 trainer's ``_load_backend`` seam, lazily. Importing ``train`` stays torch-free.
@@ -39,6 +45,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import sloth.tune.container as container_mod
 from sloth.cli._errors import EXIT_USER_ERROR, CliError
 from sloth.cli._output import emit_diagnostic, emit_result
 from sloth.tune._trainer import run_training
@@ -125,10 +132,28 @@ def _render_plan_text(plan: dict[str, Any]) -> str:
 def cmd_train(args: argparse.Namespace) -> int:
     """Handler for ``sloth train``.
 
-    Returns ``0`` on success; every failure raises :class:`CliError`.
+    Branching logic after the host-side GPU-free preflight (steps 1–3):
+
+    * **dry-run** (``--dry-run``): resolves the plan without any GPU work and
+      prints the docker command that would launch the real job.  Returns ``0``.
+    * **in-container** (``--in-container``, hidden recursion guard): running
+      *inside* the NGC container — calls :func:`run_training` directly.  Returns
+      ``0`` on success.
+    * **host real run** (default): validates on the host, then calls
+      :func:`container_mod.launch` to orchestrate the NGC container, forwarding
+      the same train args plus ``--in-container``.  Returns the container's exit
+      code.
+
+    Every failure raises :class:`CliError`.
     """
     json_mode = bool(getattr(args, "json", False))
     dry_run = bool(getattr(args, "dry_run", False))
+    in_container = bool(getattr(args, "in_container", False))
+
+    # -------------------------------------------------------------------
+    # Steps 1–3: host-side GPU-free preflight — always runs, so bad
+    # configs / datasets / scope are caught before any docker or GPU work.
+    # -------------------------------------------------------------------
 
     # 1) Load + validate the run config (CliError propagates on bad/missing file).
     config = load_config(args.config)
@@ -150,15 +175,51 @@ def cmd_train(args: argparse.Namespace) -> int:
             ),
         )
 
-    # 4) Resolve the plan (dry-run) or run the real job (delegates to the trainer,
-    #    which loads the backend, trains, and writes metadata next to the adapter).
-    plan = run_training(config, dry_run=dry_run)
+    # -------------------------------------------------------------------
+    # Step 4 — branch on execution context
+    # -------------------------------------------------------------------
 
+    # 4a) Dry-run: resolve the plan on the host; also show the docker command.
+    if dry_run:
+        plan = run_training(config, dry_run=True)
+        config_path = Path(args.config).resolve()
+        workdir = config_path.parent
+        config_in_container = str(Path(container_mod.WORKDIR_MOUNT) / config_path.name)
+        dry_run_args: list[str] = ["train", "--config", config_in_container, "--in-container"]
+        if json_mode:
+            dry_run_args.append("--json")
+        checkout = Path(__file__).resolve().parents[3]
+        cmd = container_mod.build_command(dry_run_args, workdir=workdir, checkout=checkout)
+        if json_mode:
+            result: dict[str, Any] = dict(plan)
+            result["docker_image"] = container_mod.NGC_IMAGE
+            result["docker_command"] = cmd
+            emit_result(result, json_mode=True)
+        else:
+            text = _render_plan_text(plan)
+            text += f"\ndocker-image:   {container_mod.NGC_IMAGE}"
+            text += f"\ndocker-command: {' '.join(cmd)}"
+            emit_result(text, json_mode=False)
+        return 0
+
+    # 4b) In-container: recursion guard — run the real trainer, no docker launch.
+    if in_container:
+        plan = run_training(config, dry_run=False)
+        if json_mode:
+            emit_result(plan, json_mode=True)
+        else:
+            emit_result(_render_plan_text(plan), json_mode=False)
+        return 0
+
+    # 4c) Host real run: orchestrate via the NGC container.
+    config_path = Path(args.config).resolve()
+    workdir = config_path.parent
+    config_in_container = str(Path(container_mod.WORKDIR_MOUNT) / config_path.name)
+    sloth_args: list[str] = ["train", "--config", config_in_container, "--in-container"]
     if json_mode:
-        emit_result(plan, json_mode=True)
-    else:
-        emit_result(_render_plan_text(plan), json_mode=False)
-    return 0
+        sloth_args.append("--json")
+    checkout = Path(__file__).resolve().parents[3]
+    return container_mod.launch(sloth_args, workdir=workdir, checkout=checkout)
 
 
 # ---------------------------------------------------------------------------
@@ -188,4 +249,10 @@ def register(sub: argparse._SubParsersAction) -> None:
         help="Validate and resolve the plan without importing torch or training.",
     )
     p.add_argument("--json", action="store_true", help="Emit structured JSON.")
+    p.add_argument(
+        "--in-container",
+        dest="in_container",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     p.set_defaults(func=cmd_train)
