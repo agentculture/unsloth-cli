@@ -36,15 +36,31 @@ import pytest
 def _cuda_available() -> bool:
     """Return True only when a CUDA GPU is accessible.
 
-    torch is imported lazily (inside this function body only) so the module
-    can be *collected* on CPU-only machines and the tests appear as SKIPPED
-    rather than ERROR at collection time.
+    The CUDA check runs in a *subprocess* so that torch is never imported into
+    this (the test) interpreter — importing torch at collection time would
+    leave it in ``sys.modules`` and break the import-light invariants asserted
+    by ``test_packaging_import_light`` and ``test_tune_datasets``. We first use
+    ``find_spec`` (which does not import the module) to skip the subprocess
+    entirely when torch is not even installed (the CPU-only CI case).
     """
-    try:
-        import torch  # noqa: PLC0415 — intentional lazy import
+    import importlib.util  # noqa: PLC0415 — local to keep module import-light
+    import subprocess  # noqa: PLC0415
+    import sys  # noqa: PLC0415
 
-        return torch.cuda.is_available()
-    except Exception:  # noqa: BLE001 — ImportError, RuntimeError, or anything else
+    if importlib.util.find_spec("torch") is None:
+        return False
+    try:
+        result = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            [
+                sys.executable,
+                "-c",
+                "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)",
+            ],
+            timeout=120,
+            capture_output=True,
+        )
+        return result.returncode == 0
+    except Exception:  # noqa: BLE001 — subprocess failure / timeout → treat as no GPU
         return False
 
 
