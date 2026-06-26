@@ -64,9 +64,12 @@ def _argv_has_json(argv: list[str] | None) -> bool:
 def _build_parser() -> argparse.ArgumentParser:
     from sloth.cli._commands import cli as _cli_group
     from sloth.cli._commands import doctor as _doctor_cmd
+    from sloth.cli._commands import eval as _eval_cmd
     from sloth.cli._commands import explain as _explain_cmd
+    from sloth.cli._commands import export as _export_cmd
     from sloth.cli._commands import learn as _learn_cmd
     from sloth.cli._commands import overview as _overview_cmd
+    from sloth.cli._commands import train as _train_cmd
     from sloth.cli._commands import whoami as _whoami_cmd
 
     parser = _CliArgumentParser(
@@ -88,6 +91,11 @@ def _build_parser() -> argparse.ArgumentParser:
     _overview_cmd.register(sub)
     _doctor_cmd.register(sub)
     _cli_group.register(sub)
+    # Fine-tuning verbs (issue #6): validate → train an adapter, eval it, export it.
+    # Their modules keep torch/unsloth lazy, so registering them here stays torch-free.
+    _train_cmd.register(sub)
+    _eval_cmd.register(sub)
+    _export_cmd.register(sub)
     # Register your own noun groups here:
     #   from sloth.cli._commands import my_noun as _my_noun_group
     #   _my_noun_group.register(sub)
