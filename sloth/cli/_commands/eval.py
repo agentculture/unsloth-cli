@@ -62,7 +62,7 @@ def _repo_root() -> Path:
 # ---------------------------------------------------------------------------
 
 
-def cmd_eval(args: argparse.Namespace) -> int:
+def cmd_eval(args: argparse.Namespace) -> int | None:
     """Handler for ``sloth eval``.
 
     On the **host** (``--in-container`` not set): validates the adapter directory
@@ -71,8 +71,9 @@ def cmd_eval(args: argparse.Namespace) -> int:
     ``--in-container`` to prevent recursion).  Identity bind-mounts are added for
     the parent directories of the adapter and suite paths so the host-absolute
     paths forwarded in sloth_args resolve unchanged inside the container.
-    Returns ``0`` on success; :class:`CliError` is raised (and propagated) on any
-    container failure — ``launch()`` raises rather than returning a non-zero int.
+    Returns ``None`` on success (implicit fall-through); :class:`CliError` is
+    raised (and propagated) on any container failure — ``launch()`` raises rather
+    than returning a non-zero int.
 
     **Inside the container** (``--in-container`` is set): validates inputs, calls
     :func:`~sloth.tune._trainer.run_eval` (the ML seam), and emits results via the
@@ -86,8 +87,8 @@ def cmd_eval(args: argparse.Namespace) -> int:
 
     Returns
     -------
-    int
-        ``0`` on success.  Failures raise :class:`CliError`.
+    int | None
+        ``None`` on success.  Failures raise :class:`CliError`.
     """
     json_mode = bool(getattr(args, "json", False))
     in_container = bool(getattr(args, "in_container", False))
@@ -141,7 +142,7 @@ def cmd_eval(args: argparse.Namespace) -> int:
             checkout=str(_repo_root()),
             extra_mounts=extra_mounts,
         )
-        return 0
+        return
 
     # --- IN-CONTAINER PATH: delegate to the ML seam -------------------------
     # run_eval lazy-imports torch/transformers/peft inside its body; this
@@ -165,8 +166,6 @@ def cmd_eval(args: argparse.Namespace) -> int:
             mark = "[ok]" if r["exact_match"] else "[fail]"
             lines.append(f"  {mark} #{r['index']} {r['task']!r}")
         emit_result("\n".join(lines), json_mode=False)
-
-    return 0
 
 
 # ---------------------------------------------------------------------------

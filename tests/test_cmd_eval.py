@@ -212,7 +212,7 @@ def test_eval_text_output_contains_summary(
     monkeypatch.setattr(eval_mod, "run_eval", _fake_run_eval_perfect)
     args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), in_container=True)
     rc = cmd_eval(args)
-    assert rc == 0
+    assert rc in (None, 0)
     out = capsys.readouterr().out
     assert "total" in out
     assert "exact" in out
@@ -250,7 +250,7 @@ def test_eval_json_output_structure(
     monkeypatch.setattr(eval_mod, "run_eval", _fake_run_eval_perfect)
     args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), json=True, in_container=True)
     rc = cmd_eval(args)
-    assert rc == 0
+    assert rc in (None, 0)
     out = capsys.readouterr().out
     data = json.loads(out)
     assert data["total"] == 2
@@ -345,7 +345,7 @@ def test_no_network_access_with_mocked_run_eval(
 
     args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), in_container=True)
     rc = cmd_eval(args)
-    assert rc == 0  # completed without touching the network
+    assert rc in (None, 0)  # completed without touching the network
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +374,7 @@ def test_in_container_calls_run_eval(
 
     args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), in_container=True)
     rc = cmd_eval(args)
-    assert rc == 0
+    assert rc in (None, 0)
     assert len(calls) == 1, "run_eval must be called exactly once"
     assert calls[0][0] == str(tmp_adapter)
     assert calls[0][1] == str(tmp_suite)
@@ -419,7 +419,7 @@ def test_host_routes_to_container_launch(
     args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), in_container=False)
     rc = cmd_eval(args)
 
-    assert rc == 0
+    assert rc in (None, 0)
     assert len(launch_calls) == 1, "container.launch must be called exactly once"
 
     forwarded = launch_calls[0]["sloth_args"]
@@ -460,15 +460,15 @@ def test_host_returns_0_on_launch_success(
     tmp_suite: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """cmd_eval returns 0 when container.launch succeeds (returns 0).
+    """cmd_eval returns None when container.launch succeeds.
 
-    FIX 1+2: launch() raises on failure; on success it returns 0 and the
-    handler returns 0.
+    FIX 1+2: launch() raises on failure; on success the handler falls through
+    (implicit None return) — no explicit return value.
     """
     monkeypatch.setattr(eval_mod.container, "launch", lambda *a, **kw: 0)
     args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), in_container=False)
     rc = cmd_eval(args)
-    assert rc == 0
+    assert rc in (None, 0)
 
 
 def test_host_propagates_launch_cli_error(
@@ -526,7 +526,7 @@ def test_host_extra_mounts_cover_adapter_and_suite_parents(
 
     args = _make_args(adapter=str(adapter_dir), suite=str(suite_file), in_container=False)
     rc = cmd_eval(args)
-    assert rc == 0
+    assert rc in (None, 0)
 
     extra_mounts = captured.get("extra_mounts") or []
     mounted_container_paths = {ct for _, ct in extra_mounts}
@@ -563,7 +563,7 @@ def test_in_container_does_not_call_launch(
 
     args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), in_container=True)
     rc = cmd_eval(args)
-    assert rc == 0
+    assert rc in (None, 0)
 
 
 # ---------------------------------------------------------------------------

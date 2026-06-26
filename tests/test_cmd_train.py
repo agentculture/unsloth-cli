@@ -107,7 +107,7 @@ def good_config(tmp_path: Path) -> Path:
 def test_dry_run_text_plan(good_config: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """Dry-run prints a human-readable resolved plan to stdout and exits 0."""
     rc = cmd_train(_make_args(good_config, dry_run=True))
-    assert rc == 0
+    assert rc in (None, 0)
     out = capsys.readouterr().out
     assert "unsloth/Qwen3-4B" in out
     assert "qlora" in out
@@ -119,7 +119,7 @@ def test_dry_run_text_plan(good_config: Path, capsys: pytest.CaptureFixture[str]
 def test_dry_run_json_plan(good_config: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """Dry-run with --json emits the same plan as a structured JSON object."""
     rc = cmd_train(_make_args(good_config, dry_run=True, json_mode=True))
-    assert rc == 0
+    assert rc in (None, 0)
     payload = json.loads(capsys.readouterr().out)
     assert payload["model"] == "unsloth/Qwen3-4B"
     assert payload["method"] == "qlora"
@@ -143,7 +143,7 @@ def test_dry_run_does_not_load_backend(good_config: Path, monkeypatch: pytest.Mo
 
     monkeypatch.setattr(trainer_mod, "_load_backend", _boom)
     rc = cmd_train(_make_args(good_config, dry_run=True))
-    assert rc == 0
+    assert rc in (None, 0)
 
 
 def test_dry_run_imports_no_torch_in_fresh_process(good_config: Path) -> None:
@@ -157,7 +157,7 @@ def test_dry_run_imports_no_torch_in_fresh_process(good_config: Path) -> None:
         "import sys, argparse;"
         "from sloth.cli._commands.train import cmd_train;"
         f"rc = cmd_train(argparse.Namespace(config=r'{good_config}', dry_run=True, json=True));"
-        "assert rc == 0, rc;"
+        "assert rc in (None, 0), rc;"
         "assert 'torch' not in sys.modules, 'torch imported during dry-run';"
         "assert 'unsloth' not in sys.modules, 'unsloth imported during dry-run';"
         "print('PASS')"
@@ -190,7 +190,7 @@ def test_dry_run_prints_docker_image_no_container_calls(
     monkeypatch.setattr(container_mod, "preflight", mock_preflight)
 
     rc = cmd_train(_make_args(good_config, dry_run=True))
-    assert rc == 0
+    assert rc in (None, 0)
     mock_launch.assert_not_called()
     mock_preflight.assert_not_called()
     out = capsys.readouterr().out
@@ -207,7 +207,7 @@ def test_dry_run_json_includes_docker_image_and_command(
     monkeypatch.setattr(container_mod, "preflight", Mock())
 
     rc = cmd_train(_make_args(good_config, dry_run=True, json_mode=True))
-    assert rc == 0
+    assert rc in (None, 0)
     payload = json.loads(capsys.readouterr().out)
     assert payload["docker_image"] == container_mod.NGC_IMAGE
     assert isinstance(payload["docker_command"], list)
@@ -431,7 +431,7 @@ def test_host_real_run_calls_container_launch(
     monkeypatch.setattr(container_mod, "launch", mock_launch)
 
     rc = cmd_train(_make_args(good_config, dry_run=False))
-    assert rc == 0
+    assert rc in (None, 0)
     mock_launch.assert_called_once()
     # The forwarded args must include --in-container to prevent docker recursion.
     call_args = mock_launch.call_args
@@ -444,10 +444,10 @@ def test_host_real_run_calls_container_launch(
 def test_host_real_run_returns_0_on_launch_success(
     good_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """cmd_train returns 0 when container.launch succeeds (returns 0)."""
+    """cmd_train returns None when container.launch succeeds."""
     monkeypatch.setattr(container_mod, "launch", Mock(return_value=0))
     rc = cmd_train(_make_args(good_config, dry_run=False))
-    assert rc == 0
+    assert rc in (None, 0)
 
 
 def test_host_real_run_propagates_launch_cli_error(
@@ -523,7 +523,7 @@ def test_host_real_run_extra_mounts_cover_config_dataset_output(
     monkeypatch.setattr(container_mod, "launch", _capture_launch)
 
     rc = cmd_train(_make_args(toml_path, dry_run=False))
-    assert rc == 0
+    assert rc in (None, 0)
 
     extra_mounts = captured.get("extra_mounts") or []
     mounted_container_paths = {ct for _, ct in extra_mounts}
@@ -571,7 +571,7 @@ def test_in_container_calls_run_training_not_launch(
     monkeypatch.setattr(train_mod, "run_training", lambda *_a, **_k: fake_result)
 
     rc = cmd_train(_make_args(good_config, dry_run=False, in_container=True))
-    assert rc == 0
+    assert rc in (None, 0)
     mock_launch.assert_not_called()
     out = capsys.readouterr().out
     assert "trained" in out or "training_metadata.json" in out
@@ -599,7 +599,7 @@ def test_in_container_json_delegates_to_run_training(
     monkeypatch.setattr(train_mod, "run_training", lambda *_a, **_k: fake_result)
 
     rc = cmd_train(_make_args(good_config, dry_run=False, json_mode=True, in_container=True))
-    assert rc == 0
+    assert rc in (None, 0)
     mock_launch.assert_not_called()
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "trained"
@@ -635,7 +635,7 @@ def test_real_run_delegates_to_run_training(
 
     monkeypatch.setattr(train_mod, "run_training", _fake_run_training)
     rc = cmd_train(_make_args(good_config, dry_run=False, in_container=True))
-    assert rc == 0
+    assert rc in (None, 0)
     assert len(calls) == 1
     assert calls[0]["dry_run"] is False
     assert calls[0]["config"].model == "unsloth/Qwen3-4B"
@@ -665,7 +665,7 @@ def test_real_run_json_surfaces_metadata_path(
 
     monkeypatch.setattr(train_mod, "run_training", _fake_run_training)
     rc = cmd_train(_make_args(good_config, dry_run=False, json_mode=True, in_container=True))
-    assert rc == 0
+    assert rc in (None, 0)
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "trained"
     assert payload["metadata_path"].endswith("training_metadata.json")

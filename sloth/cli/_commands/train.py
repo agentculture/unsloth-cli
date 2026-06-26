@@ -49,7 +49,7 @@ import sloth.tune.container as container_mod
 from sloth.cli._errors import EXIT_USER_ERROR, CliError
 from sloth.cli._output import emit_diagnostic, emit_result
 from sloth.tune._trainer import run_training
-from sloth.tune.config import load_config
+from sloth.tune.config import RunConfig, load_config
 from sloth.tune.datasets import detect_schema, validate_dataset
 from sloth.tune.scope import check_scope
 
@@ -125,24 +125,69 @@ def _render_plan_text(plan: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Container invocation resolver (shared by dry-run and host real-run)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_container_invocation(
+    config_path: Path, config: RunConfig, json_mode: bool
+) -> tuple[Path, list[tuple[str, str]], list[str]]:
+    """Resolve absolute paths and build the container invocation components.
+
+    Returns *(config_dir, extra_mounts, sloth_args)* for use in both the
+    dry-run (passed to :func:`~sloth.tune.container.build_command`) and the
+    host real-run (passed to :func:`~sloth.tune.container.launch`) branches,
+    so both branches produce an identical docker command.
+
+    ``sloth_args`` is ``["train", "--config", <abs-config-path>, "--in-container"]``
+    (plus ``"--json"`` when *json_mode* is set).  Passing the absolute config
+    path together with identity mounts (``host_path == container_path``) means
+    the path resolves unchanged inside the container without any
+    ``/workspace/<name>`` rewriting.
+    """
+    config_dir = config_path.parent
+
+    # Resolve dataset and output to absolute paths (TOML values may be relative;
+    # the convention is relative-to-config-dir, not relative-to-CWD).
+    dataset_path = Path(config.dataset)
+    if not dataset_path.is_absolute():
+        dataset_path = (config_dir / dataset_path).resolve()
+    output_path = Path(config.output)
+    if not output_path.is_absolute():
+        output_path = (config_dir / output_path).resolve()
+
+    # Identity mounts so host-absolute paths forwarded in sloth_args resolve
+    # unchanged inside the container (host_path == container_path).
+    mount_parents = {config_path.parent, dataset_path.parent, output_path.parent}
+    extra_mounts: list[tuple[str, str]] = [(str(p), str(p)) for p in mount_parents]
+
+    # Forward the ABSOLUTE config path; identity mounts make it resolve inside
+    # the container without rewriting to /workspace.
+    sloth_args: list[str] = ["train", "--config", str(config_path), "--in-container"]
+    if json_mode:
+        sloth_args.append("--json")
+
+    return config_dir, extra_mounts, sloth_args
+
+
+# ---------------------------------------------------------------------------
 # Command handler
 # ---------------------------------------------------------------------------
 
 
-def cmd_train(args: argparse.Namespace) -> int:
+def cmd_train(args: argparse.Namespace) -> int | None:
     """Handler for ``sloth train``.
 
     Branching logic after the host-side GPU-free preflight (steps 1–3):
 
     * **dry-run** (``--dry-run``): resolves the plan without any GPU work and
-      prints the docker command that would launch the real job.  Returns ``0``.
+      prints the docker command that would launch the real job.  Returns ``None``.
     * **in-container** (``--in-container``, hidden recursion guard): running
       *inside* the NGC container — calls :func:`run_training` directly.  Returns
-      ``0`` on success.
+      ``None`` on success.
     * **host real run** (default): validates on the host, then calls
       :func:`container_mod.launch` to orchestrate the NGC container, forwarding
-      the same train args plus ``--in-container``.  Returns the container's exit
-      code.
+      the same train args plus ``--in-container``.  Returns ``None`` on success.
 
     Every failure raises :class:`CliError`.
     """
@@ -183,13 +228,13 @@ def cmd_train(args: argparse.Namespace) -> int:
     if dry_run:
         plan = run_training(config, dry_run=True)
         config_path = Path(args.config).resolve()
-        workdir = config_path.parent
-        config_in_container = str(Path(container_mod.WORKDIR_MOUNT) / config_path.name)
-        dry_run_args: list[str] = ["train", "--config", config_in_container, "--in-container"]
-        if json_mode:
-            dry_run_args.append("--json")
+        config_dir, extra_mounts, sloth_args = _resolve_container_invocation(
+            config_path, config, json_mode
+        )
         checkout = Path(__file__).resolve().parents[3]
-        cmd = container_mod.build_command(dry_run_args, workdir=workdir, checkout=checkout)
+        cmd = container_mod.build_command(
+            sloth_args, workdir=config_dir, checkout=checkout, extra_mounts=extra_mounts
+        )
         if json_mode:
             result: dict[str, Any] = dict(plan)
             result["docker_image"] = container_mod.NGC_IMAGE
@@ -200,7 +245,7 @@ def cmd_train(args: argparse.Namespace) -> int:
             text += f"\ndocker-image:   {container_mod.NGC_IMAGE}"
             text += f"\ndocker-command: {' '.join(cmd)}"
             emit_result(text, json_mode=False)
-        return 0
+        return
 
     # 4b) In-container: recursion guard — run the real trainer, no docker launch.
     if in_container:
@@ -209,37 +254,18 @@ def cmd_train(args: argparse.Namespace) -> int:
             emit_result(plan, json_mode=True)
         else:
             emit_result(_render_plan_text(plan), json_mode=False)
-        return 0
+        return
 
     # 4c) Host real run: orchestrate via the NGC container.
     config_path = Path(args.config).resolve()
-    config_dir = config_path.parent
-
-    # Resolve dataset and output to absolute paths (TOML values may be relative;
-    # the convention is relative-to-config-dir, not relative-to-CWD).
-    dataset_path = Path(config.dataset)
-    if not dataset_path.is_absolute():
-        dataset_path = (config_dir / dataset_path).resolve()
-    output_path = Path(config.output)
-    if not output_path.is_absolute():
-        output_path = (config_dir / output_path).resolve()
-
-    # Identity mounts so host-absolute paths forwarded in sloth_args resolve
-    # unchanged inside the container (host_path == container_path).
-    mount_parents = {config_path.parent, dataset_path.parent, output_path.parent}
-    extra_mounts = [(str(p), str(p)) for p in mount_parents]
-
-    # Forward the ABSOLUTE config path; identity mounts make it resolve inside
-    # the container without rewriting to /workspace.
-    sloth_args: list[str] = ["train", "--config", str(config_path), "--in-container"]
-    if json_mode:
-        sloth_args.append("--json")
+    config_dir, extra_mounts, sloth_args = _resolve_container_invocation(
+        config_path, config, json_mode
+    )
     checkout = Path(__file__).resolve().parents[3]
-    # launch() raises CliError on any non-zero container exit; returns 0 on success.
+    # launch() raises CliError on any non-zero container exit; success falls through.
     container_mod.launch(
         sloth_args, workdir=str(config_dir), checkout=checkout, extra_mounts=extra_mounts
     )
-    return 0
 
 
 # ---------------------------------------------------------------------------
