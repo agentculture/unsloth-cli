@@ -13,7 +13,8 @@ agent-first CLI of *introspection* verbs (`whoami`, `learn`, `explain`,
 `overview`, `doctor`, `cli`) cited from teken's `python-cli` reference, a mesh
 identity, the vendored skill kit, and the CI/deploy baseline — but **no Unsloth
 fine-tuning verbs exist yet.** Building those is the main forward work, and the
-"Adding a verb or noun group" section below is the seam to do it through.
+"Adding a verb or noun group" section below is the seam to do it through — the
+**forward work** section distills issue #6's design constraints for those verbs.
 
 ## Naming: `sloth` vs `unsloth-cli` (read this first)
 
@@ -140,6 +141,42 @@ a single info check and exits 0. `doctor` reuses this to verify the
 **skills-present** check, emitting the rubric-shaped
 `{healthy, checks: [{id, passed, severity, message, remediation}]}`.
 
+## The forward work — Unsloth fine-tuning verbs (issue #6)
+
+The repo's reason to exist is a Spark-friendly **adapter-tuning** workflow for
+Qwen models — *not* full fine-tuning.
+[Issue #6](https://github.com/agentculture/unsloth-cli/issues/6) is the spec;
+build it through the "Adding a verb or noun group" seam above. The load-bearing
+decisions there:
+
+- **Scope is LoRA / QLoRA adapters**, small models first (Qwen 3.x 4B/9B) then
+  larger local adapters (Qwen 3.6 27B dense, Qwen coder variants). The CLI must
+  *explicitly warn* that full fine-tuning of large dense models is out of scope.
+- **Three planned verbs.** `train` (validate JSONL → run a small LoRA/QLoRA job
+  → write training metadata next to the adapter output), `eval` (run an adapter
+  against a small local eval suite), `export` (adapter → safetensors). Config
+  files drive repeatable runs; document Spark-friendly defaults.
+- **Two dataset schemas, validated *before* spending GPU**: a **chat** format
+  (`{"messages":[{role,content}, ...]}`) and a **task** format
+  (`{"task","input","expected_output"}`).
+- **Role-specific adapters, not one mixed blob** — e.g. `culture-contract-lora`,
+  `agentculture-cli-teacher-lora`, `repo-maintainer-lora`, `issue-writer-lora`,
+  `tool-router-lora`, `agent-first-coach-lora`.
+- **The fine-tune vs. retrieval boundary is a design rule, not a footnote.**
+  Fine-tuning stores *stable behavior/reflexes* (CLI-contract discipline,
+  AgentCulture/CULTURE.DEV terminology, agent-first habits, issue-writing format,
+  teacher behavior for `learn`). Memory/RAG stores *changing facts* (project
+  state, secrets, user-specific memory). The README must explain this split.
+
+**Critical constraint:** Unsloth/torch are heavy and GPU-bound, but
+`dependencies = []` is load-bearing (see "Zero runtime dependencies"). The ML
+stack must arrive as an **optional extra** (e.g. a `train` entry under
+`[project.optional-dependencies]`) or be invoked as an external subprocess
+resolved via `shutil.which` — never a hard top-level import. The introspection
+CLI has to keep working on a machine with no GPU and no torch. These verbs also
+connect to siblings: `lobes` serves the resulting models locally and `colleague`
+runs model backends (see the ecosystem map below).
+
 ## The agent-first rubric gate (must stay green)
 
 CI runs `uv run teken cli doctor . --strict` (the "afi rubric gate"). It is a
@@ -215,3 +252,23 @@ stores and merges. Don't store what the repo already records (code structure,
 git history, what's already in this file or `CHANGELOG.md`) — store what you'd
 have to re-derive. These are the `recall`/`remember` skills (`.claude/skills/`),
 backed by the `eidetic` store.
+
+## AgentCulture sibling ecosystem
+
+unsloth-cli is one **sibling** in the [AgentCulture](https://github.com/agentculture)
+mesh: it wears the shape `steward` defines and pulls its tooling/skills from the
+other siblings. When a task points outside this repo, route it to the owner —
+and use the `communicate` skill (issues via `agtag`, mesh messages) to reach
+them. Most siblings are checked out next to this repo under `../`.
+
+| Sibling | Owns | Touches this repo as |
+|---------|------|----------------------|
+| **agentfront** (was `teken`, was `afi-cli`) | The agent-first runtime + the rubric that `… cli doctor` enforces | The cited CLI source + the dev-only rubric gate. **Renamed:** the tool is now `agentfront`, but this repo still pins `teken>=0.8` (the deprecated alias) and CI runs `teken cli doctor`. Either name works today; expect the pin to migrate to `agentfront`. |
+| **steward** | Agent *alignment* — the sibling-pattern baseline + `steward doctor` | `doctor` here reproduces steward's invariants; `docs/steward/steward-suggestions.md` is its generated report (current finding: add the `ask-colleague` skill). |
+| **guildmaster** | The skills *supplier/manager* | Source of the 11 vendored `.claude/skills/` (provenance in `docs/skill-sources.md`). |
+| **devague** | The think → spec-to-plan → assign-to-workforce planning chain | True origin of those three skills (re-broadcast via guildmaster). |
+| **devex** | The PR-lifecycle CLI (`devex pr`) | What the `cicd` skill delegates to; needs `devex>=0.21` on PATH. |
+| **agtag** | Issue I/O (`agtag issue`) | What the `communicate` skill wraps; needs `agtag>=0.1` on PATH. |
+| **lobes** (`lobes-cli`) | Runs / assesses / switches the local OpenAI-compatible vLLM model the mesh consumes | Will serve the models the planned fine-tune verbs produce. |
+| **colleague** | A swappable coder-agent harness — one runtime, many model backends | Supplies the recommended-but-missing `ask-colleague` skill (per steward's report); a downstream consumer of trained adapters. |
+| **culture / daria** | The IRC agent mesh / the awareness agent | Where this agent's identity (`culture.yaml`) is declared and run. |
