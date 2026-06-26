@@ -313,6 +313,57 @@ def test_out_of_scope_does_not_call_container_launch(
 
 
 # ---------------------------------------------------------------------------
+# H1 anchor — consolidated named proof for honesty condition h1 (issue #9)
+# ---------------------------------------------------------------------------
+
+
+def test_h1_anchor_bad_dataset_and_out_of_scope_never_invoke_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H1 anchor: both bad-dataset (h1a) and out-of-scope (h1b) raise CliError(code=1)
+    WITHOUT ever calling sloth.tune.container.launch.
+
+    Honesty condition h1 (issue #9): the host-side ``sloth train`` path must complete
+    its dataset validation and scope check *before* delegating to the container layer.
+    A misconfigured run must raise ``CliError(code=1)`` and leave
+    ``container.launch`` un-called in both scenarios.
+
+    Note: individual scenario tests already exist as
+    ``test_bad_dataset_does_not_call_container_launch`` (h1a) and
+    ``test_out_of_scope_does_not_call_container_launch`` (h1b) — this test is the
+    single explicitly h1-named anchor that ties both conditions to the honesty
+    condition label for traceability.
+    """
+    mock_launch = Mock()
+    monkeypatch.setattr(container_mod, "launch", mock_launch)
+
+    # --- H1a: invalid dataset (empty messages list) ---
+    bad = _write_dataset(tmp_path, body='{"messages": []}\n', name="bad_ds.jsonl")
+    toml_bad = _write_toml(tmp_path, dataset=bad, name="bad_run.toml")
+    with pytest.raises(CliError) as exc_info_a:
+        cmd_train(_make_args(toml_bad, dry_run=False))
+    assert exc_info_a.value.code == 1, "h1a: expected CliError code=1 for invalid dataset"
+    mock_launch.assert_not_called()
+
+    # --- H1b: out-of-scope model + method (full fine-tune of large model) ---
+    dataset_ok = _write_dataset(tmp_path, name="ok.jsonl")
+    cfg_oos = RunConfig(
+        model="unsloth/Qwen3-72B",
+        dataset=str(dataset_ok),
+        output=str(tmp_path / "out"),
+        method="full",
+    )
+    monkeypatch.setattr(train_mod, "load_config", lambda _path: cfg_oos)
+    args_oos = argparse.Namespace(
+        config="ignored.toml", dry_run=False, json=False, in_container=False
+    )
+    with pytest.raises(CliError) as exc_info_b:
+        cmd_train(args_oos)
+    assert exc_info_b.value.code == 1, "h1b: expected CliError code=1 for out-of-scope model"
+    mock_launch.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Bad config propagation
 # ---------------------------------------------------------------------------
 
