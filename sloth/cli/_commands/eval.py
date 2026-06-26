@@ -59,13 +59,15 @@ def _default_backend(adapter_path: str, record: dict[str, str]) -> str:
             code=EXIT_ENV_ERROR,
             message=f"ML stack not installed: {exc}",
             remediation=(
-                "Install the ML extras: pip install 'unsloth-cli[train]' "
-                "or install torch and transformers manually."
+                "Install the tuning stack: uv tool install unsloth-cli "
+                "(or run uv sync in a checkout)."
             ),
         ) from exc
 
-    tokenizer = AutoTokenizer.from_pretrained(adapter_path, local_files_only=True)
-    model = AutoModelForCausalLM.from_pretrained(adapter_path, local_files_only=True)
+    # local_files_only=True loads only from the on-disk adapter, never the Hub,
+    # so B615's unpinned-remote-revision risk does not apply here.
+    tokenizer = AutoTokenizer.from_pretrained(adapter_path, local_files_only=True)  # nosec B615
+    model = AutoModelForCausalLM.from_pretrained(adapter_path, local_files_only=True)  # nosec B615
     model.eval()
 
     prompt = f"Task: {record['task']}\nInput: {record['input']}\nOutput:"
