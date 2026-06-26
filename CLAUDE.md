@@ -54,19 +54,22 @@ uv run sloth whoami                           # smoke-run the CLI
 ```
 
 `black` and `isort` (profile=black) both use **line-length 100** — match it.
-`teken` is a **dev-only** dependency. The runtime *does* carry base deps now
-(unsloth + torch — see "Base runtime dependency + lazy imports"); what keeps the
-introspection verbs fast is the **lazy-import discipline**, not an empty
-dependency list.
+`teken` is a **dev-only** dependency. The runtime has **no heavy deps**
+(`dependencies = []`); the GPU stack (unsloth + torch) is provided exclusively by the
+NGC container — see "GPU stack: NGC container, not a pip dep" under "Conventions that
+gate merges". What keeps the introspection verbs fast is the **lazy-import discipline**:
+never import torch/unsloth at module top level (still required even inside the
+container context).
 
 ## Architecture
 
 The introspection CLI is a thin, **pure-stdlib** argparse core built around four
 stable contracts — understanding these four is enough to add features safely.
-The heavy ML stack (unsloth/torch) is a base runtime dependency but is **never
-imported at module top level**; the tuning verbs lazy-import it inside their
-handlers (see "Base runtime dependency + lazy imports"), so this core stays
-import-light and fast to start.
+The heavy ML stack (unsloth/torch) is **not a runtime dependency** — it runs inside
+the NGC container that the fine-tuning verbs orchestrate. Handlers never import
+torch/unsloth at module top level; they lazy-import inside the function body once the
+container context is established. This keeps the introspection core import-light and
+installable on every architecture.
 
 ### 1. Dispatch + error propagation (`sloth/cli/__init__.py`)
 
@@ -197,11 +200,14 @@ noun group" seam above. The settled, load-bearing decisions:
   teacher behavior for `learn`). Memory/RAG stores *changing facts* (project
   state, secrets, user-specific memory). The README must explain this split.
 
-The dependency question is **settled, not open**: unsloth + torch are a base
-runtime dependency and the tuning verbs lazy-import them — see "Base runtime
-dependency + lazy imports" under "Conventions that gate merges". These verbs
-connect to siblings: `lobes` serves the resulting adapters locally and
-`colleague` runs them as model backends (see the ecosystem map below).
+The dependency question is **settled, not open**: torch + unsloth are **not**
+runtime dependencies (`dependencies = []`); the GPU stack runs inside the NGC
+container (`nvcr.io/nvidia/pytorch:25.11-py3`) that the fine-tuning verbs
+orchestrate — see "GPU stack: NGC container, not a pip dep" under "Conventions that
+gate merges". The lazy-import discipline (never import torch/unsloth at module top
+level) still applies inside the container. These verbs connect to siblings: `lobes`
+serves the resulting adapters locally and `colleague` runs them as model backends
+(see the ecosystem map below).
 
 ## The agent-first rubric gate (must stay green)
 
@@ -234,21 +240,24 @@ not.
   status, reply to review threads, and `await` (gates on the Sonar gate +
   unresolved threads). Do **not** self-merge — open the PR and await human
   merge. Replies auto-sign `- unsloth-cli (Claude)`.
-- **Base runtime dependency + lazy imports.** unsloth + torch are a **base
-  runtime dependency** (`[project].dependencies`) — `uv tool install unsloth-cli`
-  brings the full tuning stack. This is a **deliberate reversal** of the old
-  `dependencies = []` / "zero runtime dependencies" rule (`uv` is the default
-  installer and bundling the stack beats an optional extra). The discipline that
-  *replaces* the old rule: **never import torch/unsloth at module top level.**
-  Handlers lazy-import them inside the function body, the `sloth/tune/` core
-  modules (`datasets`, `config`, `metadata`, `scope`) stay pure-stdlib, and the
-  introspection verbs (`whoami`/`learn`/`explain`/`doctor`/`overview`/`cli`) keep
-  fast startup. The afi rubric gate checks the **CLI contract, not the dependency
-  count**, so a base dep does not turn it red — but a top-level heavy import that
-  slowed introspection would. (Trade-off accepted: `uv tool install` now *fails*
-  on an arch where the torch/unsloth wheels don't resolve, so Spark ARM/Blackwell
-  wheel availability must hold; the introspection CLI is no longer guaranteed to
-  install everywhere.)
+- **GPU stack: NGC container, not a pip dep.** torch + unsloth are **not** runtime
+  dependencies — `[project].dependencies` is empty for the GPU stack.
+  `uv tool install unsloth-cli` installs only the pure-stdlib introspection CLI, which
+  works on every arch including aarch64 / DGX Spark GB10. The GPU stack
+  (`nvcr.io/nvidia/pytorch:25.11-py3`) is provided by NVIDIA's official NGC container,
+  which the fine-tuning verbs (`train`, `eval`, `export`) orchestrate automatically.
+  The in-container dep layer is installed with uv (never pip):
+  `uv pip install --system transformers peft hf_transfer 'datasets==4.3.0' 'trl==0.26.1'`
+  then `uv pip install --system --no-deps unsloth unsloth_zoo bitsandbytes`.
+  **Why:** the previous design listed torch + unsloth as base deps; on aarch64
+  `uv sync` resolved to `torch==2.10.0+cpu` (the CPU-only wheel) and training aborted
+  with `"cannot find any torch accelerator"`. Container orchestration removes the
+  wheel-resolution problem entirely.
+  **Lazy-import discipline still required:** even inside the container context, never
+  import torch/unsloth at module top level. Handlers lazy-import inside the function
+  body; `sloth/tune/` core modules (`datasets`, `config`, `metadata`, `scope`) stay
+  pure-stdlib. The afi rubric gate checks the CLI contract — a top-level heavy import
+  that slowed introspection still turns it red.
 
 ## Vendored skills (cite-don't-import)
 
