@@ -30,7 +30,7 @@ import pytest
 
 from sloth.cli._errors import CliError
 from sloth.tune import _trainer
-from sloth.tune._trainer import run_training
+from sloth.tune._trainer import run_eval, run_training
 from sloth.tune.config import RunConfig
 
 # ---------------------------------------------------------------------------
@@ -241,6 +241,11 @@ class TestRealFlowWithFakes:
         backend, events = _make_fake_backend()
         monkeypatch.setattr(_trainer, "_load_backend", lambda: backend)
 
+        # Inject a fake ``datasets`` module so the lazy ``from datasets import Dataset``
+        # inside _run_real resolves without needing the real (heavy) package installed.
+        fake_module, _, _ = _fake_datasets_module()
+        monkeypatch.setitem(sys.modules, "datasets", fake_module)
+
         result = run_training(config, dry_run=False)
 
         # model loaded with the configured base model
@@ -281,3 +286,376 @@ class TestOutOfScopeRefusal:
         with pytest.raises(CliError) as exc_info:
             run_training(config, dry_run=False)
         assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# 6. Dataset wrapping: train_dataset must be Dataset.from_list(records) value
+# ---------------------------------------------------------------------------
+
+
+def _fake_datasets_module():
+    """Return a (fake_module, call_log) pair for monkeypatching sys.modules['datasets']."""
+    from_list_calls: list = []
+
+    class FakeDataset:
+        """Stand-in for datasets.Dataset; records from_list calls and acts as sentinel."""
+
+        @classmethod
+        def from_list(cls, records):
+            from_list_calls.append(records)
+            return cls  # return the class itself as an identifiable sentinel
+
+    module = SimpleNamespace(Dataset=FakeDataset)
+    return module, FakeDataset, from_list_calls
+
+
+class TestDatasetWrapping:
+    """_run_real must wrap train_records with Dataset.from_list before SFTTrainer.
+
+    H1 coverage (issue #9): these tests confirm the Dataset.from_list wrapping half of
+    honesty condition h1 — that ``_run_real`` passes a ``datasets.Dataset`` (not a raw
+    ``list[dict]``) to ``SFTTrainer``.  Do NOT duplicate; they already cover this fully.
+    """
+
+    def test_sft_trainer_receives_dataset_wrapped_value(self, tmp_path: Path, monkeypatch) -> None:
+        config = _config(tmp_path)
+        _write_chat_dataset(Path(config.dataset))
+        backend, events = _make_fake_backend()
+        monkeypatch.setattr(_trainer, "_load_backend", lambda: backend)
+
+        fake_module, FakeDataset, from_list_calls = _fake_datasets_module()
+        # Inject the fake into sys.modules so the lazy ``from datasets import Dataset``
+        # inside _run_real resolves to our FakeDataset without needing the real package.
+        monkeypatch.setitem(sys.modules, "datasets", fake_module)
+
+        run_training(config, dry_run=False)
+
+        assert from_list_calls, "Dataset.from_list was never called"
+        trainer_kwargs = events["trainer"][0]
+        assert trainer_kwargs["train_dataset"] is FakeDataset, (
+            "SFTTrainer did not receive the Dataset-wrapped value; "
+            f"got {trainer_kwargs['train_dataset']!r} instead of FakeDataset sentinel"
+        )
+
+    def test_from_list_called_with_raw_records(self, tmp_path: Path, monkeypatch) -> None:
+        """Dataset.from_list must be called with the raw list[dict] loaded from the file."""
+        config = _config(tmp_path)
+        _write_chat_dataset(Path(config.dataset))
+        backend, _ = _make_fake_backend()
+        monkeypatch.setattr(_trainer, "_load_backend", lambda: backend)
+
+        fake_module, _, from_list_calls = _fake_datasets_module()
+        monkeypatch.setitem(sys.modules, "datasets", fake_module)
+
+        run_training(config, dry_run=False)
+
+        assert from_list_calls, "Dataset.from_list was never called"
+        records = from_list_calls[0]
+        assert isinstance(records, list), f"Expected list, got {type(records)}"
+        assert len(records) == 1, f"Expected 1 record (one line in fixture), got {len(records)}"
+        assert "messages" in records[0], "Record did not match expected chat schema"
+
+
+# ---------------------------------------------------------------------------
+# 7. No-accelerator NotImplementedError -> CliError(code=2) with NGC hint
+# ---------------------------------------------------------------------------
+
+
+class TestNoAcceleratorError:
+    """NotImplementedError from the ML backend must surface as CliError(code=2).
+
+    H1 coverage (issue #9): these tests cover the ``_run_real`` side of honesty condition h1
+    — specifically that a ``NotImplementedError("cannot find any torch accelerator")`` maps
+    to ``CliError.code == 2`` with the NGC container image in the remediation string.
+    Do NOT duplicate; they already cover this fully.
+    """
+
+    def _make_no_gpu_backend(self) -> SimpleNamespace:
+        """Backend whose model-load raises the unsloth no-accelerator error."""
+
+        class FakeFLMNoGPU:
+            @staticmethod
+            def from_pretrained(**kw):
+                raise NotImplementedError(
+                    "Unsloth cannot find any torch accelerator? You need a GPU."
+                )
+
+        class FakeTrainer:
+            def __init__(self, **kw):
+                pass
+
+            def train(self):
+                pass
+
+        return SimpleNamespace(
+            fast_language_model=FakeFLMNoGPU,
+            sft_trainer=FakeTrainer,
+            sft_config=lambda **kw: kw,
+            torch=SimpleNamespace(),
+        )
+
+    def _patch_datasets(self, monkeypatch) -> None:
+        """Inject a no-op fake datasets module so the lazy import doesn't ImportError."""
+
+        class FakeDataset:
+            @classmethod
+            def from_list(cls, records):
+                return cls
+
+        monkeypatch.setitem(sys.modules, "datasets", SimpleNamespace(Dataset=FakeDataset))
+
+    def test_not_implemented_error_raises_cli_error_code_2(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        config = _config(tmp_path)
+        _write_chat_dataset(Path(config.dataset))
+        backend = self._make_no_gpu_backend()
+        monkeypatch.setattr(_trainer, "_load_backend", lambda: backend)
+        self._patch_datasets(monkeypatch)
+
+        with pytest.raises(CliError) as exc_info:
+            run_training(config, dry_run=False)
+        assert (
+            exc_info.value.code == 2
+        ), f"Expected code=2 (ENV_ERROR), got code={exc_info.value.code}"
+
+    def test_not_implemented_error_remediation_names_ngc_container(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        config = _config(tmp_path)
+        _write_chat_dataset(Path(config.dataset))
+        backend = self._make_no_gpu_backend()
+        monkeypatch.setattr(_trainer, "_load_backend", lambda: backend)
+        self._patch_datasets(monkeypatch)
+
+        with pytest.raises(CliError) as exc_info:
+            run_training(config, dry_run=False)
+        assert (
+            "nvcr.io/nvidia/pytorch:25.11-py3" in exc_info.value.remediation
+        ), f"NGC container path not in remediation: {exc_info.value.remediation!r}"
+
+    def test_not_implemented_error_does_not_propagate_as_generic(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        # The CLI must never see a raw NotImplementedError
+        # (that would emit code=1 'file a bug' via the generic handler).
+        config = _config(tmp_path)
+        _write_chat_dataset(Path(config.dataset))
+        backend = self._make_no_gpu_backend()
+        monkeypatch.setattr(_trainer, "_load_backend", lambda: backend)
+        self._patch_datasets(monkeypatch)
+
+        # Must raise CliError (not NotImplementedError)
+        with pytest.raises(CliError):
+            run_training(config, dry_run=False)
+
+    def test_not_implemented_during_train_also_caught(self, tmp_path: Path, monkeypatch) -> None:
+        """NotImplementedError during trainer.train() must map to code=2 (not just model load)."""
+        config = _config(tmp_path)
+        _write_chat_dataset(Path(config.dataset))
+
+        class FakeModel:
+            def save_pretrained(self, path):
+                pass
+
+        class FakeTokenizer:
+            def save_pretrained(self, path):
+                pass
+
+        class FakeFLMOK:
+            @staticmethod
+            def from_pretrained(**kw):
+                return FakeModel(), FakeTokenizer()
+
+            @staticmethod
+            def get_peft_model(model, **kw):
+                return model
+
+        class FakeTrainerRaisesOnTrain:
+            def __init__(self, **kw):
+                pass
+
+            def train(self):
+                raise NotImplementedError(
+                    "Unsloth cannot find any torch accelerator? You need a GPU."
+                )
+
+        backend = SimpleNamespace(
+            fast_language_model=FakeFLMOK,
+            sft_trainer=FakeTrainerRaisesOnTrain,
+            sft_config=lambda **kw: kw,
+            torch=SimpleNamespace(),
+        )
+        monkeypatch.setattr(_trainer, "_load_backend", lambda: backend)
+        self._patch_datasets(monkeypatch)
+
+        with pytest.raises(CliError) as exc_info:
+            run_training(config, dry_run=False)
+        assert exc_info.value.code == 2
+        assert "nvcr.io/nvidia/pytorch:25.11-py3" in exc_info.value.remediation
+
+
+# ---------------------------------------------------------------------------
+# 8. run_eval — PeftModel load sequence (moved from test_cmd_eval)
+# ---------------------------------------------------------------------------
+
+
+class TestRunEval:
+    """run_eval is the ML seam for ``sloth eval`` (FIX 3 — qodo #10).
+
+    These tests assert the correct PEFT load sequence:
+    - AutoModelForCausalLM.from_pretrained is called with the BASE model name
+      (read from adapter_config.json), NOT the adapter dir path.
+    - PeftModel.from_pretrained is called with (base_model_obj, adapter_path).
+
+    No GPU or real torch/peft/transformers needed: fake modules are injected via
+    monkeypatch.setitem(sys.modules, ...) so the lazy imports inside run_eval
+    pick them up without the real packages installed.
+    """
+
+    def _write_adapter_config(self, adapter_dir: Path, base_model_name: str) -> None:
+        (adapter_dir / "adapter_config.json").write_text(
+            json.dumps({"base_model_name_or_path": base_model_name, "peft_type": "LORA"}),
+            encoding="utf-8",
+        )
+
+    def _write_suite(self, suite_path: Path) -> None:
+        suite_path.write_text(
+            '{"task": "reverse", "input": "abc", "expected_output": "cba"}\n',
+            encoding="utf-8",
+        )
+
+    def _inject_fake_ml(self, monkeypatch, *, base_model_name: str, adapter_dir: str) -> dict:
+        """Inject fake torch/transformers/peft and return a call-log dict."""
+        calls: dict = {}
+        fake_base_model = object()
+
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        # fake PeftModel (records base + adapter_path)
+        class FakePeftModel:
+            @staticmethod
+            def from_pretrained(base, adapter_path, **kw):
+                calls["peft_base"] = base
+                calls["peft_adapter"] = adapter_path
+                m = MagicMock()
+                m.generate.return_value = [[1, 2, 3]]
+                return m
+
+        # fake AutoModelForCausalLM (records the name it was called with)
+        class FakeAutoModel:
+            @staticmethod
+            def from_pretrained(name, **kw):
+                calls["causal_lm_name"] = name
+                return fake_base_model
+
+        # fake AutoTokenizer
+        class _FakeTok:
+            def __call__(self, prompt, **kw):
+                return {"input_ids": [[1, 2, 3]]}
+
+            def decode(self, tokens, **kw):
+                return "cba"
+
+        class FakeAutoTokenizer:
+            @staticmethod
+            def from_pretrained(name, **kw):
+                return _FakeTok()
+
+        fake_torch = MagicMock()
+        fake_torch.no_grad.return_value.__enter__ = lambda s: None
+        fake_torch.no_grad.return_value.__exit__ = lambda s, *a: False
+
+        fake_transformers = SimpleNamespace(
+            AutoModelForCausalLM=FakeAutoModel,
+            AutoTokenizer=FakeAutoTokenizer,
+        )
+        fake_peft_mod = SimpleNamespace(PeftModel=FakePeftModel)
+
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+        monkeypatch.setitem(sys.modules, "peft", fake_peft_mod)
+
+        calls["_fake_base_model"] = fake_base_model
+        return calls
+
+    def test_peft_load_sequence_base_model_then_adapter(self, tmp_path: Path, monkeypatch) -> None:
+        """run_eval reads adapter_config.json and calls PeftModel(base_model, adapter).
+
+        AutoModelForCausalLM.from_pretrained must receive the BASE model name
+        (from adapter_config.json), not the adapter dir path.
+        PeftModel.from_pretrained must receive (base_model_obj, adapter_path).
+        """
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        base_model_name = "unsloth/Qwen3-4B"
+        self._write_adapter_config(adapter_dir, base_model_name)
+        suite_file = tmp_path / "suite.jsonl"
+        self._write_suite(suite_file)
+
+        calls = self._inject_fake_ml(
+            monkeypatch, base_model_name=base_model_name, adapter_dir=str(adapter_dir)
+        )
+
+        result = run_eval(str(adapter_dir), str(suite_file))
+
+        # AutoModelForCausalLM called with BASE name, NOT the adapter dir path.
+        assert (
+            calls["causal_lm_name"] == base_model_name
+        ), "AutoModelForCausalLM.from_pretrained must be called with the base model name"
+        assert calls["causal_lm_name"] != str(
+            adapter_dir
+        ), "AutoModelForCausalLM.from_pretrained must NOT be called with the adapter dir"
+
+        # PeftModel called with (base_model_obj, adapter_path).
+        assert (
+            calls["peft_base"] is calls["_fake_base_model"]
+        ), "PeftModel.from_pretrained must receive the base model object as its first arg"
+        assert calls["peft_adapter"] == str(
+            adapter_dir
+        ), "PeftModel.from_pretrained must receive the adapter dir path as its second arg"
+
+        # Result structure.
+        assert result["total"] == 1
+        assert "exact_match" in result
+        assert "results" in result
+
+    def test_run_eval_missing_adapter_config_raises_code_1(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """run_eval raises CliError(code=1) when adapter_config.json is absent."""
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        suite_file = tmp_path / "suite.jsonl"
+        self._write_suite(suite_file)
+
+        from unittest.mock import MagicMock
+
+        fake_torch = MagicMock()
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        monkeypatch.setitem(sys.modules, "transformers", MagicMock())
+        monkeypatch.setitem(sys.modules, "peft", MagicMock())
+
+        with pytest.raises(CliError) as exc_info:
+            run_eval(str(adapter_dir), str(suite_file))
+        assert exc_info.value.code == 1
+        assert "adapter_config.json" in exc_info.value.message
+
+    def test_run_eval_missing_ml_stack_raises_code_2(self, tmp_path: Path, monkeypatch) -> None:
+        """run_eval raises CliError(code=2) when torch/peft/transformers are absent."""
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        self._write_adapter_config(adapter_dir, "unsloth/Qwen3-4B")
+        suite_file = tmp_path / "suite.jsonl"
+        self._write_suite(suite_file)
+
+        # Remove torch so the lazy import fails.
+        monkeypatch.setitem(
+            sys.modules,
+            "torch",
+            None,  # type: ignore[arg-type]  # None in sys.modules → ImportError
+        )
+
+        with pytest.raises((CliError, ImportError)):
+            run_eval(str(adapter_dir), str(suite_file))

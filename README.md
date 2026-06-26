@@ -45,10 +45,10 @@ error, `3+` reserved.
 ## Fine-tuning
 
 unsloth-cli ships three flat verbs for LoRA/QLoRA adapter tuning of Qwen models,
-plus a `/finetune` skill that drives the full loop. The Unsloth/PyTorch stack
-arrives with `uv tool install unsloth-cli`; the introspection verbs (`whoami`,
-`learn`, `explain`, etc.) stay fast via lazy imports — torch is never loaded at
-module import time.
+plus a `/finetune` skill that drives the full loop. torch + unsloth are **not**
+installed as pip dependencies — they run inside an NGC Docker container that the
+fine-tuning verbs orchestrate. The introspection verbs (`whoami`, `learn`, `explain`,
+etc.) install and start everywhere, with no GPU stack required.
 
 ### Out of scope
 
@@ -70,6 +70,50 @@ The `/finetune` skill drives the full loop non-interactively:
 validate dataset → `sloth train` → `sloth eval` → `sloth export`.
 
 Every verb supports `--json` and routes errors through `error:` / `hint:` on stderr.
+
+### DGX Spark / NGC container
+
+The `train`, `eval`, and `export` verbs execute inside NVIDIA's official PyTorch NGC
+container (`nvcr.io/nvidia/pytorch:25.11-py3`), which ships a Blackwell-ready torch
+build. The verbs bind-mount the repo checkout into the container and install the
+fine-tuning dep layer with uv (never pip):
+
+```bash
+# In-container dep layer (installed automatically by sloth train / eval / export)
+uv pip install --system transformers peft hf_transfer 'datasets==4.3.0' 'trl==0.26.1'
+uv pip install --system --no-deps unsloth unsloth_zoo bitsandbytes
+```
+
+**Prerequisites** (GPU operators only — not needed for the introspection verbs):
+
+- CUDA 13 drivers
+- `nvidia-container-toolkit` installed and configured
+- Docker with GPU access: `docker run --gpus all` must succeed
+
+**Two audiences:**
+
+- **GPU operators** running `sloth train` / `sloth eval` / `sloth export`: you need
+  the NGC image and the prerequisites above. The verbs pull the image and orchestrate
+  the container automatically; the dep layer is installed inside the container on each
+  run.
+- **Introspection-only users** running `sloth whoami` / `sloth learn` / `sloth explain`
+  / `sloth doctor`: no GPU, no Docker, no torch required.
+  `uv tool install unsloth-cli` installs only the pure-stdlib introspection CLI, which
+  works on every architecture including aarch64 / DGX Spark GB10.
+
+**Why the NGC container?** Earlier versions of unsloth-cli listed torch + unsloth as
+base `[project].dependencies`. On aarch64 (DGX Spark GB10, Blackwell), `uv sync`
+resolved to `torch==2.10.0+cpu` — the CPU-only wheel — and the real training path
+aborted with `"cannot find any torch accelerator"`. Moving the GPU stack into the NGC
+container removes the wheel-resolution problem: the container already ships a
+Blackwell-native torch, and the introspection CLI installs cleanly everywhere again.
+
+**UMA / out-of-memory note** (DGX Spark unified memory architecture): if a training
+run exhausts unified memory, flush the page cache before retrying:
+
+```bash
+sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
+```
 
 ### Dataset schemas
 

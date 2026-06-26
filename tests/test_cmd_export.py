@@ -1,14 +1,23 @@
-"""Tests for ``sloth export`` — adapter → safetensors PEFT layout export."""
+"""Tests for ``sloth export`` — adapter → safetensors PEFT layout export.
+
+Container / ML-stack decision (risk r4)
+----------------------------------------
+``export`` is pure-stdlib — it reorganises and validates filesystem artefacts
+without loading or converting weights.  The tests below assert that
+``sloth.tune.container.launch`` is **never called** during export, documenting
+and locking in that decision.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
-from sloth.cli._commands.export import cmd_export, register
+from sloth.cli._commands.export import OPTIONAL_TOKENIZER_FILES, cmd_export, register
 from sloth.cli._errors import CliError
 
 # ---------------------------------------------------------------------------
@@ -138,6 +147,114 @@ def test_happy_path_creates_output_dir(tmp_path: Path) -> None:
     cmd_export(args)
 
     assert deep_output.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# Tokenizer file tests
+# ---------------------------------------------------------------------------
+
+
+def test_tokenizer_files_copied_when_present(tmp_path: Path) -> None:
+    """Optional tokenizer files present in the adapter dir are copied to the output dir."""
+    adapter = _make_adapter(tmp_path)
+    # Add a subset of tokenizer files that the adapter might bundle.
+    tokenizer_subset = ["tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"]
+    for fname in tokenizer_subset:
+        (adapter / fname).write_text('{"model_type": "qwen2"}', encoding="utf-8")
+
+    output_dir = tmp_path / "out"
+    args = _make_args(adapter=str(adapter), output=str(output_dir))
+
+    rc = cmd_export(args)
+
+    assert rc == 0
+    for fname in tokenizer_subset:
+        assert (output_dir / fname).exists(), f"expected tokenizer file {fname} in output"
+
+
+def test_tokenizer_files_skipped_when_absent(tmp_path: Path) -> None:
+    """Export succeeds with no tokenizer files — they are optional, not required."""
+    adapter = _make_adapter(tmp_path)
+    # Confirm none of the optional files exist.
+    for fname in OPTIONAL_TOKENIZER_FILES:
+        assert not (adapter / fname).exists()
+
+    output_dir = tmp_path / "out"
+    args = _make_args(adapter=str(adapter), output=str(output_dir))
+
+    rc = cmd_export(args)
+
+    assert rc == 0
+    # Required PEFT files must be there; optional tokenizer files must NOT be created.
+    for fname in PEFT_FILES:
+        assert (output_dir / fname).exists()
+    for fname in OPTIONAL_TOKENIZER_FILES:
+        assert not (output_dir / fname).exists(), f"{fname} should not appear when absent in src"
+
+
+def test_sentencepiece_tokenizer_model_copied(tmp_path: Path) -> None:
+    """tokenizer.model (SentencePiece) is copied when present alongside PEFT files."""
+    adapter = _make_adapter(tmp_path)
+    (adapter / "tokenizer.model").write_bytes(b"FAKE_SENTENCEPIECE_BLOB")
+
+    output_dir = tmp_path / "out"
+    rc = cmd_export(_make_args(adapter=str(adapter), output=str(output_dir)))
+
+    assert rc == 0
+    assert (output_dir / "tokenizer.model").exists()
+    assert (output_dir / "tokenizer.model").read_bytes() == b"FAKE_SENTENCEPIECE_BLOB"
+
+
+def test_tokenizer_files_in_json_files_list(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """tokenizer files present in the adapter appear in the JSON `files` list."""
+    adapter = _make_adapter(tmp_path)
+    (adapter / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (adapter / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+
+    output_dir = tmp_path / "out"
+    args = _make_args(adapter=str(adapter), output=str(output_dir), json_mode=True)
+
+    rc = cmd_export(args)
+    assert rc == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    fnames_in_output = [Path(f).name for f in payload["files"]]
+    assert "tokenizer.json" in fnames_in_output
+    assert "tokenizer_config.json" in fnames_in_output
+
+
+# ---------------------------------------------------------------------------
+# Container / ML-stack decision tests (resolves risk r4)
+# ---------------------------------------------------------------------------
+
+
+def test_export_does_not_launch_container(tmp_path: Path) -> None:
+    """export is pure-stdlib — container.launch must NEVER be called.
+
+    This test locks in the risk-r4 decision: export reorganises filesystem
+    artefacts (files are already in safetensors format after training) and
+    needs no torch/peft/ML-stack, therefore no NGC container is launched.
+    """
+    adapter = _make_adapter(tmp_path)
+    output_dir = tmp_path / "out"
+    args = _make_args(adapter=str(adapter), output=str(output_dir))
+
+    with patch("sloth.tune.container.launch") as mock_launch:
+        rc = cmd_export(args)
+
+    assert rc == 0
+    mock_launch.assert_not_called()
+
+
+def test_export_does_not_launch_container_on_error(tmp_path: Path) -> None:
+    """Even on a validation error (bad adapter dir), no container is launched."""
+    args = _make_args(adapter=str(tmp_path / "nonexistent"))
+
+    with patch("sloth.tune.container.launch") as mock_launch:
+        with pytest.raises(CliError):
+            cmd_export(args)
+
+    mock_launch.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

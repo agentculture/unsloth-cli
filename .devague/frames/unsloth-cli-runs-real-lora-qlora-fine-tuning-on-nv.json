@@ -1,0 +1,342 @@
+{
+  "slug": "unsloth-cli-runs-real-lora-qlora-fine-tuning-on-nv",
+  "title": "unsloth-cli runs real LoRA/QLoRA fine-tuning on NVIDIA DGX Spark by orchestrating NVIDIA's official NGC PyTorch container, instead of carrying torch/unsloth as pip dependencies",
+  "schema_version": 1,
+  "status": "exported",
+  "created": "2026-06-26T14:46:12Z",
+  "updated": "2026-06-26T15:00:54Z",
+  "claims": [
+    {
+      "id": "c1",
+      "kind": "announcement",
+      "text": "unsloth-cli runs real LoRA/QLoRA fine-tuning on NVIDIA DGX Spark by orchestrating NVIDIA's official NGC PyTorch container, instead of carrying torch/unsloth as pip dependencies",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h5",
+          "text": "a real LoRA/QLoRA run completes >0 training steps on GB10 via the orchestrated container \u2014 demonstrated on hardware, not just --dry-run",
+          "status": "confirmed"
+        }
+      ],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c2",
+      "kind": "audience",
+      "text": "Spark/DGX operators and AgentCulture mesh agents who run the fine-tuning verbs on GB10 (Blackwell, aarch64); plus everyone who installs unsloth-cli only for the import-light introspection verbs",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h6",
+          "text": "both audiences are served: GPU users get a working real run; introspection-only installers get a successful import-light install with no torch pulled",
+          "status": "confirmed"
+        }
+      ],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c3",
+      "kind": "before_state",
+      "text": "torch+unsloth are base [project].dependencies, so on aarch64 'uv sync' installs CPU-only torch (2.10.0+cpu); the real train/eval/export path aborts at model-load with 'cannot find any torch accelerator' and has never run on Spark \u2014 and the heavy deps also make a plain 'uv tool install' fail wherever the wheels don't resolve",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h7",
+          "text": "reproducible today: 'uv sync' on aarch64 yields a '+cpu' torch and the real path raises 'cannot find any torch accelerator'",
+          "status": "confirmed"
+        }
+      ],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c4",
+      "kind": "after_state",
+      "text": "the real train/eval/export verbs execute the GPU work inside NVIDIA's official NGC container (nvcr.io/nvidia/pytorch:25.11-py3) where a Blackwell-compatible torch already lives, with unsloth layered via 'pip install --no-deps unsloth unsloth_zoo bitsandbytes'; the same dataset+config reproduces a real run on Spark",
+      "origin": "user",
+      "status": "rejected",
+      "honesty_conditions": [
+        {
+          "id": "h8",
+          "text": "the same dataset+config reproduces a real run; the container image + invocation are pinned and deterministic",
+          "status": "confirmed"
+        }
+      ],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c5",
+      "kind": "why_it_matters",
+      "text": "fine-tuning is the repo's reason to exist; today it provably does not run on its target hardware. Orchestrating NVIDIA's official, supported path is the only sanctioned way to get a working Blackwell torch, and it restores universal installability of the introspection CLI",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h9",
+          "text": "removing the heavy base deps restores 'uv tool install unsloth-cli' on arches where the torch/unsloth wheels don't resolve",
+          "status": "confirmed"
+        }
+      ],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c6",
+      "kind": "boundary",
+      "text": "not vendoring/building torch or unsloth wheels ourselves; not full fine-tuning of large dense models (LoRA/QLoRA only, scope guard unchanged); not a general container runtime \u2014 only the one pinned NGC image and the documented dependency layer",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h10",
+          "text": "the build adds no torch/unsloth wheel vendoring and no second container image; the large-dense-model scope guard stays unchanged",
+          "status": "confirmed"
+        }
+      ],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c7",
+      "kind": "success_signal",
+      "text": "a real 'sloth train' LoRA/QLoRA run on GB10 completes >0 steps with loss recorded, writes the adapter + training metadata; 'sloth eval' then 'sloth export' complete on that adapter \u2014 the full loop runs on Spark",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h11",
+          "text": "an operator runs train->eval->export on GB10 and gets adapter + metadata + eval scores \u2014 captured by the gpu smoke test",
+          "status": "confirmed"
+        }
+      ],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c8",
+      "kind": "success_signal",
+      "text": "with no CUDA torch/accelerator, 'sloth train' exits CliError code=2 with a remediation naming the NGC container path \u2014 not code=1 'file a bug'",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h12",
+          "text": "asserted by a unit test: the no-accelerator / no-docker path returns exit code 2 with the NGC hint",
+          "status": "confirmed"
+        }
+      ],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c9",
+      "kind": "success_signal",
+      "text": "a fresh 'uv tool install unsloth-cli' / 'uv sync' succeeds on aarch64 WITHOUT pulling torch+unsloth, and the introspection verbs still run import-light",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h13",
+          "text": "asserted: a clean install resolves without torch/unsloth and 'sloth whoami' runs",
+          "status": "confirmed"
+        }
+      ],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c10",
+      "kind": "decision",
+      "text": "pin NVIDIA's official Spark recipe: image nvcr.io/nvidia/pytorch:25.11-py3; in-container deps 'transformers peft hf_transfer datasets==4.3.0 trl==0.26.1' then 'pip install --no-deps unsloth unsloth_zoo bitsandbytes'",
+      "origin": "user",
+      "status": "rejected",
+      "honesty_conditions": [],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c11",
+      "kind": "decision",
+      "text": "remove torch+unsloth from [project].dependencies (reverse the #6 base-dep decision); the GPU stack comes from the container layer, never from pip resolution",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c12",
+      "kind": "decision",
+      "text": "sloth train/eval/export auto-launch the NGC container from the host: docker run --gpus all (with NVIDIA's --ulimit memlock=-1 --ulimit stack=67108864) nvcr.io/nvidia/pytorch:25.11-py3, install the dep layer inside, run the job against a bind-mounted workdir, stream logs, collect outputs. The CLI never runs the GPU path in its own process",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [],
+      "hard_questions": [
+        {
+          "id": "q1",
+          "text": "risk: DGX Spark UMA can OOM even within memory capacity; mitigation: document NVIDIA's 'sudo sh -c \"sync; echo 3 > /proc/sys/vm/drop_caches\"' flush and keep conservative batch_size defaults",
+          "resolved": false,
+          "blocking": false
+        }
+      ],
+      "links": []
+    },
+    {
+      "id": "c13",
+      "kind": "decision",
+      "text": "in scope for this work: fix train passing list[dict] to SFTTrainer (wrap as datasets.Dataset.from_list) and fix eval loading a PEFT adapter dir via AutoModelForCausalLM (use PeftModel.from_pretrained(base, adapter) reading base_model_name_or_path from adapter_config.json)",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c14",
+      "kind": "requirement",
+      "text": "host-side GPU-free preflight runs BEFORE any docker launch: dataset-schema + TOML-config + scope-guard validation happen in-process (pure stdlib), so a bad dataset/config/out-of-scope target fails fast without paying container startup",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h1",
+          "text": "running 'sloth train' with an invalid dataset or out-of-scope model returns the user/scope error WITHOUT docker being invoked (no image pull, no container launch) \u2014 assertable in a test",
+          "status": "confirmed"
+        }
+      ],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c15",
+      "kind": "requirement",
+      "text": "all docker orchestration lives in a new pure-stdlib sloth/tune/container.py (subprocess only, imports no torch); the existing _trainer.py real path becomes the in-container entrypoint invoked inside the container",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h2",
+          "text": "container.py imports and its preflight runs on a machine with NO torch installed (import-light preserved); the in-container entrypoint is the only code path that imports torch/unsloth",
+          "status": "confirmed"
+        }
+      ],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c16",
+      "kind": "requirement",
+      "text": "preflight failure (docker missing, image unpullable, or the nvidia GPU runtime unavailable) exits CliError code=2 with a remediation naming the NGC image + nvidia-container-toolkit requirement \u2014 never code=1 'file a bug'; and any in-container no-accelerator NotImplementedError is also mapped to code=2 with the NGC hint",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h3",
+          "text": "on a host with no docker or no GPU runtime, 'sloth train' exits code 2 and the hint names nvcr.io/nvidia/pytorch:25.11-py3 \u2014 asserted by a test that stubs preflight",
+          "status": "confirmed"
+        }
+      ],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c17",
+      "kind": "requirement",
+      "text": "a pytest 'gpu' marker is registered and a real-backend smoke test (tiny train -> eval -> export) carries @pytest.mark.gpu + skipif(no CUDA); it is skipped cleanly on CPU-only CI and exercises the real path when a CUDA device is present",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h4",
+          "text": "the gpu-marked smoke test is collected-but-skipped under CPU-only pytest (suite stays green) and runs the real backend when torch.cuda.is_available()",
+          "status": "confirmed"
+        }
+      ],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c18",
+      "kind": "assumption",
+      "text": "the unsloth-cli package source reaches the container via bind-mount of the checkout (dev) or 'pip install --no-deps unsloth-cli' (released) so the in-container entrypoint can import sloth; torch/unsloth come from the image + dep layer, never from sloth's deps",
+      "origin": "llm",
+      "status": "rejected",
+      "honesty_conditions": [],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c19",
+      "kind": "decision",
+      "text": "--dry-run stays fully host-side and GPU/docker-free (unchanged): imports no torch, launches no container, and now also prints the resolved docker image + command it WOULD run",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c20",
+      "kind": "decision",
+      "text": "Pin NVIDIA's official Spark recipe but install with UV, never pip: image nvcr.io/nvidia/pytorch:25.11-py3; inside the container install the dep layer via 'uv pip install --system' (uv bootstrapped with the astral standalone installer) \u2014 transformers, peft, hf_transfer, datasets==4.3.0, trl==0.26.1, and 'unsloth unsloth_zoo bitsandbytes' with --no-deps. No 'pip install' runs anywhere",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [],
+      "hard_questions": [
+        {
+          "id": "q2",
+          "text": "risk: installing via 'uv pip install --system' diverges from NVIDIA's pip-tested recipe; must be validated on GB10 hardware that uv resolves the identical working set (unsloth --no-deps + unsloth_zoo + bitsandbytes + trl==0.26.1 against the container's preinstalled torch) and that bootstrapping uv inside the container is reliable",
+          "resolved": false,
+          "blocking": false
+        }
+      ],
+      "links": []
+    },
+    {
+      "id": "c21",
+      "kind": "decision",
+      "text": "unsloth-cli carries NO torch/unsloth dependency at all \u2014 not a base dep, not an optional extra; the unsloth install is dropped completely and the GPU stack exists ONLY inside the container. sloth reaches the container by bind-mounting the checkout and running 'python -m sloth' against the mounted source (no install step, pip-free)",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c22",
+      "kind": "after_state",
+      "text": "the real train/eval/export verbs execute the GPU work inside NVIDIA's official NGC container (nvcr.io/nvidia/pytorch:25.11-py3) where a Blackwell-compatible torch already lives, with the unsloth dep layer added via 'uv pip install --system --no-deps unsloth unsloth_zoo bitsandbytes' (uv, never pip); the same dataset+config reproduces a real run on Spark",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h14",
+          "text": "the same dataset+config reproduces a real run; the container image + invocation are pinned and deterministic",
+          "status": "confirmed"
+        }
+      ],
+      "hard_questions": [],
+      "links": []
+    }
+  ],
+  "open_vagueness": [
+    {
+      "id": "v1",
+      "text": "dep-layer install caching: per-run 'pip install ...' (correct but slow, ~minutes/run) vs a prebuilt derived image vs a persistent pip-cache named volume \u2014 per-run install is the safe v1 default, caching is a later optimization",
+      "kind": "unknown_nonblocking",
+      "claim_id": null
+    },
+    {
+      "id": "v2",
+      "text": "image + dep pins will age: nvcr.io/nvidia/pytorch:25.11-py3, datasets==4.3.0, trl==0.26.1 need a documented bump/verify path",
+      "kind": "follow_up",
+      "claim_id": null
+    }
+  ]
+}

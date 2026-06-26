@@ -2,13 +2,27 @@
 
 Evaluates an adapter directory against a JSONL file whose records conform to the
 **task** schema (``{"task": …, "input": …, "expected_output": …}``).  All
-inference is local and offline: every model load uses ``local_files_only=True``
-and the heavy ML stack (torch, transformers, unsloth) is imported lazily inside
-:func:`_default_backend` so the introspection CLI keeps working on machines with
-no GPU or ML stack installed.
+inference is local and offline.
 
-The inference backend is exposed at module level as :data:`_inference_backend`
-so tests can monkeypatch it without touching the rest of the evaluation logic.
+This module is **ML-free** — it imports no torch, peft, or transformers at module
+level or anywhere.  The heavy ML work (model loading, PeftModel wrapping, eval
+loop) lives entirely in :func:`sloth.tune._trainer.run_eval`, which lazy-imports
+the ML stack inside its body.  This mirrors how ``train.py`` delegates to
+:func:`~sloth.tune._trainer.run_training`.
+
+**Host vs in-container routing**
+
+On the host (no ``--in-container`` flag) :func:`cmd_eval` validates the adapter
+directory and suite file, then hands off GPU/ML work to the NGC container via
+:func:`sloth.tune.container.launch`, forwarding all original args plus
+``--in-container`` to prevent docker recursion.  Identity bind-mounts are added
+for the parent directories of the adapter and suite so their host-absolute paths
+resolve unchanged inside the container.
+
+Inside the container (``--in-container`` is set) it runs the real eval by calling
+:func:`~sloth.tune._trainer.run_eval`, which loads the base model, wraps it with
+the LoRA adapter via ``PeftModel.from_pretrained(base, adapter)``, and scores
+the suite.
 
 Usage::
 
@@ -20,104 +34,27 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-from sloth.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
+from sloth.cli._errors import EXIT_USER_ERROR, CliError
 from sloth.cli._output import emit_result
+from sloth.tune import container
+from sloth.tune._trainer import run_eval
 from sloth.tune.datasets import validate_dataset
 
 # ---------------------------------------------------------------------------
-# Inference backend (mockable)
+# Checkout locator (repo root for container bind-mount)
 # ---------------------------------------------------------------------------
 
 
-def _default_backend(adapter_path: str, record: dict[str, str]) -> str:
-    """Load the adapter locally and generate a prediction for *record*.
+def _repo_root() -> Path:
+    """Return the unsloth-cli checkout root by walking up from this module.
 
-    Heavy ML imports (torch, transformers) are deferred here so the CLI works
-    on machines without the ML stack.  ``local_files_only=True`` is passed to
-    every ``from_pretrained`` call so no network access can occur.
-
-    Parameters
-    ----------
-    adapter_path:
-        Filesystem path to the adapter directory (must exist on disk).
-    record:
-        A validated task-schema record with ``"task"``, ``"input"``, and
-        ``"expected_output"`` keys.
-
-    Returns
-    -------
-    str
-        The raw decoded prediction from the model.
+    ``sloth/cli/_commands/eval.py`` → ``parents[3]`` is the checkout root (the
+    dir containing the ``sloth/`` package), which is bind-mounted inside the NGC
+    container so ``python -m sloth`` resolves without an install step.
     """
-    try:
-        import torch  # type: ignore[import]
-        from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore[import]
-    except ImportError as exc:
-        raise CliError(
-            code=EXIT_ENV_ERROR,
-            message=f"ML stack not installed: {exc}",
-            remediation=(
-                "Install the tuning stack: uv tool install unsloth-cli "
-                "(or run uv sync in a checkout)."
-            ),
-        ) from exc
-
-    # local_files_only=True loads only from the on-disk adapter, never the Hub,
-    # so B615's unpinned-remote-revision risk does not apply here.
-    tokenizer = AutoTokenizer.from_pretrained(adapter_path, local_files_only=True)  # nosec B615
-    model = AutoModelForCausalLM.from_pretrained(adapter_path, local_files_only=True)  # nosec B615
-    model.eval()
-
-    prompt = f"Task: {record['task']}\nInput: {record['input']}\nOutput:"
-    inputs = tokenizer(prompt, return_tensors="pt")
-    with torch.no_grad():
-        outputs = model.generate(**inputs, max_new_tokens=100)
-    return tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-
-# Module-level reference; override in tests via ``monkeypatch.setattr``.
-_inference_backend: Callable[[str, dict[str, str]], str] = _default_backend
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-
-def _evaluate(adapter_path: str, records: list[dict[str, str]]) -> list[dict[str, Any]]:
-    """Run the inference backend on each record and return structured results.
-
-    Parameters
-    ----------
-    adapter_path:
-        Filesystem path to the adapter directory.
-    records:
-        Validated task-schema records from :func:`sloth.tune.datasets.validate_dataset`.
-
-    Returns
-    -------
-    list[dict]
-        One result dict per record with keys: ``index``, ``task``, ``input``,
-        ``expected_output``, ``prediction``, ``exact_match``.
-    """
-    results: list[dict[str, Any]] = []
-    for i, record in enumerate(records):
-        prediction = _inference_backend(adapter_path, record)
-        expected = record["expected_output"]
-        exact_match = prediction.strip() == expected.strip()
-        results.append(
-            {
-                "index": i,
-                "task": record["task"],
-                "input": record["input"],
-                "expected_output": expected,
-                "prediction": prediction,
-                "exact_match": exact_match,
-            }
-        )
-    return results
+    return Path(__file__).resolve().parents[3]
 
 
 # ---------------------------------------------------------------------------
@@ -125,23 +62,36 @@ def _evaluate(adapter_path: str, records: list[dict[str, str]]) -> list[dict[str
 # ---------------------------------------------------------------------------
 
 
-def cmd_eval(args: argparse.Namespace) -> int:
+def cmd_eval(args: argparse.Namespace) -> int | None:
     """Handler for ``sloth eval``.
 
-    Validates the adapter directory and suite file, runs the eval suite through
-    the (mockable) inference backend, and emits results via the output contract.
+    On the **host** (``--in-container`` not set): validates the adapter directory
+    and suite file, then delegates GPU/ML work to the NGC container via
+    :func:`sloth.tune.container.launch` (forwarding all args plus
+    ``--in-container`` to prevent recursion).  Identity bind-mounts are added for
+    the parent directories of the adapter and suite paths so the host-absolute
+    paths forwarded in sloth_args resolve unchanged inside the container.
+    Returns ``None`` on success (implicit fall-through); :class:`CliError` is
+    raised (and propagated) on any container failure — ``launch()`` raises rather
+    than returning a non-zero int.
+
+    **Inside the container** (``--in-container`` is set): validates inputs, calls
+    :func:`~sloth.tune._trainer.run_eval` (the ML seam), and emits results via the
+    output contract.
 
     Parameters
     ----------
     args:
-        Parsed namespace with ``adapter``, ``suite``, and ``json`` attributes.
+        Parsed namespace with ``adapter``, ``suite``, ``json``, and
+        ``in_container`` attributes.
 
     Returns
     -------
-    int
-        ``0`` on success.  Failures raise :class:`CliError`.
+    int | None
+        ``None`` on success.  Failures raise :class:`CliError`.
     """
     json_mode = bool(getattr(args, "json", False))
+    in_container = bool(getattr(args, "in_container", False))
 
     # --- validate adapter dir ------------------------------------------------
     adapter = Path(args.adapter)
@@ -168,40 +118,54 @@ def cmd_eval(args: argparse.Namespace) -> int:
             ),
         )
 
-    # --- parse + validate the suite as task-schema JSONL --------------------
-    records = validate_dataset(suite, schema="task")
+    # --- HOST PATH: route GPU/ML work through the NGC container --------------
+    if not in_container:
+        adapter_abs = adapter.resolve()
+        suite_abs = suite.resolve()
+        sloth_args = [
+            "eval",
+            "--adapter",
+            str(adapter_abs),
+            "--suite",
+            str(suite_abs),
+        ]
+        if json_mode:
+            sloth_args.append("--json")
+        sloth_args.append("--in-container")
+        # Identity mounts so the host-absolute paths in sloth_args resolve
+        # unchanged inside the container without any path rewriting.
+        mount_parents = {adapter_abs.parent, suite_abs.parent}
+        extra_mounts = [(str(p), str(p)) for p in mount_parents]
+        container.launch(
+            sloth_args,
+            workdir=str(adapter_abs.parent),
+            checkout=str(_repo_root()),
+            extra_mounts=extra_mounts,
+        )
+        return
 
-    # --- run inference -------------------------------------------------------
-    results = _evaluate(str(adapter), records)
-
-    # --- compute summary -----------------------------------------------------
-    total = len(results)
-    exact = sum(1 for r in results if r["exact_match"])
-    score_pct = round(exact / total * 100, 2) if total else 0.0
-    summary: dict[str, Any] = {
-        "total": total,
-        "exact_match": exact,
-        "exact_match_pct": score_pct,
-        "results": results,
-    }
+    # --- IN-CONTAINER PATH: delegate to the ML seam -------------------------
+    # run_eval lazy-imports torch/transformers/peft inside its body; this
+    # module stays ML-free.
+    validate_dataset(suite, schema="task")  # fast pre-check before heavy ML load
+    summary: dict[str, Any] = run_eval(str(adapter), str(suite))
 
     # --- emit results --------------------------------------------------------
     if json_mode:
         emit_result(summary, json_mode=True)
     else:
+        results = summary.get("results", [])
         lines = [
             f"eval suite: {suite}",
             f"adapter:    {adapter}",
-            f"total:      {total}",
-            f"exact:      {exact}",
-            f"score:      {score_pct}%",
+            f"total:      {summary['total']}",
+            f"exact:      {summary['exact_match']}",
+            f"score:      {summary['exact_match_pct']}%",
         ]
         for r in results:
             mark = "[ok]" if r["exact_match"] else "[fail]"
             lines.append(f"  {mark} #{r['index']} {r['task']!r}")
         emit_result("\n".join(lines), json_mode=False)
-
-    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -226,4 +190,10 @@ def register(sub: argparse._SubParsersAction) -> None:
         help="Path to a task-schema JSONL eval suite.",
     )
     p.add_argument("--json", action="store_true", help="Emit structured JSON.")
+    p.add_argument(
+        "--in-container",
+        dest="in_container",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     p.set_defaults(func=cmd_eval)

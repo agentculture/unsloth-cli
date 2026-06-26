@@ -4,11 +4,29 @@ Copies or normalises a LoRA/QLoRA adapter directory into the canonical PEFT
 layout that the ``lobes`` server can serve and ``colleague`` can run:
 
     <output>/
-      adapter_config.json
-      adapter_model.safetensors
+      adapter_config.json          # required — PEFT adapter config
+      adapter_model.safetensors    # required — LoRA/QLoRA weight deltas
+      tokenizer.json               # optional — copied when present
+      tokenizer_config.json        # optional — copied when present
+      special_tokens_map.json      # optional — copied when present
+      vocab.json                   # optional — copied when present
+      merges.txt                   # optional — copied when present
+      tokenizer.model              # optional — copied when present (SentencePiece)
 
-No torch or ML runtime is required at import time; this is a pure
-stdlib file-system operation. Torch / Unsloth are never imported here.
+Container / ML-stack decision (resolves risk r4 from the build plan)
+----------------------------------------------------------------------
+``export`` is **pure stdlib — no container, no torch, no peft**.
+
+The rationale: unsloth/PEFT write the adapter weights in safetensors format
+*during training*, so by the time the trainer exits the adapter directory
+already contains the canonical PEFT files.  Nothing in the export step requires
+loading or converting weights — the verb reorganises and validates file-system
+artefacts.  ``sloth.tune.container`` is **not imported here**; no docker process
+is launched.
+
+Contrast with ``train`` (GPU compute → container) and ``eval`` (PeftModel load
+→ container): those verbs genuinely need the ML stack.  ``export`` does not.
+Torch / Unsloth are never imported anywhere in this module.
 """
 
 from __future__ import annotations
@@ -23,24 +41,43 @@ from sloth.cli._output import emit_result
 # The only format supported today. Extend this set as new formats land.
 SUPPORTED_FORMATS: frozenset[str] = frozenset({"safetensors"})
 
-# Canonical PEFT file names that must be present in the output directory.
-PEFT_FILES = [
+# Canonical PEFT file names that MUST be present in the adapter directory.
+# Their absence is a hard error — an export without these files is unusable.
+PEFT_FILES: list[str] = [
     "adapter_config.json",
     "adapter_model.safetensors",
 ]
 
+# Tokenizer files that are copied when present but are NOT required.
+# A trained adapter may bundle the tokenizer alongside the weights; if it does,
+# lobes / colleague benefit from having those files in the export directory.
+OPTIONAL_TOKENIZER_FILES: list[str] = [
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "vocab.json",
+    "merges.txt",
+    "tokenizer.model",
+]
+
 
 def _export_safetensors(adapter: Path, output: Path) -> list[str]:
-    """Copy standard PEFT files from *adapter* into *output*.
+    """Copy required PEFT files and any optional tokenizer files from *adapter* to *output*.
 
-    If *adapter* and *output* resolve to the same directory, the copy is skipped
+    If *adapter* and *output* resolve to the same directory, copies are skipped
     and the files are reported as-is (normalise-in-place semantics).
 
-    Returns a list of absolute string paths for the files present in *output*.
+    Required files (``PEFT_FILES``) are assumed already validated present by the
+    caller; optional files (``OPTIONAL_TOKENIZER_FILES``) are silently skipped
+    when absent — they are not mandatory for a valid PEFT layout.
+
+    Returns a list of absolute string paths for all files written/present in *output*.
     """
     output.mkdir(parents=True, exist_ok=True)
     written: list[str] = []
-    for fname in PEFT_FILES:
+
+    # Copy all files that should appear in the output: required first, then optional.
+    for fname in PEFT_FILES + OPTIONAL_TOKENIZER_FILES:
         src = adapter / fname
         if not src.exists():
             continue
@@ -48,6 +85,7 @@ def _export_safetensors(adapter: Path, output: Path) -> list[str]:
         if src.resolve() != dst.resolve():
             shutil.copy2(src, dst)
         written.append(str(dst.resolve()))
+
     return written
 
 
@@ -94,7 +132,7 @@ def cmd_export(args: argparse.Namespace) -> int:
     # --- Determine output directory (default: normalise in place) ---
     output = Path(args.output) if args.output else adapter
 
-    # --- Perform the export ---
+    # --- Perform the export (pure filesystem — no container, no torch) ---
     if fmt == "safetensors":
         files = _export_safetensors(adapter, output)
 
