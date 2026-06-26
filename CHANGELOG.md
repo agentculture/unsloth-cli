@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-06-26
+
+### Changed
+
+- CLAUDE.md: documented issue #6 fine-tuning design constraints (LoRA/QLoRA adapter scope, train/eval/export verbs, dataset schemas, role-specific adapters, fine-tune vs. RAG boundary) and the optional-extra/subprocess rule for the GPU stack.
+- CLAUDE.md: added an AgentCulture sibling-ecosystem map (agentfront/steward/guildmaster/devague/devex/agtag/lobes/colleague/culture/daria) and noted the teken→agentfront rename.
+
 ## [0.3.0] - 2026-06-24
 
 ### Added
