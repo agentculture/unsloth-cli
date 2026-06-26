@@ -8,6 +8,8 @@ from sloth.tune.scope import (
     LARGE_DENSE_THRESHOLD_B,
     SUPPORTED_ADAPTER_METHODS,
     ScopeResult,
+    _is_large_model,
+    _parse_largest_param_count,
     check_scope,
 )
 
@@ -171,3 +173,39 @@ class TestUnknownMethod:
         assert result.out_of_scope is True
         assert result.ok is False
         assert result.warning is not None
+
+
+# ---------------------------------------------------------------------------
+# Parameter-count parsing — regex-free scan (no ReDoS surface; Sonar S5852)
+# ---------------------------------------------------------------------------
+
+
+class TestParseParamCount:
+    @pytest.mark.parametrize(
+        "model,expected",
+        [
+            ("unsloth/Qwen3-4B", 4.0),
+            ("Qwen2.5-72B", 72.0),
+            ("unsloth/Qwen3.6-27B-dense", 27.0),
+            ("Qwen3-235B-A22B", 235.0),
+            ("some-org/qwen2-57b-a14b", 57.0),  # active-param suffix ignored
+            ("model-1.5b", 1.5),
+            ("no-params-here", None),
+            ("", None),
+        ],
+    )
+    def test_parse_largest_param_count(self, model: str, expected) -> None:
+        assert _parse_largest_param_count(model) == expected
+
+    @pytest.mark.parametrize(
+        "model,is_large",
+        [
+            ("unsloth/Qwen3-4B", False),
+            ("unsloth/Qwen3-9B", False),
+            ("Qwen/Qwen3-27B", True),
+            ("Qwen/Qwen3-72B", True),
+            ("no-digits", False),
+        ],
+    )
+    def test_is_large_model(self, model: str, is_large: bool) -> None:
+        assert _is_large_model(model) is is_large

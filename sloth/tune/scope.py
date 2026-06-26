@@ -24,7 +24,6 @@ Thresholds
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 
 # ---------------------------------------------------------------------------
@@ -97,21 +96,61 @@ class ScopeResult:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-# Possessive quantifiers (``\d++``) make this regex linear: once the digit run is
-# consumed it is never given back, so no input can trigger the polynomial
-# backtracking that an ambiguous ``\d+(?:\.\d+)?`` would (CWE-1333 / Sonar S5852).
-_PARAM_COUNT_RE = re.compile(
-    r"(?<![a-z])(\d++(?:\.\d++)?)b(?!\w)",
-    re.IGNORECASE,
-)
+
+def _scan_number_span(model: str, start: int) -> int:
+    """Return the exclusive end index of the number beginning at *start*.
+
+    Consumes a digit run, optionally followed by a single ``.`` and more digits.
+    *start* must point at a digit, so the returned index is always > *start*.
+    """
+    n = len(model)
+    j = start
+    while j < n and model[j].isdigit():
+        j += 1
+    if j < n and model[j] == "." and j + 1 < n and model[j + 1].isdigit():
+        j += 1
+        while j < n and model[j].isdigit():
+            j += 1
+    return j
+
+
+def _is_param_token(model: str, start: int, end: int) -> bool:
+    """Return ``True`` when ``model[start:end]`` is a ``<number>`` followed by a 'b'.
+
+    Mirrors the boundaries of the old ``(?<![a-z])(\\d+(?:\\.\\d+)?)b(?!\\w)``
+    pattern: the number must be immediately followed by ``b``/``B``, must not be
+    preceded by an ASCII letter, and the ``b`` must not be followed by a word
+    character.
+    """
+    n = len(model)
+    if end >= n or model[end] not in ("b", "B"):
+        return False
+    before = model[start - 1] if start > 0 else ""
+    after = model[end + 1] if end + 1 < n else ""
+    if before.isascii() and before.isalpha():
+        return False
+    return not (after and (after.isalnum() or after == "_"))
 
 
 def _parse_largest_param_count(model: str) -> float | None:
-    """Return the largest parameter count (in billions) found in *model*, or ``None``."""
-    matches = _PARAM_COUNT_RE.findall(model)
-    if not matches:
-        return None
-    return max(float(m) for m in matches)
+    """Return the largest parameter count (in billions) found in *model*, or ``None``.
+
+    Uses a hand-rolled scan rather than a regular expression: there is no
+    backtracking surface for a crafted input to exploit (CWE-1333 / Sonar
+    S5852), while the ``<number>b`` matches stay equivalent to the old pattern.
+    """
+    counts: list[float] = []
+    i = 0
+    n = len(model)
+    while i < n:
+        if model[i].isdigit():
+            end = _scan_number_span(model, i)
+            if _is_param_token(model, i, end):
+                counts.append(float(model[i:end]))
+            i = end
+        else:
+            i += 1
+    return max(counts) if counts else None
 
 
 def _is_large_model(model: str) -> bool:
