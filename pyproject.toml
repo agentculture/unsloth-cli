@@ -13,7 +13,7 @@ classifiers = [
     "Topic :: Software Development",
     "Intended Audience :: Developers",
 ]
-dependencies = []
+dependencies = ["unsloth", "torch"]
 
 [project.urls]
 Homepage = "https://github.com/agentculture/unsloth-cli"
