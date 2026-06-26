@@ -8,13 +8,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 agent + CLI that simplifies fine-tuning with Unsloth* (adding complementary
 actions so an agent can fine-tune models more easily).
 
-**Today the repo is the scaffold, not the product.** It carries a working
+**The repo is moving from scaffold to product.** It carries a working
 agent-first CLI of *introspection* verbs (`whoami`, `learn`, `explain`,
 `overview`, `doctor`, `cli`) cited from teken's `python-cli` reference, a mesh
-identity, the vendored skill kit, and the CI/deploy baseline — but **no Unsloth
-fine-tuning verbs exist yet.** Building those is the main forward work, and the
-"Adding a verb or noun group" section below is the seam to do it through — the
-**forward work** section distills issue #6's design constraints for those verbs.
+identity, the vendored skill kit, and the CI/deploy baseline. The Unsloth
+fine-tuning verbs (`train`, `eval`, `export`) are now **designed and being
+built** on top of that base (issue #6; the converged spec + plan live under
+`docs/specs/` and `docs/plans/`). The "Adding a verb or noun group" section
+below is the seam they go through, and the **forward work** section captures
+their decided design.
 
 ## Naming: `sloth` vs `unsloth-cli` (read this first)
 
@@ -52,13 +54,19 @@ uv run sloth whoami                           # smoke-run the CLI
 ```
 
 `black` and `isort` (profile=black) both use **line-length 100** — match it.
-`teken` is a **dev-only** dependency; the runtime has `dependencies = []` and
-must stay that way (see "Zero runtime dependencies").
+`teken` is a **dev-only** dependency. The runtime *does* carry base deps now
+(unsloth + torch — see "Base runtime dependency + lazy imports"); what keeps the
+introspection verbs fast is the **lazy-import discipline**, not an empty
+dependency list.
 
 ## Architecture
 
-The package is a thin, dependency-free argparse CLI built around four stable
-contracts. Understanding these four is enough to add features safely.
+The introspection CLI is a thin, **pure-stdlib** argparse core built around four
+stable contracts — understanding these four is enough to add features safely.
+The heavy ML stack (unsloth/torch) is a base runtime dependency but is **never
+imported at module top level**; the tuning verbs lazy-import it inside their
+handlers (see "Base runtime dependency + lazy imports"), so this core stays
+import-light and fast to start.
 
 ### 1. Dispatch + error propagation (`sloth/cli/__init__.py`)
 
@@ -133,10 +141,10 @@ Each command is a module under `sloth/cli/_commands/` exposing
 
 `whoami` parses the agent's **own** `culture.yaml` — found by walking *up from
 `__file__`*, not from the caller's CWD — with a hand-rolled scalar parser (no
-YAML dependency, to keep runtime deps empty). In a wheel install no
-`culture.yaml` ships, so it falls back to literal defaults and `doctor` reports
-a single info check and exits 0. `doctor` reuses this to verify the
-`steward doctor` invariants: **prompt-file-present** + **backend-consistency**
+YAML dependency, so the introspection path stays import-light). In a wheel
+install no `culture.yaml` ships, so it falls back to literal defaults and
+`doctor` reports a single info check and exits 0. `doctor` reuses this to verify
+the `steward doctor` invariants: **prompt-file-present** + **backend-consistency**
 (`claude`→`CLAUDE.md`, `acp`→`AGENTS.md`, `gemini`→`GEMINI.md`) plus a
 **skills-present** check, emitting the rubric-shaped
 `{healthy, checks: [{id, passed, severity, message, remediation}]}`.
@@ -145,20 +153,41 @@ a single info check and exits 0. `doctor` reuses this to verify the
 
 The repo's reason to exist is a Spark-friendly **adapter-tuning** workflow for
 Qwen models — *not* full fine-tuning.
-[Issue #6](https://github.com/agentculture/unsloth-cli/issues/6) is the spec;
-build it through the "Adding a verb or noun group" seam above. The load-bearing
-decisions there:
+[Issue #6](https://github.com/agentculture/unsloth-cli/issues/6) is the source;
+the converged spec + plan under `docs/specs/` and `docs/plans/` are the design of
+record (this section summarizes them). Build it through the "Adding a verb or
+noun group" seam above. The settled, load-bearing decisions:
 
 - **Scope is LoRA / QLoRA adapters**, small models first (Qwen 3.x 4B/9B) then
   larger local adapters (Qwen 3.6 27B dense, Qwen coder variants). The CLI must
-  *explicitly warn* that full fine-tuning of large dense models is out of scope.
-- **Three planned verbs.** `train` (validate JSONL → run a small LoRA/QLoRA job
-  → write training metadata next to the adapter output), `eval` (run an adapter
-  against a small local eval suite), `export` (adapter → safetensors). Config
-  files drive repeatable runs; document Spark-friendly defaults.
+  *explicitly warn* that full fine-tuning of large dense models is out of scope
+  and refuse or downgrade to adapter-only (the `sloth/tune/scope.py` guard).
+- **Three flat verbs — `train`, `eval`, `export`.** They are **global** verbs
+  (siblings of `whoami`/`explain`, *not* a `tune` noun group), which is
+  rubric-legal because global verbs don't require an `overview` sub-verb. `train`
+  validates the dataset → scope-guards the target → runs a small LoRA/QLoRA job
+  (or `--dry-run`s the resolved plan) → writes training metadata next to the
+  adapter output; `eval` runs an adapter against a small **local, offline** eval
+  suite; `export` turns an adapter into a standard PEFT/safetensors layout (so
+  `lobes` can serve it and `colleague` can run it as a backend).
+- **TOML run-configs** parsed read-only with stdlib `tomllib` (the 3.12+ floor
+  has it) drive repeatable runs; omitted fields fall back to documented
+  Spark-friendly defaults, and the same config + dataset reproduces the same run.
+- **A dependency-free core under `sloth/tune/`.** `datasets.py` (JSONL schema
+  validation), `config.py` (the TOML loader + defaults), `metadata.py` (the
+  run-metadata writer), and `scope.py` (the adapter-OK vs out-of-scope guard) are
+  **pure stdlib and import no torch** — so dataset/config/scope validation
+  happens *before* any GPU spend. Only `_trainer.py` touches the ML stack, and it
+  **lazy-imports unsloth/torch inside its run function** (raising
+  `CliError(code=2)` with an install hint when the stack is unavailable). This is
+  the same seam as any other command, just with a heavy-import-isolating core.
 - **Two dataset schemas, validated *before* spending GPU**: a **chat** format
   (`{"messages":[{role,content}, ...]}`) and a **task** format
   (`{"task","input","expected_output"}`).
+- **A `/finetune` skill** (`.claude/skills/finetune/`) drives the full loop —
+  validate dataset → `sloth train` → `sloth eval` → `sloth export` — wrapping the
+  flat CLI verbs non-interactively (forwarding `--json`, surfacing
+  `error:`/`hint:`).
 - **Role-specific adapters, not one mixed blob** — e.g. `culture-contract-lora`,
   `agentculture-cli-teacher-lora`, `repo-maintainer-lora`, `issue-writer-lora`,
   `tool-router-lora`, `agent-first-coach-lora`.
@@ -168,14 +197,11 @@ decisions there:
   teacher behavior for `learn`). Memory/RAG stores *changing facts* (project
   state, secrets, user-specific memory). The README must explain this split.
 
-**Critical constraint:** Unsloth/torch are heavy and GPU-bound, but
-`dependencies = []` is load-bearing (see "Zero runtime dependencies"). The ML
-stack must arrive as an **optional extra** (e.g. a `train` entry under
-`[project.optional-dependencies]`) or be invoked as an external subprocess
-resolved via `shutil.which` — never a hard top-level import. The introspection
-CLI has to keep working on a machine with no GPU and no torch. These verbs also
-connect to siblings: `lobes` serves the resulting models locally and `colleague`
-runs model backends (see the ecosystem map below).
+The dependency question is **settled, not open**: unsloth + torch are a base
+runtime dependency and the tuning verbs lazy-import them — see "Base runtime
+dependency + lazy imports" under "Conventions that gate merges". These verbs
+connect to siblings: `lobes` serves the resulting adapters locally and
+`colleague` runs them as model backends (see the ecosystem map below).
 
 ## The agent-first rubric gate (must stay green)
 
@@ -208,11 +234,21 @@ not.
   status, reply to review threads, and `await` (gates on the Sonar gate +
   unresolved threads). Do **not** self-merge — open the PR and await human
   merge. Replies auto-sign `- unsloth-cli (Claude)`.
-- **Zero runtime dependencies.** `dependencies = []` is load-bearing (the CLI
-  is pure stdlib). Anything heavier — including Unsloth/torch when the domain
-  verbs arrive — should be an **optional extra** or invoked as an external
-  subprocess (resolved via `shutil.which`), not a hard runtime import, so the
-  introspection CLI keeps working on a machine without the ML stack.
+- **Base runtime dependency + lazy imports.** unsloth + torch are a **base
+  runtime dependency** (`[project].dependencies`) — `uv tool install unsloth-cli`
+  brings the full tuning stack. This is a **deliberate reversal** of the old
+  `dependencies = []` / "zero runtime dependencies" rule (`uv` is the default
+  installer and bundling the stack beats an optional extra). The discipline that
+  *replaces* the old rule: **never import torch/unsloth at module top level.**
+  Handlers lazy-import them inside the function body, the `sloth/tune/` core
+  modules (`datasets`, `config`, `metadata`, `scope`) stay pure-stdlib, and the
+  introspection verbs (`whoami`/`learn`/`explain`/`doctor`/`overview`/`cli`) keep
+  fast startup. The afi rubric gate checks the **CLI contract, not the dependency
+  count**, so a base dep does not turn it red — but a top-level heavy import that
+  slowed introspection would. (Trade-off accepted: `uv tool install` now *fails*
+  on an arch where the torch/unsloth wheels don't resolve, so Spark ARM/Blackwell
+  wheel availability must hold; the introspection CLI is no longer guaranteed to
+  install everywhere.)
 
 ## Vendored skills (cite-don't-import)
 

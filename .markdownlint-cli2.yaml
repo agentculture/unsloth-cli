@@ -21,3 +21,13 @@ ignores:
   - ".teken/**"
   # Vendored skills are cited verbatim from guildmaster — do not reformat them.
   - ".claude/skills/**"
+  # The virtualenv carries vendored package READMEs (unsloth/torch are base deps
+  # now) — not our prose; never lint them. The CI lint job runs `uv sync` before
+  # markdownlint, so .venv exists when the linter walks the tree.
+  - ".venv/**"
+  # devague-generated specs/plans use <placeholder> angle-bracket syntax that
+  # markdownlint reads as inline HTML (MD033). They are tool artifacts, not prose.
+  - "docs/specs/**"
+  - "docs/plans/**"
+  # devague frame/review working state (mostly gitignored anyway).
+  - ".devague/**"

@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-06-26
+
+### Added
+
+- `sloth train` / `sloth eval` / `sloth export` verbs for Spark-friendly LoRA/QLoRA adapter fine-tuning of Qwen models (issue #6)
+- Dependency-free `sloth/tune/` core: JSONL dataset validation (chat + task schemas), TOML run-config loader with Spark-friendly defaults, training-metadata writer (model/method/dataset sha256+lines/hyperparams/timestamp), and a model-scope guard that refuses out-of-scope large-dense full fine-tuning
+- Lazy LoRA/QLoRA trainer (`sloth/tune/_trainer.py`) that imports unsloth/torch only inside its run function, with a GPU-free `--dry-run` plan path
+- `/finetune` skill driving the validate -> train -> eval -> export loop non-interactively
+- explain catalog entries for the three new verbs
+
+### Changed
+
+- unsloth + torch are now BASE runtime dependencies — `uv tool install unsloth-cli` brings the full tuning stack — retiring the prior zero-runtime-dependency rule; introspection verbs stay torch-free and fast via lazy imports, and the afi rubric gate stays green
+- CLAUDE.md and README now document the base-dependency policy, the lazy-import discipline, and the fine-tune vs memory/RAG vs retrieval boundary
+- markdownlint excludes `.venv` (vendored package READMEs now present via base deps) and devague-generated specs/plans
+
+### Fixed
+
+- `validate_dataset` now fails fast with `CliError` (exit 1) on an empty or blank-only dataset instead of returning `[]` and letting `train` proceed to model load (qodo review)
+- `sloth export` refuses an adapter directory that lacks the canonical PEFT files (`adapter_config.json`, `adapter_model.safetensors`) instead of reporting success with an empty file list (qodo review)
+- `dataset_digest` counts JSONL **records** (non-blank lines) rather than `b"\n"` bytes, so `training_metadata.json` `line_count` is correct for files without a trailing newline and ignores blank separator lines (qodo review)
+- `load_config` validates hyperparameter **types and ranges** (rejecting strings, booleans-for-ints, and out-of-range values) before constructing `RunConfig`, surfacing actionable `CliError`s instead of failing deep in the ML stack (qodo review)
+- `_trainer._run_real` validates/loads the dataset **before** the expensive model load, honoring the "validate before spending GPU" contract (qodo review)
+- `sloth train --help` now states the LoRA/QLoRA-only scope and full-fine-tuning refusal up front (qodo review)
+- Hardened the model parameter-count regex (`sloth/tune/scope.py`) with possessive quantifiers to remove a polynomial-backtracking (ReDoS) risk flagged by Sonar (S5852); renamed `_Backend` fields to snake_case (S116), reduced `_validate_chat_record` cognitive complexity (S3776), and switched a type hint to the `X | Y` union form (S6546)
+
 ## [0.3.1] - 2026-06-26
 
 ### Changed
