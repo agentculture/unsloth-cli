@@ -229,3 +229,9 @@ skills.local.yaml
 
 # stray subagent worktrees
 .claude/worktrees/
+
+# fine-tuning run outputs (adapters, metadata) — examples write here
+runs/
+
+# unsloth writes a compiled-kernel cache to the working dir during training
+unsloth_compiled_cache/

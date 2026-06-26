@@ -79,6 +79,11 @@ def _make_fake_backend() -> tuple[SimpleNamespace, dict]:
             events["saved"].append(("model", str(path)))
 
     class FakeTokenizer:
+        eos_token = "<eos>"
+
+        def apply_chat_template(self, messages, tokenize=False):
+            return f"<chat>{messages}</chat>"
+
         def save_pretrained(self, path):
             events["saved"].append(("tokenizer", str(path)))
 
@@ -337,8 +342,13 @@ class TestDatasetWrapping:
             f"got {trainer_kwargs['train_dataset']!r} instead of FakeDataset sentinel"
         )
 
-    def test_from_list_called_with_raw_records(self, tmp_path: Path, monkeypatch) -> None:
-        """Dataset.from_list must be called with the raw list[dict] loaded from the file."""
+    def test_from_list_called_with_rendered_text_records(self, tmp_path: Path, monkeypatch) -> None:
+        """Dataset.from_list must receive records rendered into a single ``text`` column.
+
+        ``_run_real`` renders each validated record (chat → chat template, task →
+        prompt shape) into ``{"text": ...}`` before wrapping, so SFTTrainer does not
+        depend on trl/unsloth conversational auto-detection.
+        """
         config = _config(tmp_path)
         _write_chat_dataset(Path(config.dataset))
         backend, _ = _make_fake_backend()
@@ -353,7 +363,7 @@ class TestDatasetWrapping:
         records = from_list_calls[0]
         assert isinstance(records, list), f"Expected list, got {type(records)}"
         assert len(records) == 1, f"Expected 1 record (one line in fixture), got {len(records)}"
-        assert "messages" in records[0], "Record did not match expected chat schema"
+        assert "text" in records[0], "Record was not rendered into a single 'text' field"
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +469,11 @@ class TestNoAcceleratorError:
                 pass
 
         class FakeTokenizer:
+            eos_token = "<eos>"
+
+            def apply_chat_template(self, messages, tokenize=False):
+                return f"<chat>{messages}</chat>"
+
             def save_pretrained(self, path):
                 pass
 
@@ -493,6 +508,83 @@ class TestNoAcceleratorError:
             run_training(config, dry_run=False)
         assert exc_info.value.code == 2
         assert "nvcr.io/nvidia/pytorch:25.11-py3" in exc_info.value.remediation
+
+
+# ---------------------------------------------------------------------------
+# 7b. GPU out-of-memory -> CliError(code=2) with a memory remediation
+# ---------------------------------------------------------------------------
+
+
+class TestGpuOomMapping:
+    """A CUDA/accelerator OOM must surface as CliError(code=2), not a code-1 "file a
+    bug". Unsloth raises it at *import* (GPU probe) on a memory-starved box and during
+    training; both are environment errors with a free-memory remediation."""
+
+    def test_oom_at_backend_load_maps_to_code_2(self, tmp_path: Path, monkeypatch) -> None:
+        config = _config(tmp_path)
+        _write_chat_dataset(Path(config.dataset))
+
+        def _oom():
+            raise RuntimeError("CUDA error: out of memory")
+
+        monkeypatch.setattr(_trainer, "_load_backend", _oom)
+        with pytest.raises(CliError) as exc_info:
+            run_training(config, dry_run=False)
+        assert exc_info.value.code == 2
+        assert "memory" in exc_info.value.remediation.lower()
+
+    def test_oom_during_train_maps_to_code_2(self, tmp_path: Path, monkeypatch) -> None:
+        config = _config(tmp_path)
+        _write_chat_dataset(Path(config.dataset))
+
+        class FakeModel:
+            def save_pretrained(self, path):
+                pass
+
+        class FakeTokenizer:
+            eos_token = "<eos>"
+
+            def apply_chat_template(self, messages, tokenize=False):
+                return f"<chat>{messages}</chat>"
+
+            def save_pretrained(self, path):
+                pass
+
+        class FakeFLM:
+            @staticmethod
+            def from_pretrained(**kw):
+                return FakeModel(), FakeTokenizer()
+
+            @staticmethod
+            def get_peft_model(model, **kw):
+                return model
+
+        class FakeTrainerOom:
+            def __init__(self, **kw):
+                pass
+
+            def train(self):
+                raise RuntimeError("CUDA error: out of memory")
+
+        backend = SimpleNamespace(
+            fast_language_model=FakeFLM,
+            sft_trainer=FakeTrainerOom,
+            sft_config=lambda **kw: kw,
+            torch=SimpleNamespace(),
+        )
+        monkeypatch.setattr(_trainer, "_load_backend", lambda: backend)
+
+        class FakeDataset:
+            @classmethod
+            def from_list(cls, records):
+                return cls
+
+        monkeypatch.setitem(sys.modules, "datasets", SimpleNamespace(Dataset=FakeDataset))
+
+        with pytest.raises(CliError) as exc_info:
+            run_training(config, dry_run=False)
+        assert exc_info.value.code == 2
+        assert "memory" in exc_info.value.remediation.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -533,15 +625,31 @@ class TestRunEval:
         from types import SimpleNamespace
         from unittest.mock import MagicMock
 
+        # A dict that also supports ``.to(device)`` (mirrors a transformers BatchEncoding).
+        class _FakeInputs(dict):
+            def to(self, device):
+                calls["inputs_moved_to"] = device
+                return self
+
+        # fake model returned by PeftModel.from_pretrained — exposes parameters()/eval()/
+        # generate() like a real (GPU-resident) model so run_eval can read its device.
+        class _FakeEvalModel:
+            def eval(self):
+                return self
+
+            def parameters(self):
+                yield SimpleNamespace(device="cpu")
+
+            def generate(self, **kw):
+                return [[1, 2, 3]]
+
         # fake PeftModel (records base + adapter_path)
         class FakePeftModel:
             @staticmethod
             def from_pretrained(base, adapter_path, **kw):
                 calls["peft_base"] = base
                 calls["peft_adapter"] = adapter_path
-                m = MagicMock()
-                m.generate.return_value = [[1, 2, 3]]
-                return m
+                return _FakeEvalModel()
 
         # fake AutoModelForCausalLM (records the name it was called with)
         class FakeAutoModel:
@@ -553,7 +661,7 @@ class TestRunEval:
         # fake AutoTokenizer
         class _FakeTok:
             def __call__(self, prompt, **kw):
-                return {"input_ids": [[1, 2, 3]]}
+                return _FakeInputs(input_ids=[[1, 2, 3]])
 
             def decode(self, tokens, **kw):
                 return "cba"

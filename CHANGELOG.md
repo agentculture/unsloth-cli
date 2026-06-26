@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-06-27
+
+### Added
+
+- Validated real LoRA and QLoRA adapter fine-tuning end-to-end on an NVIDIA DGX Spark (GB10, Blackwell) via the shipped `sloth train`/`eval`/`export` verbs — the first on-hardware runs (loss decreases, a loadable PEFT adapter + run metadata are written, eval and export complete)
+- `examples/` with runnable artifacts: a chat dataset (`chat-smoke.jsonl`), a task eval suite (`eval-suite.jsonl`), and QLoRA/LoRA TOML configs
+- Fine-tuning docs: `docs/fine-tuning.md` (feature reference), `docs/dgx-spark.md` (DGX Spark operator guide + gotchas), `docs/benchmarks.md` (measured results), `docs/tested.md` (the exact tested-vs-untested matrix — validated on `unsloth/Qwen3-1.7B`, **not** on Qwen 4B/9B)
+- First-party `/unsloth-cli-guide` skill that explains how to use the CLI (the two faces, the agent-first contract, the fine-tuning loop, Spark prerequisites), surfacing the CLI's own live `learn`/`overview`/`explain` output
+
+### Changed
+
+- In-container dep layer now installs into a `--system-site-packages` venv (a bare `uv pip install --system` fails on the NGC image — PEP-668 as root, root-owned site-packages under `--user`) and uninstalls the venv-pulled torch so the container's Blackwell-native nv torch shows through
+- Dep-layer pins corrected and validated against NGC 25.11's torch 2.10: transformers==4.57.1, peft==0.18.0, trl==0.24.0 (the prior trl==0.26.1 was outside unsloth's range; peft>=0.19 hard-requires torchao>0.16 which needs torch>=2.11 the container lacks)
+- `build_command` now mounts the host Hugging Face cache (HF_HOME) so models are reused across runs, and always sets `PYTORCH_ALLOC_CONF=expandable_segments:True` to avoid UMA OOM on the Spark
+- `train` resolves relative dataset/output paths against the working directory consistently, so host-side validation and the in-container run agree (a config in a subdirectory no longer double-resolves its dataset path)
+
+### Fixed
+
+- `_trainer` called `SFTTrainer(tokenizer=...)` — trl 0.24 renamed it to `processing_class`
+- `_trainer` imported trl before unsloth — unsloth must be imported first or trl's SFTConfig `<EOS_TOKEN>` sentinel is left unpatched (`eos_token '<EOS_TOKEN>' is not found in the vocabulary`)
+- `_trainer` now renders each dataset record into a single `text` column (chat template / task prompt) so SFTTrainer does not require a `formatting_func`
+- `run_eval` now moves tokenized inputs to the model's device before `generate()` (was raising `Expected all tensors to be on the same device`)
+- A CUDA/accelerator out-of-memory error now maps to `CliError(code=2)` with a memory remediation instead of a code-1 'file a bug' (unsloth raises it at import on a memory-starved box)
+
 ## [0.4.1] - 2026-06-26
 
 ### Changed

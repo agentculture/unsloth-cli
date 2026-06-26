@@ -145,20 +145,25 @@ def _resolve_container_invocation(
     the path resolves unchanged inside the container without any
     ``/workspace/<name>`` rewriting.
     """
-    config_dir = config_path.parent
+    # Relative dataset/output paths resolve against the current working directory
+    # (where ``sloth train`` was invoked) — the SAME base the host-side
+    # ``validate_dataset`` uses and the dir bind-mounted as the container workdir.
+    # Resolving against the config's *parent* instead (the prior behavior) made the
+    # host check and the in-container run disagree whenever the config lived in a
+    # subdirectory, e.g. ``examples/run.toml`` referencing ``examples/data.jsonl``
+    # double-resolved to ``examples/examples/data.jsonl`` inside the container.
+    base_dir = Path.cwd()
 
-    # Resolve dataset and output to absolute paths (TOML values may be relative;
-    # the convention is relative-to-config-dir, not relative-to-CWD).
     dataset_path = Path(config.dataset)
     if not dataset_path.is_absolute():
-        dataset_path = (config_dir / dataset_path).resolve()
+        dataset_path = (base_dir / dataset_path).resolve()
     output_path = Path(config.output)
     if not output_path.is_absolute():
-        output_path = (config_dir / output_path).resolve()
+        output_path = (base_dir / output_path).resolve()
 
-    # Identity mounts so host-absolute paths forwarded in sloth_args resolve
-    # unchanged inside the container (host_path == container_path).
-    mount_parents = {config_path.parent, dataset_path.parent, output_path.parent}
+    # Identity mounts so host-absolute paths (the forwarded config, the dataset, and
+    # the output dir) resolve unchanged inside the container (host_path == container_path).
+    mount_parents = {base_dir, config_path.parent, dataset_path.parent, output_path.parent}
     extra_mounts: list[tuple[str, str]] = [(str(p), str(p)) for p in mount_parents]
 
     # Forward the ABSOLUTE config path; identity mounts make it resolve inside
@@ -167,7 +172,7 @@ def _resolve_container_invocation(
     if json_mode:
         sloth_args.append("--json")
 
-    return config_dir, extra_mounts, sloth_args
+    return base_dir, extra_mounts, sloth_args
 
 
 # ---------------------------------------------------------------------------

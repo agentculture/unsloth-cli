@@ -50,6 +50,25 @@ installed as pip dependencies — they run inside an NGC Docker container that t
 fine-tuning verbs orchestrate. The introspection verbs (`whoami`, `learn`, `explain`,
 etc.) install and start everywhere, with no GPU stack required.
 
+> **Validated on hardware (2026-06-26):** real LoRA *and* QLoRA runs complete on an
+> NVIDIA **DGX Spark (GB10, Blackwell)** via the shipped `sloth train` — loss
+> decreases over real steps, a loadable PEFT adapter + run metadata are written, and
+> `sloth eval` / `sloth export` complete on the adapter. See
+> [`docs/benchmarks.md`](docs/benchmarks.md).
+
+**Deeper docs:** [feature reference](docs/fine-tuning.md) ·
+[DGX Spark operator guide](docs/dgx-spark.md) · [benchmarks](docs/benchmarks.md) ·
+[exactly what was tested](docs/tested.md). New to the CLI? The `/unsloth-cli-guide`
+skill explains how to use it. Ready-to-run example datasets + configs live in
+[`examples/`](examples/):
+
+```bash
+uv run sloth train --config examples/qlora-smoke.toml --dry-run   # GPU-free plan + docker command
+uv run sloth train --config examples/qlora-smoke.toml             # real QLoRA run (NGC container)
+uv run sloth eval  --adapter runs/qlora-smoke --suite examples/eval-suite.jsonl
+uv run sloth export --adapter runs/qlora-smoke --output runs/qlora-smoke-export
+```
+
 ### Out of scope
 
 **Full fine-tuning of large dense models is not supported.** The CLI targets
@@ -79,9 +98,13 @@ build. The verbs bind-mount the repo checkout into the container and install the
 fine-tuning dep layer with uv (never pip):
 
 ```bash
-# In-container dep layer (installed automatically by sloth train / eval / export)
-uv pip install --system transformers peft hf_transfer 'datasets==4.3.0' 'trl==0.26.1'
-uv pip install --system --no-deps unsloth unsloth_zoo bitsandbytes
+# In-container dep layer (installed automatically by sloth train / eval / export).
+# Installed into a --system-site-packages venv (inherits the container's nv torch);
+# pins are validated against NGC 25.11's torch 2.10 (see docs/dgx-spark.md).
+uv venv --system-site-packages "$HOME/.unsloth-cli-venv" && . "$HOME/.unsloth-cli-venv/bin/activate"
+uv pip install transformers==4.57.1 peft==0.18.0 hf_transfer 'datasets==4.3.0' trl==0.24.0
+uv pip uninstall torch torchvision        # drop venv-pulled torch so the nv torch shows through
+uv pip install --no-deps unsloth unsloth_zoo bitsandbytes
 ```
 
 **Prerequisites** (GPU operators only — not needed for the introspection verbs):

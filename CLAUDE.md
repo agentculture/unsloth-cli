@@ -246,13 +246,22 @@ not.
   works on every arch including aarch64 / DGX Spark GB10. The GPU stack
   (`nvcr.io/nvidia/pytorch:25.11-py3`) is provided by NVIDIA's official NGC container,
   which the fine-tuning verbs (`train`, `eval`, `export`) orchestrate automatically.
-  The in-container dep layer is installed with uv (never pip):
-  `uv pip install --system transformers peft hf_transfer 'datasets==4.3.0' 'trl==0.26.1'`
-  then `uv pip install --system --no-deps unsloth unsloth_zoo bitsandbytes`.
-  **Why:** the previous design listed torch + unsloth as base deps; on aarch64
-  `uv sync` resolved to `torch==2.10.0+cpu` (the CPU-only wheel) and training aborted
-  with `"cannot find any torch accelerator"`. Container orchestration removes the
-  wheel-resolution problem entirely.
+  The in-container dep layer is installed with uv (never pip) into a
+  **`--system-site-packages` venv** (so it inherits the container's nv torch; a bare
+  `uv pip install --system` fails on the NGC image — PEP-668 as root, root-owned
+  site-packages under `--user`). The pins are **validated against NGC 25.11's torch
+  2.10** (`transformers==4.57.1 peft==0.18.0 trl==0.24.0 datasets==4.3.0 hf_transfer`,
+  then `--no-deps unsloth unsloth_zoo bitsandbytes`; the venv-pulled torch is then
+  uninstalled so the nv torch shows through). **Do not float these** — `peft>=0.19`
+  hard-requires `torchao>0.16`, which needs `torch>=2.11` the container lacks. The
+  exact recipe + Spark gotchas (UMA OOM → `PYTORCH_ALLOC_CONF=expandable_segments`,
+  HF-cache mount, the version-matrix deadlock) live in
+  [`docs/dgx-spark.md`](docs/dgx-spark.md); measured runs in
+  [`docs/benchmarks.md`](docs/benchmarks.md).
+  **Why a container:** the previous design listed torch + unsloth as base deps; on
+  aarch64 `uv sync` resolved to `torch==2.10.0+cpu` (the CPU-only wheel) and training
+  aborted with `"cannot find any torch accelerator"`. Container orchestration removes
+  the wheel-resolution problem entirely.
   **Lazy-import discipline still required:** even inside the container context, never
   import torch/unsloth at module top level. Handlers lazy-import inside the function
   body; `sloth/tune/` core modules (`datasets`, `config`, `metadata`, `scope`) stay
