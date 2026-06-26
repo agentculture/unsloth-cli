@@ -298,6 +298,45 @@ class TestSubprocessSeams:
 
 
 # ---------------------------------------------------------------------------
+# h12 cross-check: no-docker path → preflight code=2
+# ---------------------------------------------------------------------------
+
+
+class TestH12CrossCheck:
+    """h12 honesty-condition cross-check — the two halves of 'no GPU path → code=2'.
+
+    Host side (no docker): ``preflight()`` raises ``CliError(code=2)`` — asserted
+    in ``test_h12_no_docker_yields_preflight_code2`` below.
+
+    In-container side (docker present but no GPU accelerator available inside):
+    that half lives in ``tests/test_tune_trainer.py``, which verifies the
+    in-container training path exits with code=2 when no accelerator is found.
+    The two halves share the same exit-code contract so an agent reading a ``hint:``
+    line always knows to look at the environment, not the code.
+    """
+
+    def test_h12_no_docker_yields_preflight_code2(self, monkeypatch) -> None:
+        """h12 (host side): docker absent → preflight raises CliError(code=2).
+
+        This is the explicit h12 named anchor. The same path is also exercised
+        in ``TestPreflight.test_docker_absent_raises_env_error`` with full
+        remediation-content assertions; this test documents the *honesty condition*
+        that code=2 is the required exit for the no-docker environment failure.
+
+        In-container no-accelerator coverage: see tests/test_tune_trainer.py.
+        """
+        monkeypatch.setattr(container, "_docker_available", lambda: False)
+        monkeypatch.setattr(container, "_image_available", lambda image=NGC_IMAGE: True)
+        monkeypatch.setattr(container, "_gpu_runtime_ok", lambda image=NGC_IMAGE: True)
+        with pytest.raises(CliError) as exc_info:
+            preflight()
+        assert exc_info.value.code == 2, (
+            "h12 requires the no-docker path to exit code=2 (env-setup error, "
+            f"EXIT_ENV_ERROR); got code={exc_info.value.code}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # 4. launch: preflight + build + stream, all via stubbable seams
 # ---------------------------------------------------------------------------
 
