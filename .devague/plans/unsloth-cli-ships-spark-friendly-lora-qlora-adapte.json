@@ -1,0 +1,316 @@
+{
+  "slug": "unsloth-cli-ships-spark-friendly-lora-qlora-adapte",
+  "title": "unsloth-cli ships Spark-friendly LoRA/QLoRA adapter fine-tuning for Qwen models: a 'tune' noun group (train, eval, export) that validates JSONL datasets before spending GPU, runs small reproducible config-driven adapter jobs, and writes training metadata next to the adapter \u2014 plus a /finetune skill that drives the loop. The introspection CLI keeps working with zero runtime deps; the ML stack arrives as an optional extra.",
+  "frame_slug": "unsloth-cli-ships-spark-friendly-lora-qlora-adapte",
+  "schema_version": 1,
+  "status": "exported",
+  "created": "2026-06-26T10:15:33Z",
+  "updated": "2026-06-26T10:19:10Z",
+  "targets": [
+    {
+      "id": "c1",
+      "kind": "announcement",
+      "text": "unsloth-cli ships Spark-friendly LoRA/QLoRA adapter fine-tuning for Qwen models: a 'tune' noun group (train, eval, export) that validates JSONL datasets before spending GPU, runs small reproducible config-driven adapter jobs, and writes training metadata next to the adapter \u2014 plus a /finetune skill that drives the loop. The introspection CLI keeps working with zero runtime deps; the ML stack arrives as an optional extra."
+    },
+    {
+      "id": "h5",
+      "kind": "honesty",
+      "text": "Running an introspection verb (e.g. sloth whoami) does NOT trigger a torch import \u2014 top-level import of the sloth package stays torch-free via lazy imports \u2014 so introspection startup is fast and 'teken cli doctor . --strict' stays green even with torch installed as a base dep."
+    },
+    {
+      "id": "c2",
+      "kind": "audience",
+      "text": "AgentCulture mesh agents and their operators (Spark first) doing local, Jetson/Spark-class adapter tuning of Qwen models \u2014 plus the downstream siblings that consume the result: lobes (serves the adapter) and colleague (runs it as a model backend)."
+    },
+    {
+      "id": "h8",
+      "kind": "honesty",
+      "text": "The verbs and the /finetune skill are usable by an agent non-interactively (every verb supports --json and routes errors via error:/hint:), and the produced adapter uses a standard PEFT/safetensors layout that lobes can serve and colleague can run as a backend."
+    },
+    {
+      "id": "c4",
+      "kind": "why_it_matters",
+      "text": "Fine-tuning is how the mesh stores STABLE behavior and reflexes (CLI-contract discipline, AgentCulture/CULTURE.DEV terminology, agent-first habits, issue-writing format, teacher behavior) directly into the models its siblings run \u2014 while memory/RAG keeps the CHANGING facts. This adapter-tuning loop is the repo's actual reason to exist; today it's only scaffold."
+    },
+    {
+      "id": "h9",
+      "kind": "honesty",
+      "text": "The README draws an explicit, actionable line between what belongs in a fine-tune (stable behavior/reflexes) and what belongs in memory/RAG (changing facts) \u2014 concrete enough that a contributor can decide where a given capability goes."
+    },
+    {
+      "id": "c5",
+      "kind": "before_state",
+      "text": "Today unsloth-cli is the scaffold only: introspection verbs (whoami/learn/explain/overview/doctor/cli) but zero fine-tuning. There is no reproducible, agent-friendly way to train a role-specific adapter \u2014 you'd hand-roll a torch/unsloth script with no dataset validation, no run metadata, and none of the CLI's error/exit-code contract."
+    },
+    {
+      "id": "h10",
+      "kind": "honesty",
+      "text": "train/eval/export are genuinely net-new verbs (no fine-tuning path exists in the repo today), so the scaffold-only baseline is accurate and this is not re-implementing an existing flow."
+    },
+    {
+      "id": "c7",
+      "kind": "success_signal",
+      "text": "Issue #6's acceptance criteria all pass: validate JSONL before training, run a small Qwen LoRA/QLoRA job end-to-end, config files drive repeatable runs, training metadata written next to the adapter, an eval command against a small local suite, documented Spark-friendly defaults, an explicit out-of-scope warning for large dense full-FT, and a README section on the fine-tune vs memory/RAG vs retrieval split. AND the afi rubric gate (teken cli doctor --strict) stays green."
+    },
+    {
+      "id": "h3",
+      "kind": "honesty",
+      "text": "The eval verb runs an adapter against a small LOCAL suite with no network, and the afi rubric gate stays green: every new verb/noun has a catalog entry, supports --json, routes errors through error:/hint:, and any action-noun exposes 'overview'."
+    },
+    {
+      "id": "c12",
+      "kind": "after_state",
+      "text": "An agent or operator goes from a JSONL dataset to a validated, reproducible LoRA/QLoRA adapter \u2014 training metadata written next to the output and a config file for repeatable runs \u2014 locally on a Spark, driven by the flat CLI verbs (sloth train / sloth eval / sloth export) or the controlling skill. The full unsloth/torch stack ships with the install via 'uv tool install unsloth-cli'."
+    },
+    {
+      "id": "h6",
+      "kind": "honesty",
+      "text": "Re-running the same config file + dataset reproduces the same training setup, and a metadata file written next to the adapter records model, method, dataset hash/size, hyperparameters, and a timestamp."
+    },
+    {
+      "id": "c13",
+      "kind": "boundary",
+      "text": "NOT full fine-tuning of large dense models \u2014 the CLI must explicitly WARN this is out of scope (and refuse/downgrade to adapter-only). NOT a serving/inference server (that's lobes). NOT memory/RAG or retrieval (separate concern; the README must explain the fine-tune vs RAG vs retrieval split). NOT distributed/multi-GPU cluster training. (Note: 'no hard torch dependency' is deliberately NO LONGER a boundary \u2014 see decision c10; unsloth/torch is a base dep.)"
+    },
+    {
+      "id": "h7",
+      "kind": "honesty",
+      "text": "Pointing train at a large dense full-fine-tune target emits an explicit out-of-scope warning (and refuses or clearly downgrades to adapter-only) rather than silently attempting it."
+    }
+  ],
+  "tasks": [
+    {
+      "id": "t1",
+      "summary": "Dataset validation module (sloth/tune/datasets.py): validate JSONL chat + task schemas, pure stdlib, no torch",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "Valid chat JSONL ({messages:[{role,content}]}) and task JSONL ({task,input,expected_output}) pass; malformed lines (bad JSON, missing/extra keys, wrong types) raise CliError carrying the offending line number + a hint",
+        "Validation runs with no torch installed; a test asserts 'torch' absent from sys.modules after running it"
+      ],
+      "deps": [],
+      "covers": [
+        "c7",
+        "c12"
+      ]
+    },
+    {
+      "id": "t2",
+      "summary": "TOML run-config loader (sloth/tune/config.py) via stdlib tomllib with Spark-friendly defaults",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "A valid run.toml (model, method, dataset, output, hyperparams) loads into a typed config; missing required keys raise CliError with hint; a method other than lora/qlora is rejected",
+        "Omitted optional fields fall back to documented Spark-friendly defaults; the same file loads identically on repeat (deterministic)"
+      ],
+      "deps": [],
+      "covers": [
+        "c12",
+        "h6",
+        "c7"
+      ]
+    },
+    {
+      "id": "t3",
+      "summary": "Training-metadata writer (sloth/tune/metadata.py): write run metadata next to the adapter output",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "After a (mocked) run, a metadata file beside the adapter records model, method, dataset sha256 + line count, hyperparameters, and an ISO-8601 timestamp; re-reading round-trips every field"
+      ],
+      "deps": [],
+      "covers": [
+        "h6",
+        "c12",
+        "c7"
+      ]
+    },
+    {
+      "id": "t4",
+      "summary": "Model-scope guard (sloth/tune/scope.py): classify adapter-OK vs out-of-scope large-dense full-FT",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "A LoRA/QLoRA target on a supported small/medium Qwen returns OK; a large-dense full-fine-tune request returns an explicit out-of-scope warning and refuses or downgrades to adapter-only \u2014 asserted by test"
+      ],
+      "deps": [],
+      "covers": [
+        "c13",
+        "h7"
+      ]
+    },
+    {
+      "id": "t5",
+      "summary": "Lazy-import discipline guard test (tests/test_lazy_import.py)",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "Importing the sloth package and running 'sloth whoami' leaves 'torch' and 'unsloth' absent from sys.modules; the test fails if any imported module pulls torch at top level"
+      ],
+      "deps": [],
+      "covers": [
+        "h5"
+      ]
+    },
+    {
+      "id": "t6",
+      "summary": "Add unsloth + torch to [project].dependencies (base) in pyproject.toml",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "pyproject [project].dependencies lists unsloth (with torch as required); 'uv lock' resolves; introspection verbs still run and the lazy-import test stays green"
+      ],
+      "deps": [],
+      "covers": [
+        "c12",
+        "c7"
+      ]
+    },
+    {
+      "id": "t7",
+      "summary": "README: fine-tune vs memory/RAG vs retrieval split, Spark-friendly defaults, out-of-scope warning",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "README has a section drawing an actionable line between fine-tune (stable reflexes) and memory/RAG (changing facts), documents Spark-friendly defaults, and states full-FT of large dense models is out of scope"
+      ],
+      "deps": [],
+      "covers": [
+        "c4",
+        "h9",
+        "c7"
+      ]
+    },
+    {
+      "id": "t8",
+      "summary": "CLAUDE.md: retire the dependencies=[] rule; document train/eval/export + base-dep + lazy-import policy",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "CLAUDE.md no longer asserts 'dependencies = []' as load-bearing; it documents unsloth/torch as a base dep, the lazy-import discipline, and the three new verbs via the 'Adding a verb or noun group' seam"
+      ],
+      "deps": [],
+      "covers": [
+        "c5",
+        "c13"
+      ]
+    },
+    {
+      "id": "t9",
+      "summary": "Lazy LoRA/QLoRA trainer adapter (sloth/tune/_trainer.py): lazy-import unsloth/torch inside the run function",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "torch/unsloth import only inside the run function; when unsloth is absent the function raises CliError(code=2) with an install hint ('uv tool install unsloth-cli'); a dry-run path returns the resolved plan without importing torch",
+        "Module has no top-level torch/unsloth import \u2014 the lazy-import guard test (t5) stays green"
+      ],
+      "deps": [
+        "t2",
+        "t3",
+        "t4"
+      ],
+      "covers": [
+        "c7",
+        "c12"
+      ]
+    },
+    {
+      "id": "t10",
+      "summary": "'sloth train' verb (sloth/cli/_commands/train.py): validate -> scope-guard -> (dry-run|train) -> write metadata",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "'sloth train --config run.toml --dry-run' validates the dataset, prints the resolved plan in text and --json, exits 0 without importing torch; an invalid dataset exits 1 with error:/hint:",
+        "'sloth train' at a large-dense full-FT target emits the out-of-scope warning (t4) and refuses; a real run writes metadata (t3) next to the adapter"
+      ],
+      "deps": [
+        "t1",
+        "t2",
+        "t3",
+        "t4",
+        "t9"
+      ],
+      "covers": [
+        "c7",
+        "c12",
+        "c13",
+        "h7"
+      ]
+    },
+    {
+      "id": "t11",
+      "summary": "'sloth eval' verb (sloth/cli/_commands/eval.py): run an adapter against a small LOCAL suite, no network",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "'sloth eval --adapter <dir> --suite <file>' runs offline (test asserts no socket/network access) and emits results in text and --json; a missing adapter/suite exits 1 with error:/hint:"
+      ],
+      "deps": [
+        "t1",
+        "t4"
+      ],
+      "covers": [
+        "h3",
+        "c7"
+      ]
+    },
+    {
+      "id": "t12",
+      "summary": "'sloth export' verb (sloth/cli/_commands/export.py): adapter -> safetensors",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "'sloth export --adapter <dir> --format safetensors' writes a standard PEFT/safetensors adapter layout (lobes-servable / colleague-runnable); an unsupported --format exits 1 with error:/hint:; --json reports the output path"
+      ],
+      "deps": [
+        "t3",
+        "t4"
+      ],
+      "covers": [
+        "h8",
+        "c7"
+      ]
+    },
+    {
+      "id": "t13",
+      "summary": "Wire train/eval/export into _build_parser + add explain catalog entries",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "_build_parser registers train/eval/export; explain resolves ('train',)/('eval',)/('export',) so test_every_catalog_path_resolves stays green; each verb supports --json and routes errors via error:/hint:",
+        "'uv run teken cli doctor . --strict' exits 0 (afi rubric gate green) with the three verbs present"
+      ],
+      "deps": [
+        "t10",
+        "t11",
+        "t12"
+      ],
+      "covers": [
+        "c1",
+        "h3",
+        "h8",
+        "h10",
+        "c5"
+      ]
+    },
+    {
+      "id": "t14",
+      "summary": "/finetune skill (.claude/skills/finetune/SKILL.md + scripts/finetune.sh): drive validate -> train -> eval -> export",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "SKILL.md carries 'type: command'; the script drives the four steps non-interactively, forwards --json, and surfaces error:/hint: from the CLI; a sample run produces an adapter + metadata"
+      ],
+      "deps": [
+        "t13"
+      ],
+      "covers": [
+        "h8",
+        "c1",
+        "c12",
+        "c2"
+      ]
+    }
+  ],
+  "risks": []
+}
