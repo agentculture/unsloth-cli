@@ -441,13 +441,37 @@ def test_host_real_run_calls_container_launch(
     assert "--config" in sloth_args
 
 
-def test_host_real_run_returns_container_exit_code(
+def test_host_real_run_returns_0_on_launch_success(
     good_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """cmd_train propagates the container's non-zero exit code."""
-    monkeypatch.setattr(container_mod, "launch", Mock(return_value=2))
+    """cmd_train returns 0 when container.launch succeeds (returns 0)."""
+    monkeypatch.setattr(container_mod, "launch", Mock(return_value=0))
     rc = cmd_train(_make_args(good_config, dry_run=False))
-    assert rc == 2
+    assert rc == 0
+
+
+def test_host_real_run_propagates_launch_cli_error(
+    good_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A CliError raised by container.launch propagates out of cmd_train.
+
+    launch() now raises CliError (code 1 or 2) on container failure instead of
+    returning a non-zero int; the handler must not swallow it.
+    """
+    monkeypatch.setattr(
+        container_mod,
+        "launch",
+        Mock(
+            side_effect=CliError(
+                code=2,
+                message="Container exited with status 2",
+                remediation="Check the in-container error output.",
+            )
+        ),
+    )
+    with pytest.raises(CliError) as exc_info:
+        cmd_train(_make_args(good_config, dry_run=False))
+    assert exc_info.value.code == 2
 
 
 def test_host_real_run_json_forwarded_to_container(
@@ -460,6 +484,64 @@ def test_host_real_run_json_forwarded_to_container(
     cmd_train(_make_args(good_config, dry_run=False, json_mode=True))
     sloth_args = mock_launch.call_args[0][0]
     assert "--json" in sloth_args
+
+
+def test_host_real_run_extra_mounts_cover_config_dataset_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Identity mounts cover the parent dirs of config, dataset, and output.
+
+    FIX 4 (path visibility): host-absolute paths forwarded in sloth_args must
+    resolve unchanged inside the container; extra_mounts achieves this by
+    mounting each parent dir at the same path (identity mount).
+    """
+    dataset = tmp_path / "data" / "train.jsonl"
+    dataset.parent.mkdir(parents=True)
+    dataset.write_text(
+        '{"messages": [{"role": "user", "content": "hi"},'
+        '{"role": "assistant", "content": "hello"}]}\n',
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "adapters" / "out"
+    toml_path = tmp_path / "run.toml"
+    toml_path.write_text(
+        "[run]\n"
+        'model   = "unsloth/Qwen3-4B"\n'
+        'method  = "qlora"\n'
+        f'dataset = "{dataset}"\n'
+        f'output  = "{out_dir}"\n',
+        encoding="utf-8",
+    )
+
+    captured: dict[str, Any] = {}
+
+    def _capture_launch(sloth_args: list[str], **kwargs: Any) -> int:
+        captured.update(kwargs)
+        captured["sloth_args"] = list(sloth_args)
+        return 0
+
+    monkeypatch.setattr(container_mod, "launch", _capture_launch)
+
+    rc = cmd_train(_make_args(toml_path, dry_run=False))
+    assert rc == 0
+
+    extra_mounts = captured.get("extra_mounts") or []
+    mounted_container_paths = {ct for _, ct in extra_mounts}
+
+    # The parent dirs of config, dataset, and output must all be identity-mounted.
+    assert (
+        str(toml_path.parent) in mounted_container_paths
+    ), f"config parent {toml_path.parent} not in extra_mounts: {extra_mounts}"
+    assert (
+        str(dataset.parent) in mounted_container_paths
+    ), f"dataset parent {dataset.parent} not in extra_mounts: {extra_mounts}"
+    # Forward the ABSOLUTE config path — not rewritten to /workspace.
+    assert "--config" in captured["sloth_args"]
+    idx = captured["sloth_args"].index("--config")
+    forwarded_config = captured["sloth_args"][idx + 1]
+    assert forwarded_config == str(
+        toml_path.resolve()
+    ), f"expected absolute config path, got: {forwarded_config}"
 
 
 # ---------------------------------------------------------------------------

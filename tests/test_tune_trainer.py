@@ -30,7 +30,7 @@ import pytest
 
 from sloth.cli._errors import CliError
 from sloth.tune import _trainer
-from sloth.tune._trainer import run_training
+from sloth.tune._trainer import run_eval, run_training
 from sloth.tune.config import RunConfig
 
 # ---------------------------------------------------------------------------
@@ -493,3 +493,169 @@ class TestNoAcceleratorError:
             run_training(config, dry_run=False)
         assert exc_info.value.code == 2
         assert "nvcr.io/nvidia/pytorch:25.11-py3" in exc_info.value.remediation
+
+
+# ---------------------------------------------------------------------------
+# 8. run_eval — PeftModel load sequence (moved from test_cmd_eval)
+# ---------------------------------------------------------------------------
+
+
+class TestRunEval:
+    """run_eval is the ML seam for ``sloth eval`` (FIX 3 — qodo #10).
+
+    These tests assert the correct PEFT load sequence:
+    - AutoModelForCausalLM.from_pretrained is called with the BASE model name
+      (read from adapter_config.json), NOT the adapter dir path.
+    - PeftModel.from_pretrained is called with (base_model_obj, adapter_path).
+
+    No GPU or real torch/peft/transformers needed: fake modules are injected via
+    monkeypatch.setitem(sys.modules, ...) so the lazy imports inside run_eval
+    pick them up without the real packages installed.
+    """
+
+    def _write_adapter_config(self, adapter_dir: Path, base_model_name: str) -> None:
+        (adapter_dir / "adapter_config.json").write_text(
+            json.dumps({"base_model_name_or_path": base_model_name, "peft_type": "LORA"}),
+            encoding="utf-8",
+        )
+
+    def _write_suite(self, suite_path: Path) -> None:
+        suite_path.write_text(
+            '{"task": "reverse", "input": "abc", "expected_output": "cba"}\n',
+            encoding="utf-8",
+        )
+
+    def _inject_fake_ml(self, monkeypatch, *, base_model_name: str, adapter_dir: str) -> dict:
+        """Inject fake torch/transformers/peft and return a call-log dict."""
+        calls: dict = {}
+        fake_base_model = object()
+
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        # fake PeftModel (records base + adapter_path)
+        class FakePeftModel:
+            @staticmethod
+            def from_pretrained(base, adapter_path, **kw):
+                calls["peft_base"] = base
+                calls["peft_adapter"] = adapter_path
+                m = MagicMock()
+                m.generate.return_value = [[1, 2, 3]]
+                return m
+
+        # fake AutoModelForCausalLM (records the name it was called with)
+        class FakeAutoModel:
+            @staticmethod
+            def from_pretrained(name, **kw):
+                calls["causal_lm_name"] = name
+                return fake_base_model
+
+        # fake AutoTokenizer
+        class _FakeTok:
+            def __call__(self, prompt, **kw):
+                return {"input_ids": [[1, 2, 3]]}
+
+            def decode(self, tokens, **kw):
+                return "cba"
+
+        class FakeAutoTokenizer:
+            @staticmethod
+            def from_pretrained(name, **kw):
+                return _FakeTok()
+
+        fake_torch = MagicMock()
+        fake_torch.no_grad.return_value.__enter__ = lambda s: None
+        fake_torch.no_grad.return_value.__exit__ = lambda s, *a: False
+
+        fake_transformers = SimpleNamespace(
+            AutoModelForCausalLM=FakeAutoModel,
+            AutoTokenizer=FakeAutoTokenizer,
+        )
+        fake_peft_mod = SimpleNamespace(PeftModel=FakePeftModel)
+
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+        monkeypatch.setitem(sys.modules, "peft", fake_peft_mod)
+
+        calls["_fake_base_model"] = fake_base_model
+        return calls
+
+    def test_peft_load_sequence_base_model_then_adapter(self, tmp_path: Path, monkeypatch) -> None:
+        """run_eval reads adapter_config.json and calls PeftModel(base_model, adapter).
+
+        AutoModelForCausalLM.from_pretrained must receive the BASE model name
+        (from adapter_config.json), not the adapter dir path.
+        PeftModel.from_pretrained must receive (base_model_obj, adapter_path).
+        """
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        base_model_name = "unsloth/Qwen3-4B"
+        self._write_adapter_config(adapter_dir, base_model_name)
+        suite_file = tmp_path / "suite.jsonl"
+        self._write_suite(suite_file)
+
+        calls = self._inject_fake_ml(
+            monkeypatch, base_model_name=base_model_name, adapter_dir=str(adapter_dir)
+        )
+
+        result = run_eval(str(adapter_dir), str(suite_file))
+
+        # AutoModelForCausalLM called with BASE name, NOT the adapter dir path.
+        assert (
+            calls["causal_lm_name"] == base_model_name
+        ), "AutoModelForCausalLM.from_pretrained must be called with the base model name"
+        assert calls["causal_lm_name"] != str(
+            adapter_dir
+        ), "AutoModelForCausalLM.from_pretrained must NOT be called with the adapter dir"
+
+        # PeftModel called with (base_model_obj, adapter_path).
+        assert (
+            calls["peft_base"] is calls["_fake_base_model"]
+        ), "PeftModel.from_pretrained must receive the base model object as its first arg"
+        assert calls["peft_adapter"] == str(
+            adapter_dir
+        ), "PeftModel.from_pretrained must receive the adapter dir path as its second arg"
+
+        # Result structure.
+        assert result["total"] == 1
+        assert "exact_match" in result
+        assert "results" in result
+
+    def test_run_eval_missing_adapter_config_raises_code_1(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """run_eval raises CliError(code=1) when adapter_config.json is absent."""
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        suite_file = tmp_path / "suite.jsonl"
+        self._write_suite(suite_file)
+
+        from unittest.mock import MagicMock
+
+        fake_torch = MagicMock()
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        monkeypatch.setitem(sys.modules, "transformers", MagicMock())
+        monkeypatch.setitem(sys.modules, "peft", MagicMock())
+
+        with pytest.raises(CliError) as exc_info:
+            run_eval(str(adapter_dir), str(suite_file))
+        assert exc_info.value.code == 1
+        assert "adapter_config.json" in exc_info.value.message
+
+    def test_run_eval_missing_ml_stack_raises_code_2(self, tmp_path: Path, monkeypatch) -> None:
+        """run_eval raises CliError(code=2) when torch/peft/transformers are absent."""
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        self._write_adapter_config(adapter_dir, "unsloth/Qwen3-4B")
+        suite_file = tmp_path / "suite.jsonl"
+        self._write_suite(suite_file)
+
+        # Remove torch so the lazy import fails.
+        monkeypatch.setitem(
+            sys.modules,
+            "torch",
+            None,  # type: ignore[arg-type]  # None in sys.modules → ImportError
+        )
+
+        with pytest.raises((CliError, ImportError)):
+            run_eval(str(adapter_dir), str(suite_file))

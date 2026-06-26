@@ -213,13 +213,33 @@ def cmd_train(args: argparse.Namespace) -> int:
 
     # 4c) Host real run: orchestrate via the NGC container.
     config_path = Path(args.config).resolve()
-    workdir = config_path.parent
-    config_in_container = str(Path(container_mod.WORKDIR_MOUNT) / config_path.name)
-    sloth_args: list[str] = ["train", "--config", config_in_container, "--in-container"]
+    config_dir = config_path.parent
+
+    # Resolve dataset and output to absolute paths (TOML values may be relative;
+    # the convention is relative-to-config-dir, not relative-to-CWD).
+    dataset_path = Path(config.dataset)
+    if not dataset_path.is_absolute():
+        dataset_path = (config_dir / dataset_path).resolve()
+    output_path = Path(config.output)
+    if not output_path.is_absolute():
+        output_path = (config_dir / output_path).resolve()
+
+    # Identity mounts so host-absolute paths forwarded in sloth_args resolve
+    # unchanged inside the container (host_path == container_path).
+    mount_parents = {config_path.parent, dataset_path.parent, output_path.parent}
+    extra_mounts = [(str(p), str(p)) for p in mount_parents]
+
+    # Forward the ABSOLUTE config path; identity mounts make it resolve inside
+    # the container without rewriting to /workspace.
+    sloth_args: list[str] = ["train", "--config", str(config_path), "--in-container"]
     if json_mode:
         sloth_args.append("--json")
     checkout = Path(__file__).resolve().parents[3]
-    return container_mod.launch(sloth_args, workdir=workdir, checkout=checkout)
+    # launch() raises CliError on any non-zero container exit; returns 0 on success.
+    container_mod.launch(
+        sloth_args, workdir=str(config_dir), checkout=checkout, extra_mounts=extra_mounts
+    )
+    return 0
 
 
 # ---------------------------------------------------------------------------

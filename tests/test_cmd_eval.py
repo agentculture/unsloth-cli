@@ -3,14 +3,15 @@
 Covers:
 * missing --adapter dir  → CliError(code=1) with ``error:`` / ``hint:`` two-line contract
 * missing --suite file   → CliError(code=1) with ``error:`` / ``hint:`` two-line contract
-* valid adapter + suite  → results emitted in text mode and --json mode (mocked backend)
+* eval.py imports no ML modules (torch / peft / transformers must NOT be in sys.modules
+  after importing sloth.cli._commands.eval)
+* valid adapter + suite  → results emitted in text mode and --json mode (run_eval mocked)
 * no-network assertion   → monkeypatching ``socket.socket`` to raise proves no
   network call escapes the mocked code path
-* PeftModel load sequence → _default_backend reads adapter_config.json and
-  calls PeftModel.from_pretrained(base_model, adapter), NOT
-  AutoModelForCausalLM.from_pretrained(adapter)
+* PeftModel load sequence → now tested via run_eval in test_tune_trainer.py
 * container routing      → host path calls container.launch with forwarded args +
-  ``--in-container``; in-container path does NOT call launch
+  ``--in-container`` and correct identity extra_mounts; handler returns 0 on success
+  and propagates CliError raised by launch()
 * recursion guard        → ``--in-container`` flag prevents docker recursion
 """
 
@@ -23,7 +24,6 @@ import socket
 import sys
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -44,9 +44,31 @@ def _make_args(**kwargs: Any) -> argparse.Namespace:
     return argparse.Namespace(**defaults)
 
 
-def _mock_backend(adapter_path: str, record: dict[str, str]) -> str:  # noqa: ARG001
-    """Always returns the expected output — perfect score for testing."""
-    return record["expected_output"]
+def _fake_run_eval_perfect(adapter_path: str, suite_path: str) -> dict[str, Any]:
+    """Return a perfect-score eval summary without touching torch/peft."""
+    return {
+        "total": 2,
+        "exact_match": 2,
+        "exact_match_pct": 100.0,
+        "results": [
+            {
+                "index": 0,
+                "task": "reverse",
+                "input": "abc",
+                "expected_output": "cba",
+                "prediction": "cba",
+                "exact_match": True,
+            },
+            {
+                "index": 1,
+                "task": "upper",
+                "input": "hello",
+                "expected_output": "HELLO",
+                "prediction": "HELLO",
+                "exact_match": True,
+            },
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +108,24 @@ def tmp_suite(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return f
+
+
+# ---------------------------------------------------------------------------
+# ML-free import assertion
+# ---------------------------------------------------------------------------
+
+
+def test_eval_module_imports_no_ml_modules() -> None:
+    """eval.py must not cause torch / peft / transformers to enter sys.modules.
+
+    FIX 3: the CLI command module must be ML-free so the introspection verbs
+    keep working on machines without the ML stack installed.
+    """
+    # The module is already imported (import at top of this file), so we just
+    # confirm the heavy packages are absent.
+    ml_packages = {"torch", "peft", "transformers"}
+    leaked = ml_packages & set(sys.modules)
+    assert not leaked, f"eval.py caused ML modules to be imported: {sorted(leaked)}"
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +198,7 @@ def test_missing_suite_emits_error_and_hint(tmp_adapter: Path, tmp_path: Path) -
 
 
 # ---------------------------------------------------------------------------
-# Happy path: text output (mocked backend, in-container)
+# Happy path: text output (mocked run_eval, in-container)
 # ---------------------------------------------------------------------------
 
 
@@ -168,8 +208,8 @@ def test_eval_text_output_contains_summary(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Mocked perfect-score backend → text output includes total / exact / score."""
-    monkeypatch.setattr(eval_mod, "_inference_backend", _mock_backend)
+    """Mocked run_eval → text output includes total / exact / score."""
+    monkeypatch.setattr(eval_mod, "run_eval", _fake_run_eval_perfect)
     args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), in_container=True)
     rc = cmd_eval(args)
     assert rc == 0
@@ -186,7 +226,7 @@ def test_eval_text_shows_per_item_results(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Text mode shows one line per eval record."""
-    monkeypatch.setattr(eval_mod, "_inference_backend", _mock_backend)
+    monkeypatch.setattr(eval_mod, "run_eval", _fake_run_eval_perfect)
     args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), in_container=True)
     cmd_eval(args)
     out = capsys.readouterr().out
@@ -196,7 +236,7 @@ def test_eval_text_shows_per_item_results(
 
 
 # ---------------------------------------------------------------------------
-# Happy path: JSON output (mocked backend, in-container)
+# Happy path: JSON output (mocked run_eval, in-container)
 # ---------------------------------------------------------------------------
 
 
@@ -206,8 +246,8 @@ def test_eval_json_output_structure(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Mocked backend with --json → well-formed JSON with summary fields."""
-    monkeypatch.setattr(eval_mod, "_inference_backend", _mock_backend)
+    """Mocked run_eval with --json → well-formed JSON with summary fields."""
+    monkeypatch.setattr(eval_mod, "run_eval", _fake_run_eval_perfect)
     args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), json=True, in_container=True)
     rc = cmd_eval(args)
     assert rc == 0
@@ -226,7 +266,7 @@ def test_eval_json_result_items(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Each result item has the expected fields and correct exact_match flag."""
-    monkeypatch.setattr(eval_mod, "_inference_backend", _mock_backend)
+    monkeypatch.setattr(eval_mod, "run_eval", _fake_run_eval_perfect)
     args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), json=True, in_container=True)
     cmd_eval(args)
     data = json.loads(capsys.readouterr().out)
@@ -245,17 +285,31 @@ def test_eval_json_partial_score(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A backend that always returns 'WRONG' yields exact_match=0, score=0.0."""
+    """A run_eval result with no exact matches → score=0.0."""
     suite = tmp_path / "suite.jsonl"
     suite.write_text(
         '{"task": "t", "input": "x", "expected_output": "y"}\n',
         encoding="utf-8",
     )
 
-    def _always_wrong(adapter_path: str, record: dict[str, str]) -> str:  # noqa: ARG001
-        return "WRONG"
+    def _zero_score(adapter_path: str, suite_path: str) -> dict[str, Any]:
+        return {
+            "total": 1,
+            "exact_match": 0,
+            "exact_match_pct": 0.0,
+            "results": [
+                {
+                    "index": 0,
+                    "task": "t",
+                    "input": "x",
+                    "expected_output": "y",
+                    "prediction": "WRONG",
+                    "exact_match": False,
+                }
+            ],
+        }
 
-    monkeypatch.setattr(eval_mod, "_inference_backend", _always_wrong)
+    monkeypatch.setattr(eval_mod, "run_eval", _zero_score)
     args = _make_args(adapter=str(tmp_adapter), suite=str(suite), json=True, in_container=True)
     cmd_eval(args)
     data = json.loads(capsys.readouterr().out)
@@ -269,19 +323,19 @@ def test_eval_json_partial_score(
 # ---------------------------------------------------------------------------
 
 
-def test_no_network_access_with_mocked_backend(
+def test_no_network_access_with_mocked_run_eval(
     tmp_adapter: Path,
     tmp_suite: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """When the inference backend is mocked, no socket is opened.
+    """When run_eval is mocked, no socket is opened.
 
     Replaces ``socket.socket`` with a callable that raises AssertionError, then
     runs the full eval code path and asserts it completes without triggering the
     replacement — proving the code path never touches the network.
     """
-    monkeypatch.setattr(eval_mod, "_inference_backend", _mock_backend)
+    monkeypatch.setattr(eval_mod, "run_eval", _fake_run_eval_perfect)
 
     class _NoSocket:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -295,115 +349,41 @@ def test_no_network_access_with_mocked_backend(
 
 
 # ---------------------------------------------------------------------------
-# Acceptance 1 — PeftModel load sequence (correct adapter loading)
+# Acceptance — in-container branch calls run_eval (the ML seam)
 # ---------------------------------------------------------------------------
 
 
-def test_default_backend_reads_adapter_config(
-    tmp_adapter_with_config: tuple[Path, str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """_default_backend reads base_model_name_or_path from adapter_config.json.
-
-    Injects fake torch/transformers/peft into sys.modules and asserts that:
-    - AutoModelForCausalLM.from_pretrained is called with the BASE model name
-      (not the adapter dir path)
-    - PeftModel.from_pretrained is called with (base_model_obj, adapter_path)
-    """
-    adapter_dir, base_model_name = tmp_adapter_with_config
-
-    calls: dict[str, Any] = {}
-
-    # --- fake base model object (sentinel) ---
-    fake_base_model = object()
-
-    # --- fake peft model (supports .eval() and .generate()) ---
-    fake_peft_model = MagicMock()
-    fake_peft_model.generate.return_value = [[1, 2, 3]]
-
-    # --- fake AutoModelForCausalLM ---
-    class FakeAutoModelForCausalLM:
-        @staticmethod
-        def from_pretrained(name: str, **kwargs: Any) -> object:
-            calls["causal_lm_name"] = name
-            return fake_base_model
-
-    # --- fake PeftModel ---
-    class FakePeftModel:
-        @staticmethod
-        def from_pretrained(base: object, adapter_path: str, **kwargs: Any) -> Any:
-            calls["peft_base"] = base
-            calls["peft_adapter"] = adapter_path
-            return fake_peft_model
-
-    # --- fake AutoTokenizer ---
-    class _FakeTokenizer:
-        def __call__(self, prompt: str, **kwargs: Any) -> dict[str, Any]:
-            return {"input_ids": [[1, 2, 3]]}
-
-        def decode(self, tokens: Any, **kwargs: Any) -> str:
-            return "decoded_output"
-
-    class FakeAutoTokenizer:
-        @staticmethod
-        def from_pretrained(name: str, **kwargs: Any) -> _FakeTokenizer:
-            return _FakeTokenizer()
-
-    # --- fake torch (context manager support via MagicMock) ---
-    fake_torch = MagicMock()
-
-    # Inject fakes into sys.modules so lazy `import` inside _default_backend picks them up.
-    fake_transformers = MagicMock()
-    fake_transformers.AutoModelForCausalLM = FakeAutoModelForCausalLM
-    fake_transformers.AutoTokenizer = FakeAutoTokenizer
-
-    fake_peft_module = MagicMock()
-    fake_peft_module.PeftModel = FakePeftModel
-
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-    monkeypatch.setitem(sys.modules, "peft", fake_peft_module)
-
-    record = {"task": "reverse", "input": "abc", "expected_output": "cba"}
-    result = eval_mod._default_backend(str(adapter_dir), record)
-
-    # AutoModelForCausalLM must be called with the BASE name, not the adapter dir.
-    assert calls["causal_lm_name"] == base_model_name
-    assert calls["causal_lm_name"] != str(
-        adapter_dir
-    ), "AutoModelForCausalLM.from_pretrained must NOT be called with the adapter dir"
-
-    # PeftModel must be called with (base_model_obj, adapter_path).
-    assert (
-        calls["peft_base"] is fake_base_model
-    ), "PeftModel.from_pretrained must receive the base model object as its first arg"
-    assert calls["peft_adapter"] == str(
-        adapter_dir
-    ), "PeftModel.from_pretrained must receive the adapter dir path as its second arg"
-
-    # Result is the tokenizer's decoded output.
-    assert isinstance(result, str)
-
-
-def test_default_backend_missing_adapter_config(
+def test_in_container_calls_run_eval(
     tmp_adapter: Path,
+    tmp_suite: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """_default_backend raises CliError(code=1) when adapter_config.json is absent."""
-    fake_torch = MagicMock()
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    monkeypatch.setitem(sys.modules, "transformers", MagicMock())
-    monkeypatch.setitem(sys.modules, "peft", MagicMock())
+    """With --in-container, cmd_eval delegates to run_eval (the tune ML seam).
 
-    record = {"task": "t", "input": "x", "expected_output": "y"}
-    with pytest.raises(CliError) as exc_info:
-        eval_mod._default_backend(str(tmp_adapter), record)
-    assert exc_info.value.code == 1
-    assert "adapter_config.json" in exc_info.value.message
+    FIX 3: the real eval logic (model loading, PeftModel wrapping, scoring) lives
+    in sloth.tune._trainer.run_eval, not in this CLI module.
+    """
+    calls: list[tuple[str, str]] = []
+
+    def _capture_run_eval(adapter_path: str, suite_path: str) -> dict[str, Any]:
+        calls.append((adapter_path, suite_path))
+        return _fake_run_eval_perfect(adapter_path, suite_path)
+
+    monkeypatch.setattr(eval_mod, "run_eval", _capture_run_eval)
+
+    args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), in_container=True)
+    rc = cmd_eval(args)
+    assert rc == 0
+    assert len(calls) == 1, "run_eval must be called exactly once"
+    assert calls[0][0] == str(tmp_adapter)
+    assert calls[0][1] == str(tmp_suite)
+    out = capsys.readouterr().out
+    assert "total" in out
 
 
 # ---------------------------------------------------------------------------
-# Acceptance 2 — container routing: host path calls container.launch
+# Acceptance — container routing: host path calls container.launch
 # ---------------------------------------------------------------------------
 
 
@@ -417,8 +397,8 @@ def test_host_routes_to_container_launch(
     Asserts that:
     - container.launch IS called
     - the sloth_args list starts with 'eval' and ends with '--in-container'
-    - '--adapter' and '--suite' are forwarded
-    - the function returns container.launch's exit code, not the eval summary
+    - '--adapter' and '--suite' are forwarded with absolute paths
+    - the function returns 0 (launch() returns 0 on success)
     """
     launch_calls: list[dict[str, Any]] = []
 
@@ -430,7 +410,7 @@ def test_host_routes_to_container_launch(
         **kwargs: Any,
     ) -> int:
         launch_calls.append(
-            {"sloth_args": list(sloth_args), "workdir": workdir, "checkout": checkout}
+            {"sloth_args": list(sloth_args), "workdir": workdir, "checkout": checkout, **kwargs}
         )
         return 0
 
@@ -475,20 +455,92 @@ def test_host_routes_json_flag_when_set(
     assert "--in-container" in forwarded_args[0]
 
 
-def test_host_returns_container_exit_code(
+def test_host_returns_0_on_launch_success(
     tmp_adapter: Path,
     tmp_suite: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """cmd_eval returns the exit code from container.launch, not a hardcoded 0."""
-    monkeypatch.setattr(eval_mod.container, "launch", lambda *a, **kw: 42)
+    """cmd_eval returns 0 when container.launch succeeds (returns 0).
+
+    FIX 1+2: launch() raises on failure; on success it returns 0 and the
+    handler returns 0.
+    """
+    monkeypatch.setattr(eval_mod.container, "launch", lambda *a, **kw: 0)
     args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), in_container=False)
     rc = cmd_eval(args)
-    assert rc == 42
+    assert rc == 0
+
+
+def test_host_propagates_launch_cli_error(
+    tmp_adapter: Path,
+    tmp_suite: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CliError raised by container.launch propagates out of cmd_eval.
+
+    FIX 1+2: launch() raises CliError (code 1 or 2) on container failure.
+    The handler must not swallow it — the CliError must surface to the caller.
+    """
+
+    def _raise_cli_error(*args: Any, **kwargs: Any) -> int:
+        raise CliError(
+            code=2,
+            message="Container exited with status 2",
+            remediation="Check the in-container error output.",
+        )
+
+    monkeypatch.setattr(eval_mod.container, "launch", _raise_cli_error)
+    args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), in_container=False)
+    with pytest.raises(CliError) as exc_info:
+        cmd_eval(args)
+    assert exc_info.value.code == 2
+
+
+def test_host_extra_mounts_cover_adapter_and_suite_parents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Identity mounts cover the parent dirs of adapter and suite.
+
+    FIX 4 (path visibility): host-absolute paths forwarded in sloth_args must
+    resolve unchanged inside the container; extra_mounts achieves this by
+    mounting each parent dir at the same path (identity mount).
+    """
+    adapter_dir = tmp_path / "adapters" / "my-lora"
+    adapter_dir.mkdir(parents=True)
+    suite_file = tmp_path / "data" / "eval.jsonl"
+    suite_file.parent.mkdir(parents=True)
+    suite_file.write_text(
+        '{"task": "t", "input": "x", "expected_output": "y"}\n',
+        encoding="utf-8",
+    )
+
+    captured: dict[str, Any] = {}
+
+    def _capture_launch(sloth_args: list[str], **kwargs: Any) -> int:
+        captured["sloth_args"] = list(sloth_args)
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
+
+    args = _make_args(adapter=str(adapter_dir), suite=str(suite_file), in_container=False)
+    rc = cmd_eval(args)
+    assert rc == 0
+
+    extra_mounts = captured.get("extra_mounts") or []
+    mounted_container_paths = {ct for _, ct in extra_mounts}
+
+    assert (
+        str(adapter_dir.resolve().parent) in mounted_container_paths
+    ), f"adapter parent not in extra_mounts: {extra_mounts}"
+    assert (
+        str(suite_file.resolve().parent) in mounted_container_paths
+    ), f"suite parent not in extra_mounts: {extra_mounts}"
 
 
 # ---------------------------------------------------------------------------
-# Acceptance 2 — recursion guard: --in-container path does NOT call launch
+# Acceptance — recursion guard: --in-container path does NOT call launch
 # ---------------------------------------------------------------------------
 
 
@@ -497,7 +549,7 @@ def test_in_container_does_not_call_launch(
     tmp_suite: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With --in-container set, cmd_eval runs the real eval, never calls launch.
+    """With --in-container set, cmd_eval runs run_eval, never calls launch.
 
     Stubs container.launch to raise AssertionError; the in-container path must
     complete without triggering it.
@@ -507,7 +559,7 @@ def test_in_container_does_not_call_launch(
         raise AssertionError("container.launch called inside container — recursion guard broken")
 
     monkeypatch.setattr(eval_mod.container, "launch", _must_not_launch)
-    monkeypatch.setattr(eval_mod, "_inference_backend", _mock_backend)
+    monkeypatch.setattr(eval_mod, "run_eval", _fake_run_eval_perfect)
 
     args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), in_container=True)
     rc = cmd_eval(args)

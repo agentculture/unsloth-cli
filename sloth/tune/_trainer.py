@@ -275,6 +275,129 @@ def _run_real(config: RunConfig, plan: dict[str, Any], backend: _Backend) -> dic
 # ---------------------------------------------------------------------------
 
 
+def run_eval(adapter_path: str, suite_path: str) -> dict[str, Any]:
+    """Load a LoRA adapter and evaluate against a task-schema JSONL suite.
+
+    This is the ML-seam entry point for ``sloth eval``.  Heavy imports
+    (torch, transformers, peft) are deferred inside this function so
+    ``sloth/cli/_commands/eval.py`` stays ML-free at module level.
+
+    Parameters
+    ----------
+    adapter_path:
+        Filesystem path to the adapter directory (must contain
+        ``adapter_config.json``).
+    suite_path:
+        Path to a task-schema JSONL eval suite.
+
+    Returns
+    -------
+    dict
+        Summary with keys: ``total``, ``exact_match``, ``exact_match_pct``,
+        ``results``.
+
+    Raises
+    ------
+    CliError(code=1)
+        When ``adapter_config.json`` is absent, unreadable, or missing the
+        ``base_model_name_or_path`` key.
+    CliError(code=2)
+        When the ML stack (torch / transformers / peft) is not installed.
+    """
+    try:
+        import torch  # noqa: PLC0415 — intentional lazy import
+        from peft import PeftModel  # noqa: PLC0415
+        from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: PLC0415
+    except ImportError as exc:
+        raise CliError(
+            code=EXIT_ENV_ERROR,
+            message=f"ML stack not installed: {exc}",
+            remediation=(
+                "Install the tuning stack: uv tool install unsloth-cli "
+                "(or run uv sync in a checkout)."
+            ),
+        ) from exc
+
+    # Read the base model name from the adapter config (pure stdlib).
+    config_file = Path(adapter_path) / "adapter_config.json"
+    if not config_file.is_file():
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"adapter_config.json not found in {adapter_path}",
+            remediation=(
+                "The adapter directory must contain adapter_config.json "
+                "(produced by peft/unsloth during training). "
+                "Re-run `sloth train` to produce a valid adapter."
+            ),
+        )
+    try:
+        with config_file.open(encoding="utf-8") as fh:
+            adapter_cfg = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"could not read adapter_config.json: {exc}",
+            remediation="Ensure adapter_config.json is valid JSON.",
+        ) from exc
+    base_model_name = adapter_cfg.get("base_model_name_or_path")
+    if not base_model_name:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message="base_model_name_or_path missing in adapter_config.json",
+            remediation=(
+                "The adapter_config.json must contain 'base_model_name_or_path'. "
+                "Re-run `sloth train` to produce a valid adapter."
+            ),
+        )
+
+    # Correct PEFT load sequence: load BASE model first, then wrap with adapter.
+    # local_files_only=True so no Hub access can occur (B615 — unpinned remote
+    # revision risk does not apply here since we are loading from local files).
+    tokenizer = AutoTokenizer.from_pretrained(adapter_path, local_files_only=True)  # nosec B615
+    base_model = AutoModelForCausalLM.from_pretrained(  # nosec B615
+        base_model_name, local_files_only=True
+    )
+    # Wrap the base model with the LoRA adapter weights — calling
+    # AutoModelForCausalLM.from_pretrained(adapter_path) directly would fail.
+    model = PeftModel.from_pretrained(base_model, adapter_path, local_files_only=True)  # nosec B615
+    model.eval()
+
+    # Load and validate the eval suite (pure stdlib, already validated by eval.py
+    # before the container launch, but re-validate inside the container).
+    records = validate_dataset(Path(suite_path), schema="task")
+
+    # Eval loop.
+    eval_results: list[dict[str, Any]] = []
+    for i, record in enumerate(records):
+        prompt = f"Task: {record['task']}\nInput: {record['input']}\nOutput:"
+        inputs = tokenizer(prompt, return_tensors="pt")
+        with torch.no_grad():
+            outputs = model.generate(**inputs, max_new_tokens=100)
+        prediction = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        expected = record["expected_output"]
+        exact_match = prediction.strip() == expected.strip()
+        eval_results.append(
+            {
+                "index": i,
+                "task": record["task"],
+                "input": record["input"],
+                "expected_output": expected,
+                "prediction": prediction,
+                "exact_match": exact_match,
+            }
+        )
+
+    total = len(eval_results)
+    exact = sum(1 for r in eval_results if r["exact_match"])
+    score_pct = round(exact / total * 100, 2) if total else 0.0
+    return {
+        "total": total,
+        "exact_match": exact,
+        "exact_match_pct": score_pct,
+        "results": eval_results,
+    }
+
+
 def run_training(config: RunConfig, *, dry_run: bool = False) -> dict[str, Any]:
     """Resolve *config* into a training plan and (unless ``dry_run``) run the job.
 
