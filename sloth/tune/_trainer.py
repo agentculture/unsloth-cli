@@ -50,6 +50,12 @@ _INSTALL_HINT = (
     "on a CUDA-capable machine, then re-run."
 )
 
+_NGC_HINT = (
+    "No GPU accelerator was found. Run the trainer inside the NVIDIA NGC container: "
+    "nvcr.io/nvidia/pytorch:25.11-py3 "
+    "(which includes the required CUDA drivers, unsloth, torch, and trl)."
+)
+
 
 # ---------------------------------------------------------------------------
 # Plan construction (pure — no torch)
@@ -195,35 +201,54 @@ def _run_real(config: RunConfig, plan: dict[str, Any], backend: _Backend) -> dic
     # time ("validate before spending GPU").
     train_records = _load_train_records(config.dataset)
 
-    model, tokenizer = backend.fast_language_model.from_pretrained(
-        model_name=config.model,
-        max_seq_length=config.max_seq_len,
-        load_in_4bit=load_in_4bit,
-        dtype=None,
-    )
-    model = backend.fast_language_model.get_peft_model(
-        model,
-        r=config.lora_r,
-        lora_alpha=config.lora_alpha,
-        lora_dropout=config.lora_dropout,
-        random_state=config.seed,
-    )
+    # Wrap the raw list[dict] as a datasets.Dataset so SFTTrainer gets the typed
+    # object it expects. Lazy-imported here (not at module top) so:
+    #   (a) the module stays importable without ``datasets`` installed, and
+    #   (b) tests can monkeypatch sys.modules["datasets"] to inject a fake.
+    from datasets import Dataset  # noqa: PLC0415 — intentional lazy import
 
-    sft_config = backend.sft_config(
-        output_dir=config.output,
-        per_device_train_batch_size=config.batch_size,
-        gradient_accumulation_steps=config.grad_accum,
-        learning_rate=config.learning_rate,
-        max_steps=config.max_steps,
-        seed=config.seed,
-    )
-    trainer = backend.sft_trainer(
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=train_records,
-        args=sft_config,
-    )
-    trainer.train()
+    train_dataset = Dataset.from_list(train_records)
+
+    try:
+        model, tokenizer = backend.fast_language_model.from_pretrained(
+            model_name=config.model,
+            max_seq_length=config.max_seq_len,
+            load_in_4bit=load_in_4bit,
+            dtype=None,
+        )
+        model = backend.fast_language_model.get_peft_model(
+            model,
+            r=config.lora_r,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout,
+            random_state=config.seed,
+        )
+
+        sft_config = backend.sft_config(
+            output_dir=config.output,
+            per_device_train_batch_size=config.batch_size,
+            gradient_accumulation_steps=config.grad_accum,
+            learning_rate=config.learning_rate,
+            max_steps=config.max_steps,
+            seed=config.seed,
+        )
+        trainer = backend.sft_trainer(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=train_dataset,
+            args=sft_config,
+        )
+        trainer.train()
+    except NotImplementedError as exc:
+        # Unsloth raises NotImplementedError (message: "cannot find any torch
+        # accelerator") when no GPU is available. Map it to a user-actionable
+        # CliError so the CLI can surface a clear remediation instead of a
+        # "file a bug" generic error (code=1).
+        raise CliError(
+            code=EXIT_ENV_ERROR,
+            message=f"No GPU accelerator found — the ML backend raised: {exc}",
+            remediation=_NGC_HINT,
+        ) from exc
 
     output_dir = Path(config.output)
     output_dir.mkdir(parents=True, exist_ok=True)

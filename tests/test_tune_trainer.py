@@ -281,3 +281,199 @@ class TestOutOfScopeRefusal:
         with pytest.raises(CliError) as exc_info:
             run_training(config, dry_run=False)
         assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# 6. Dataset wrapping: train_dataset must be Dataset.from_list(records) value
+# ---------------------------------------------------------------------------
+
+
+def _fake_datasets_module():
+    """Return a (fake_module, call_log) pair for monkeypatching sys.modules['datasets']."""
+    from_list_calls: list = []
+
+    class FakeDataset:
+        """Stand-in for datasets.Dataset; records from_list calls and acts as sentinel."""
+
+        @classmethod
+        def from_list(cls, records):
+            from_list_calls.append(records)
+            return cls  # return the class itself as an identifiable sentinel
+
+    module = SimpleNamespace(Dataset=FakeDataset)
+    return module, FakeDataset, from_list_calls
+
+
+class TestDatasetWrapping:
+    """_run_real must wrap train_records with Dataset.from_list before SFTTrainer."""
+
+    def test_sft_trainer_receives_dataset_wrapped_value(self, tmp_path: Path, monkeypatch) -> None:
+        config = _config(tmp_path)
+        _write_chat_dataset(Path(config.dataset))
+        backend, events = _make_fake_backend()
+        monkeypatch.setattr(_trainer, "_load_backend", lambda: backend)
+
+        fake_module, FakeDataset, from_list_calls = _fake_datasets_module()
+        # Inject the fake into sys.modules so the lazy ``from datasets import Dataset``
+        # inside _run_real resolves to our FakeDataset without needing the real package.
+        monkeypatch.setitem(sys.modules, "datasets", fake_module)
+
+        run_training(config, dry_run=False)
+
+        assert from_list_calls, "Dataset.from_list was never called"
+        trainer_kwargs = events["trainer"][0]
+        assert trainer_kwargs["train_dataset"] is FakeDataset, (
+            "SFTTrainer did not receive the Dataset-wrapped value; "
+            f"got {trainer_kwargs['train_dataset']!r} instead of FakeDataset sentinel"
+        )
+
+    def test_from_list_called_with_raw_records(self, tmp_path: Path, monkeypatch) -> None:
+        """Dataset.from_list must be called with the raw list[dict] loaded from the file."""
+        config = _config(tmp_path)
+        _write_chat_dataset(Path(config.dataset))
+        backend, _ = _make_fake_backend()
+        monkeypatch.setattr(_trainer, "_load_backend", lambda: backend)
+
+        fake_module, _, from_list_calls = _fake_datasets_module()
+        monkeypatch.setitem(sys.modules, "datasets", fake_module)
+
+        run_training(config, dry_run=False)
+
+        assert from_list_calls, "Dataset.from_list was never called"
+        records = from_list_calls[0]
+        assert isinstance(records, list), f"Expected list, got {type(records)}"
+        assert len(records) == 1, f"Expected 1 record (one line in fixture), got {len(records)}"
+        assert "messages" in records[0], "Record did not match expected chat schema"
+
+
+# ---------------------------------------------------------------------------
+# 7. No-accelerator NotImplementedError -> CliError(code=2) with NGC hint
+# ---------------------------------------------------------------------------
+
+
+class TestNoAcceleratorError:
+    """NotImplementedError from the ML backend must surface as CliError(code=2)."""
+
+    def _make_no_gpu_backend(self) -> SimpleNamespace:
+        """Backend whose model-load raises the unsloth no-accelerator error."""
+
+        class FakeFLMNoGPU:
+            @staticmethod
+            def from_pretrained(**kw):
+                raise NotImplementedError(
+                    "Unsloth cannot find any torch accelerator? You need a GPU."
+                )
+
+        class FakeTrainer:
+            def __init__(self, **kw):
+                pass
+
+            def train(self):
+                pass
+
+        return SimpleNamespace(
+            fast_language_model=FakeFLMNoGPU,
+            sft_trainer=FakeTrainer,
+            sft_config=lambda **kw: kw,
+            torch=SimpleNamespace(),
+        )
+
+    def _patch_datasets(self, monkeypatch) -> None:
+        """Inject a no-op fake datasets module so the lazy import doesn't ImportError."""
+
+        class FakeDataset:
+            @classmethod
+            def from_list(cls, records):
+                return cls
+
+        monkeypatch.setitem(sys.modules, "datasets", SimpleNamespace(Dataset=FakeDataset))
+
+    def test_not_implemented_error_raises_cli_error_code_2(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        config = _config(tmp_path)
+        _write_chat_dataset(Path(config.dataset))
+        backend = self._make_no_gpu_backend()
+        monkeypatch.setattr(_trainer, "_load_backend", lambda: backend)
+        self._patch_datasets(monkeypatch)
+
+        with pytest.raises(CliError) as exc_info:
+            run_training(config, dry_run=False)
+        assert (
+            exc_info.value.code == 2
+        ), f"Expected code=2 (ENV_ERROR), got code={exc_info.value.code}"
+
+    def test_not_implemented_error_remediation_names_ngc_container(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        config = _config(tmp_path)
+        _write_chat_dataset(Path(config.dataset))
+        backend = self._make_no_gpu_backend()
+        monkeypatch.setattr(_trainer, "_load_backend", lambda: backend)
+        self._patch_datasets(monkeypatch)
+
+        with pytest.raises(CliError) as exc_info:
+            run_training(config, dry_run=False)
+        assert (
+            "nvcr.io/nvidia/pytorch:25.11-py3" in exc_info.value.remediation
+        ), f"NGC container path not in remediation: {exc_info.value.remediation!r}"
+
+    def test_not_implemented_error_does_not_propagate_as_generic(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        # The CLI must never see a raw NotImplementedError
+        # (that would emit code=1 'file a bug' via the generic handler).
+        config = _config(tmp_path)
+        _write_chat_dataset(Path(config.dataset))
+        backend = self._make_no_gpu_backend()
+        monkeypatch.setattr(_trainer, "_load_backend", lambda: backend)
+        self._patch_datasets(monkeypatch)
+
+        # Must raise CliError (not NotImplementedError)
+        with pytest.raises(CliError):
+            run_training(config, dry_run=False)
+
+    def test_not_implemented_during_train_also_caught(self, tmp_path: Path, monkeypatch) -> None:
+        """NotImplementedError during trainer.train() must map to code=2 (not just model load)."""
+        config = _config(tmp_path)
+        _write_chat_dataset(Path(config.dataset))
+
+        class FakeModel:
+            def save_pretrained(self, path):
+                pass
+
+        class FakeTokenizer:
+            def save_pretrained(self, path):
+                pass
+
+        class FakeFLMOK:
+            @staticmethod
+            def from_pretrained(**kw):
+                return FakeModel(), FakeTokenizer()
+
+            @staticmethod
+            def get_peft_model(model, **kw):
+                return model
+
+        class FakeTrainerRaisesOnTrain:
+            def __init__(self, **kw):
+                pass
+
+            def train(self):
+                raise NotImplementedError(
+                    "Unsloth cannot find any torch accelerator? You need a GPU."
+                )
+
+        backend = SimpleNamespace(
+            fast_language_model=FakeFLMOK,
+            sft_trainer=FakeTrainerRaisesOnTrain,
+            sft_config=lambda **kw: kw,
+            torch=SimpleNamespace(),
+        )
+        monkeypatch.setattr(_trainer, "_load_backend", lambda: backend)
+        self._patch_datasets(monkeypatch)
+
+        with pytest.raises(CliError) as exc_info:
+            run_training(config, dry_run=False)
+        assert exc_info.value.code == 2
+        assert "nvcr.io/nvidia/pytorch:25.11-py3" in exc_info.value.remediation
