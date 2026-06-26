@@ -1,0 +1,241 @@
+{
+  "slug": "unsloth-cli-ships-spark-friendly-lora-qlora-adapte",
+  "title": "unsloth-cli ships Spark-friendly LoRA/QLoRA adapter fine-tuning for Qwen models: a 'tune' noun group (train, eval, export) that validates JSONL datasets before spending GPU, runs small reproducible config-driven adapter jobs, and writes training metadata next to the adapter \u2014 plus a /finetune skill that drives the loop. The introspection CLI keeps working with zero runtime deps; the ML stack arrives as an optional extra.",
+  "schema_version": 1,
+  "status": "exported",
+  "created": "2026-06-26T09:31:29Z",
+  "updated": "2026-06-26T09:59:45Z",
+  "claims": [
+    {
+      "id": "c1",
+      "kind": "announcement",
+      "text": "unsloth-cli ships Spark-friendly LoRA/QLoRA adapter fine-tuning for Qwen models: a 'tune' noun group (train, eval, export) that validates JSONL datasets before spending GPU, runs small reproducible config-driven adapter jobs, and writes training metadata next to the adapter \u2014 plus a /finetune skill that drives the loop. The introspection CLI keeps working with zero runtime deps; the ML stack arrives as an optional extra.",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h1",
+          "text": "On a machine WITHOUT the ML extra, the new verbs still load and run dataset validation + a dry-run plan, exiting cleanly \u2014 torch/unsloth is never imported at module top-level \u2014 and the introspection CLI still passes 'teken cli doctor . --strict' with runtime dependencies = [].",
+          "status": "rejected"
+        },
+        {
+          "id": "h5",
+          "text": "Running an introspection verb (e.g. sloth whoami) does NOT trigger a torch import \u2014 top-level import of the sloth package stays torch-free via lazy imports \u2014 so introspection startup is fast and 'teken cli doctor . --strict' stays green even with torch installed as a base dep.",
+          "status": "confirmed"
+        }
+      ],
+      "hard_questions": [
+        {
+          "id": "q1",
+          "text": "Does 'validate JSONL before spending GPU' live in the zero-dep core (always available) while only the actual training step is gated behind the extra? If validation needed torch, the 'works without the ML stack' promise breaks.",
+          "resolved": false,
+          "blocking": false
+        }
+      ],
+      "links": []
+    },
+    {
+      "id": "c2",
+      "kind": "audience",
+      "text": "AgentCulture mesh agents and their operators (Spark first) doing local, Jetson/Spark-class adapter tuning of Qwen models \u2014 plus the downstream siblings that consume the result: lobes (serves the adapter) and colleague (runs it as a model backend).",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h8",
+          "text": "The verbs and the /finetune skill are usable by an agent non-interactively (every verb supports --json and routes errors via error:/hint:), and the produced adapter uses a standard PEFT/safetensors layout that lobes can serve and colleague can run as a backend.",
+          "status": "confirmed"
+        }
+      ],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c3",
+      "kind": "after_state",
+      "text": "An agent or operator goes from a JSONL dataset to a validated, reproducible LoRA/QLoRA adapter \u2014 with training metadata written next to the output and a config file for repeatable runs \u2014 locally on a Spark, driven either by the CLI verbs or the /finetune skill, without installing torch unless they opt into the ML extra.",
+      "origin": "llm",
+      "status": "rejected",
+      "honesty_conditions": [
+        {
+          "id": "h2",
+          "text": "Re-running the same config file + dataset reproduces the same training setup, and a metadata file written next to the adapter records model, method, dataset hash/size, hyperparameters, and a timestamp.",
+          "status": "rejected"
+        }
+      ],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c4",
+      "kind": "why_it_matters",
+      "text": "Fine-tuning is how the mesh stores STABLE behavior and reflexes (CLI-contract discipline, AgentCulture/CULTURE.DEV terminology, agent-first habits, issue-writing format, teacher behavior) directly into the models its siblings run \u2014 while memory/RAG keeps the CHANGING facts. This adapter-tuning loop is the repo's actual reason to exist; today it's only scaffold.",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h9",
+          "text": "The README draws an explicit, actionable line between what belongs in a fine-tune (stable behavior/reflexes) and what belongs in memory/RAG (changing facts) \u2014 concrete enough that a contributor can decide where a given capability goes.",
+          "status": "confirmed"
+        }
+      ],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c5",
+      "kind": "before_state",
+      "text": "Today unsloth-cli is the scaffold only: introspection verbs (whoami/learn/explain/overview/doctor/cli) but zero fine-tuning. There is no reproducible, agent-friendly way to train a role-specific adapter \u2014 you'd hand-roll a torch/unsloth script with no dataset validation, no run metadata, and none of the CLI's error/exit-code contract.",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h10",
+          "text": "train/eval/export are genuinely net-new verbs (no fine-tuning path exists in the repo today), so the scaffold-only baseline is accurate and this is not re-implementing an existing flow.",
+          "status": "confirmed"
+        }
+      ],
+      "hard_questions": [
+        {
+          "id": "q3",
+          "text": "risk: Because unsloth/torch is now a BASE dependency, 'uv tool install unsloth-cli' will FAIL entirely on a machine where the torch/unsloth wheels don't resolve (e.g. an unsupported arch). The introspection CLI is no longer guaranteed to install everywhere \u2014 that property is traded away by this decision. Spark (ARM/Blackwell) wheel availability must be verified.",
+          "resolved": false,
+          "blocking": false
+        }
+      ],
+      "links": []
+    },
+    {
+      "id": "c6",
+      "kind": "boundary",
+      "text": "NOT full fine-tuning of large dense models \u2014 the CLI must explicitly warn this is out of scope. NOT a serving/inference server (that's lobes). NOT memory/RAG or retrieval (separate concern, but the README must explain the split). NOT distributed/multi-GPU cluster training. NOT a hard torch runtime dependency \u2014 the introspection CLI keeps working with dependencies = [].",
+      "origin": "llm",
+      "status": "rejected",
+      "honesty_conditions": [
+        {
+          "id": "h4",
+          "text": "Pointing train at a large dense full-fine-tune target emits an explicit out-of-scope warning (and refuses or clearly downgrades to adapter-only) rather than silently attempting it.",
+          "status": "rejected"
+        }
+      ],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c7",
+      "kind": "success_signal",
+      "text": "Issue #6's acceptance criteria all pass: validate JSONL before training, run a small Qwen LoRA/QLoRA job end-to-end, config files drive repeatable runs, training metadata written next to the adapter, an eval command against a small local suite, documented Spark-friendly defaults, an explicit out-of-scope warning for large dense full-FT, and a README section on the fine-tune vs memory/RAG vs retrieval split. AND the afi rubric gate (teken cli doctor --strict) stays green.",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h3",
+          "text": "The eval verb runs an adapter against a small LOCAL suite with no network, and the afi rubric gate stays green: every new verb/noun has a catalog entry, supports --json, routes errors through error:/hint:, and any action-noun exposes 'overview'.",
+          "status": "confirmed"
+        }
+      ],
+      "hard_questions": [
+        {
+          "id": "q2",
+          "text": "risk: Unsloth/torch versions move fast and are GPU/arch-specific (Spark = ARM/Blackwell). A pinned ML extra may not resolve on every machine; the subprocess-vs-extra choice affects how badly this bites.",
+          "resolved": false,
+          "blocking": false
+        }
+      ],
+      "links": []
+    },
+    {
+      "id": "c8",
+      "kind": "non_goal",
+      "text": "The first implementation is intentionally minimal: reproducibility and agent-friendliness matter more than breadth of model/method coverage. We are not chasing every Unsloth-supported model or PEFT method in v1.",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c9",
+      "kind": "decision",
+      "text": "Verb topology: FLAT top-level verbs \u2014 sloth train / sloth eval / sloth export \u2014 sitting alongside the introspection verbs (not a 'tune' noun group). Rubric-legal because global verbs don't require an 'overview' sub-verb.",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c10",
+      "kind": "decision",
+      "text": "Dependency policy REVERSED for this feature: unsloth (and its torch stack) is a BASE runtime dependency in pyproject [project].dependencies \u2014 'uv tool install unsloth-cli' brings the full tuning stack. Product-owner decision: uv is the default installer and bundling everything beats an optional extra. CONSEQUENCE: the prior load-bearing 'dependencies = []' / zero-runtime-deps rule is retired; CLAUDE.md (Zero runtime dependencies, Architecture, forward-work) and any lint/CI assumptions must be rewritten to match.",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c11",
+      "kind": "decision",
+      "text": "Even though unsloth is a base dep, handlers LAZY-import torch/unsloth inside the function body (never at module top-level), so introspection verbs (whoami/learn/explain/doctor/overview/cli) keep fast startup and the afi rubric gate (teken cli doctor --strict) stays green \u2014 the gate checks the CLI contract, not dependency count.",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c12",
+      "kind": "after_state",
+      "text": "An agent or operator goes from a JSONL dataset to a validated, reproducible LoRA/QLoRA adapter \u2014 training metadata written next to the output and a config file for repeatable runs \u2014 locally on a Spark, driven by the flat CLI verbs (sloth train / sloth eval / sloth export) or the controlling skill. The full unsloth/torch stack ships with the install via 'uv tool install unsloth-cli'.",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h6",
+          "text": "Re-running the same config file + dataset reproduces the same training setup, and a metadata file written next to the adapter records model, method, dataset hash/size, hyperparameters, and a timestamp.",
+          "status": "confirmed"
+        }
+      ],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c13",
+      "kind": "boundary",
+      "text": "NOT full fine-tuning of large dense models \u2014 the CLI must explicitly WARN this is out of scope (and refuse/downgrade to adapter-only). NOT a serving/inference server (that's lobes). NOT memory/RAG or retrieval (separate concern; the README must explain the fine-tune vs RAG vs retrieval split). NOT distributed/multi-GPU cluster training. (Note: 'no hard torch dependency' is deliberately NO LONGER a boundary \u2014 see decision c10; unsloth/torch is a base dep.)",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h7",
+          "text": "Pointing train at a large dense full-fine-tune target emits an explicit out-of-scope warning (and refuses or clearly downgrades to adapter-only) rather than silently attempting it.",
+          "status": "confirmed"
+        }
+      ],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c14",
+      "kind": "decision",
+      "text": "Run-config format: TOML, parsed with stdlib tomllib (read-only, available on the >=3.12 floor). Human-friendly, supports comments, matches pyproject.toml. Configs are inputs so read-only is fine.",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [],
+      "hard_questions": [],
+      "links": []
+    },
+    {
+      "id": "c15",
+      "kind": "decision",
+      "text": "Controlling skill is named /finetune; it drives the full loop \u2014 validate dataset -> sloth train -> sloth eval -> sloth export \u2014 wrapping the flat CLI verbs.",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [],
+      "hard_questions": [],
+      "links": []
+    }
+  ],
+  "open_vagueness": []
+}
