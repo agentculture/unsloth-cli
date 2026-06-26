@@ -7,7 +7,7 @@ unsloth dependency layer with **uv** (never ``pip``), bind-mount this checkout +
 the working directory, and run ``python -m sloth <args>`` *inside* the container.
 
 This module is the host-side orchestrator. It is **pure stdlib** — it imports
-``shutil``/``subprocess``/``shlex``/``pathlib`` only and **never** imports
+``os``/``shutil``/``subprocess``/``shlex``/``pathlib`` only and **never** imports
 torch/unsloth/datasets/trl/peft — so it loads on a machine with no GPU and no ML
 stack, keeping the introspection verbs import-light. The only code that imports
 the heavy stack is :mod:`sloth.tune._trainer`, which becomes the in-container
@@ -15,7 +15,8 @@ entrypoint reached via ``python -m sloth``.
 
 Public API
 ----------
-build_command(sloth_args, *, workdir=None, checkout=None, image=NGC_IMAGE, gpus="all") -> list[str]
+build_command(sloth_args, *, workdir=None, checkout=None, image=NGC_IMAGE, gpus="all",
+              extra_mounts=None, use_host_user=True) -> list[str]
     Build the deterministic ``docker run`` argv that runs *sloth_args* inside the
     NGC container with the uv-installed dependency layer.
 preflight(*, image=NGC_IMAGE) -> None
@@ -23,17 +24,22 @@ preflight(*, image=NGC_IMAGE) -> None
     NVIDIA GPU runtime usable). Raises :class:`CliError` (code 2) on any failure,
     with a remediation naming the NGC image + ``nvidia-container-toolkit``.
 launch(sloth_args, *, workdir=None, checkout=None, image=NGC_IMAGE, gpus="all",
-       skip_preflight=False) -> int
+       skip_preflight=False, extra_mounts=None, use_host_user=True) -> int
     Run :func:`preflight` (unless skipped), build the command, run it streaming
-    its output to the parent stdio, and return the container's exit code.
+    its output to the parent stdio. Returns 0 on success; raises :class:`CliError`
+    (code 1 or 2) on any container or docker-infrastructure failure.
 
 Design notes
 ------------
 * The dep layer is pinned to NVIDIA's Spark recipe but installed with **uv**:
-  uv is bootstrapped inside the container with the astral standalone installer
-  (``curl -LsSf https://astral.sh/uv/install.sh | sh``) when absent, then
-  ``uv pip install --system`` installs the layer. No ``pip install`` runs
-  anywhere.
+  uv is bootstrapped inside the container with the pinned astral standalone
+  installer (:data:`UV_INSTALL_URL`, version :data:`UV_INSTALLER_VERSION`) when
+  absent, then ``uv pip install --system`` installs the layer. No ``pip install``
+  runs anywhere.
+* Extra bind-mounts: callers may pass ``extra_mounts=[(host, container), ...]``.
+  The convention is identity-mounts (``host_path == container_path``) so that
+  host-absolute paths in *sloth_args* (dataset, output, adapter, suite dirs)
+  resolve unchanged inside the container without any path rewriting.
 * Subprocess calls are isolated in tiny helpers (:func:`_docker_available`,
   :func:`_image_available`, :func:`_gpu_runtime_ok`, :func:`_stream`,
   :func:`_run_quiet`) so tests can monkeypatch them without invoking docker.
@@ -41,12 +47,13 @@ Design notes
 
 from __future__ import annotations
 
+import os
 import shlex
 import shutil
 import subprocess  # nosec B404 - orchestrating docker is this module's whole job
 from pathlib import Path
 
-from sloth.cli._errors import EXIT_ENV_ERROR, CliError
+from sloth.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 
 # ---------------------------------------------------------------------------
 # Pinned NVIDIA recipe — image, dependency layer, uv bootstrap (all importable)
@@ -73,8 +80,11 @@ DEP_LAYER_NODEPS_PACKAGES: tuple[str, ...] = (
     "bitsandbytes",
 )
 
-#: The astral standalone uv installer (used to bootstrap uv inside the container).
-UV_INSTALL_URL: str = "https://astral.sh/uv/install.sh"
+#: Pinned version of the astral uv standalone installer (supply-chain safety).
+UV_INSTALLER_VERSION: str = "0.9.2"
+
+#: The pinned astral standalone uv installer URL (versioned, not floating latest).
+UV_INSTALL_URL: str = f"https://astral.sh/uv/{UV_INSTALLER_VERSION}/install.sh"
 
 #: NVIDIA-recommended ulimits for PyTorch training containers.
 DOCKER_ULIMITS: tuple[str, ...] = ("memlock=-1", "stack=67108864")
@@ -102,21 +112,28 @@ NGC_REMEDIATION: str = (
 def _inner_script(sloth_args: list[str]) -> str:
     """Return the ``bash -lc`` script run inside the NGC container.
 
-    Bootstraps uv with the astral installer when absent, installs the pinned
-    dependency layer with ``uv pip install --system`` (never ``pip``), then runs
+    Bootstraps uv with the pinned astral installer (:data:`UV_INSTALL_URL`) when
+    absent — guarded by a ``curl`` availability check that exits 2 with a clear
+    message if curl is missing — installs the pinned dependency layer with
+    ``uv pip install --system`` (never ``pip``), then runs
     ``python -m sloth <args>`` against the bind-mounted checkout. *sloth_args* is
     shell-quoted with :func:`shlex.join`.
     """
     install_deps = "uv pip install --system " + shlex.join(DEP_LAYER_PACKAGES)
     install_nodeps = "uv pip install --system --no-deps " + shlex.join(DEP_LAYER_NODEPS_PACKAGES)
     entrypoint = f"PYTHONPATH={CHECKOUT_MOUNT} python -m sloth " + shlex.join(sloth_args)
+    curl_guard = (
+        "  command -v curl >/dev/null 2>&1"
+        ' || { echo "curl is required to bootstrap uv" >&2; exit 2; }'
+    )
     return "\n".join(
         [
             "set -euo pipefail",
             # Make a freshly-installed uv (astral default install dir) discoverable.
             'export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"',
-            # Bootstrap uv via the astral standalone installer if it is absent.
+            # Bootstrap uv via the pinned astral standalone installer if it is absent.
             "if ! command -v uv >/dev/null 2>&1; then",
+            curl_guard,
             f"  curl -LsSf {UV_INSTALL_URL} | sh",
             "fi",
             install_deps,
@@ -148,6 +165,8 @@ def build_command(
     checkout: str | Path | None = None,
     image: str = NGC_IMAGE,
     gpus: str = "all",
+    extra_mounts: list[tuple[str, str]] | None = None,
+    use_host_user: bool = True,
 ) -> list[str]:
     """Build the deterministic ``docker run`` argv that runs *sloth_args* in NGC.
 
@@ -168,6 +187,23 @@ def build_command(
         Container image. Defaults to the pinned :data:`NGC_IMAGE`.
     gpus:
         Value for ``--gpus``. Defaults to ``"all"``.
+    extra_mounts:
+        Optional list of ``(host_path, container_path)`` tuples to bind-mount in
+        addition to the standard workdir and checkout mounts. Deduplication is
+        applied by container-target: any tuple whose ``container_path`` already
+        exists as a mount target (including :data:`WORKDIR_MOUNT` and
+        :data:`CHECKOUT_MOUNT`) is silently skipped.
+
+        **Convention — identity mounts:** pass ``host_path == container_path``
+        (absolute host path identical to the container path) so that
+        host-absolute paths forwarded in *sloth_args* (dataset files, output
+        dirs, adapter dirs, eval suites) resolve unchanged inside the container
+        without any path rewriting.
+    use_host_user:
+        When ``True`` (default) **and** running on a POSIX system, adds
+        ``--user <uid>:<gid>`` to the ``docker run`` argv so bind-mounted outputs
+        are owned by the calling user instead of root. Set to ``False`` when the
+        container image requires root or when running on non-POSIX hosts.
 
     Returns
     -------
@@ -177,6 +213,9 @@ def build_command(
     """
     workdir_path = Path(workdir) if workdir is not None else Path.cwd()
     checkout_path = Path(checkout) if checkout is not None else _default_checkout()
+
+    # Track used container mount targets for deduplication (extra_mounts dedup).
+    used_container_targets: set[str] = {WORKDIR_MOUNT, CHECKOUT_MOUNT}
 
     cmd: list[str] = [
         "docker",
@@ -189,11 +228,26 @@ def build_command(
     ]
     for limit in DOCKER_ULIMITS:
         cmd += ["--ulimit", limit]
+
+    # Host-user ownership: bind-mounted outputs are written as the calling user.
+    if use_host_user and os.name == "posix":
+        cmd += ["--user", f"{os.getuid()}:{os.getgid()}"]
+
     cmd += [
         "-v",
         f"{workdir_path}:{WORKDIR_MOUNT}",
         "-v",
         f"{checkout_path}:{CHECKOUT_MOUNT}",
+    ]
+
+    # Extra bind-mounts, deduped by container target.
+    if extra_mounts:
+        for host_path, container_path in extra_mounts:
+            if container_path not in used_container_targets:
+                used_container_targets.add(container_path)
+                cmd += ["-v", f"{host_path}:{container_path}"]
+
+    cmd += [
         "-w",
         WORKDIR_MOUNT,
         image,
@@ -308,8 +362,10 @@ def launch(
     image: str = NGC_IMAGE,
     gpus: str = "all",
     skip_preflight: bool = False,
+    extra_mounts: list[tuple[str, str]] | None = None,
+    use_host_user: bool = True,
 ) -> int:
-    """Preflight, build the docker command, run it streaming output, return its code.
+    """Preflight, build the docker command, run it streaming output, return 0 or raise.
 
     Calls :func:`preflight` first (unless *skip_preflight*), so a host that
     cannot run the container fails fast with ``CliError(code=2)`` before any
@@ -322,12 +378,17 @@ def launch(
     Returns
     -------
     int
-        The container's exit code.
+        ``0`` on success.
 
     Raises
     ------
     CliError(code=2)
-        From :func:`preflight` when the host cannot run the container.
+        From :func:`preflight` when the host cannot run the container, or when
+        the container exits due to an environment/infrastructure error (exit
+        codes: 2, 137 OOM/SIGKILL, or any other non-{0,1,2} docker infra code).
+    CliError(code=1)
+        When the container exits with code 1 (in-container user-input error;
+        the container's own ``error:``/``hint:`` output was already streamed).
     """
     if not skip_preflight:
         preflight(image=image)
@@ -337,5 +398,45 @@ def launch(
         checkout=checkout,
         image=image,
         gpus=gpus,
+        extra_mounts=extra_mounts,
+        use_host_user=use_host_user,
     )
-    return _stream(cmd)
+    code = _stream(cmd)
+    if code == 0:
+        return 0
+    if code == 1:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"Container exited with status {code}; its own output was shown above.",
+            remediation="Review the error:/hint: output above from the in-container sloth run.",
+        )
+    if code == 2:
+        raise CliError(
+            code=EXIT_ENV_ERROR,
+            message=f"Container exited with status {code}; its own output was shown above.",
+            remediation="Review the environment error output above from the in-container run.",
+        )
+    if code == 137:
+        raise CliError(
+            code=EXIT_ENV_ERROR,
+            message=(
+                f"Container was killed (exit {code}): likely OOM / SIGKILL from the "
+                "DGX Spark Unified Memory Architecture (UMA) reclaimer."
+            ),
+            remediation=(
+                "Free host memory and flush the page cache before retrying: "
+                'sudo sh -c "sync; echo 3 > /proc/sys/vm/drop_caches". '
+                "Then reduce batch size or model size."
+            ),
+        )
+    raise CliError(
+        code=EXIT_ENV_ERROR,
+        message=(
+            f"Container exited with status {code} (docker infrastructure error); "
+            "its output was shown above."
+        ),
+        remediation=(
+            "Check that Docker is running and the NVIDIA Container Toolkit is installed "
+            "(nvidia-container-toolkit); see `docker run` exit codes 125/126/127."
+        ),
+    )

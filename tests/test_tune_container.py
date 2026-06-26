@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -37,6 +38,7 @@ from sloth.tune.container import (
     NGC_IMAGE,
     NGC_REMEDIATION,
     UV_INSTALL_URL,
+    UV_INSTALLER_VERSION,
     WORKDIR_MOUNT,
     build_command,
     launch,
@@ -169,10 +171,19 @@ class TestBuildCommand:
 
     def test_bootstraps_uv_via_astral_installer(self, tmp_path: Path) -> None:
         joined = _joined(self._cmd(tmp_path))
-        assert UV_INSTALL_URL == "https://astral.sh/uv/install.sh"
+        assert UV_INSTALLER_VERSION == "0.9.2"
+        assert UV_INSTALL_URL == f"https://astral.sh/uv/{UV_INSTALLER_VERSION}/install.sh"
         assert f"curl -LsSf {UV_INSTALL_URL} | sh" in joined
         # bootstrap is guarded on uv being absent
         assert "command -v uv" in joined
+
+    def test_curl_guard_precedes_curl_call(self, tmp_path: Path) -> None:
+        """curl availability is checked before the curl | sh bootstrap call."""
+        joined = _joined(self._cmd(tmp_path))
+        assert "command -v curl" in joined
+        curl_guard_idx = joined.index("command -v curl")
+        curl_sh_idx = joined.index("curl -LsSf")
+        assert curl_guard_idx < curl_sh_idx
 
     def test_runs_python_m_sloth_with_forwarded_args(self, tmp_path: Path) -> None:
         joined = _joined(self._cmd(tmp_path))
@@ -204,6 +215,99 @@ class TestBuildCommand:
         joined = _joined(cmd)
         repo_root = Path(container.__file__).resolve().parents[2]
         assert f"{repo_root}:{CHECKOUT_MOUNT}" in joined
+
+
+# ---------------------------------------------------------------------------
+# 2b. extra_mounts contract
+# ---------------------------------------------------------------------------
+
+
+class TestExtraMounts:
+    def test_extra_mounts_appear_in_command(self, tmp_path: Path) -> None:
+        cmd = build_command(
+            ["train"],
+            workdir=tmp_path,
+            checkout=tmp_path / "checkout",
+            extra_mounts=[("/data/dataset", "/data/dataset"), ("/output", "/output")],
+        )
+        joined = _joined(cmd)
+        assert "-v /data/dataset:/data/dataset" in joined
+        assert "-v /output:/output" in joined
+
+    def test_extra_mounts_deduped_against_workdir(self, tmp_path: Path) -> None:
+        # WORKDIR_MOUNT (/workspace) target — an extra_mount pointing there is skipped.
+        cmd = build_command(
+            ["train"],
+            workdir=tmp_path,
+            checkout=tmp_path / "checkout",
+            extra_mounts=[("/other", WORKDIR_MOUNT)],
+        )
+        joined = _joined(cmd)
+        # Standard workdir mount present exactly once; extra duplicate discarded.
+        assert joined.count(f":{WORKDIR_MOUNT}") == 1
+
+    def test_extra_mounts_deduped_against_checkout(self, tmp_path: Path) -> None:
+        # CHECKOUT_MOUNT (/opt/unsloth-cli) target — an extra_mount is skipped.
+        cmd = build_command(
+            ["train"],
+            workdir=tmp_path,
+            checkout=tmp_path / "checkout",
+            extra_mounts=[("/other", CHECKOUT_MOUNT)],
+        )
+        joined = _joined(cmd)
+        assert joined.count(f":{CHECKOUT_MOUNT}") == 1
+
+    def test_extra_mounts_deduped_among_themselves(self, tmp_path: Path) -> None:
+        # When two extra_mounts share the same container target, only the first wins.
+        cmd = build_command(
+            ["train"],
+            workdir=tmp_path,
+            checkout=tmp_path / "checkout",
+            extra_mounts=[("/a", "/shared"), ("/b", "/shared")],
+        )
+        joined = _joined(cmd)
+        assert joined.count(":/shared") == 1
+        assert "-v /a:/shared" in joined  # first one wins
+
+    def test_no_extra_mounts_same_as_none(self, tmp_path: Path) -> None:
+        cmd_default = build_command(
+            ["train"],
+            workdir=tmp_path,
+            checkout=tmp_path / "checkout",
+        )
+        cmd_none = build_command(
+            ["train"],
+            workdir=tmp_path,
+            checkout=tmp_path / "checkout",
+            extra_mounts=None,
+        )
+        assert cmd_default == cmd_none
+
+
+# ---------------------------------------------------------------------------
+# 2c. use_host_user contract
+# ---------------------------------------------------------------------------
+
+
+class TestUseHostUser:
+    def test_user_flag_present_on_posix_by_default(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(os, "getuid", lambda: 1234)
+        monkeypatch.setattr(os, "getgid", lambda: 5678)
+        cmd = build_command(["train"], workdir=tmp_path, checkout=tmp_path)
+        # On POSIX (Linux CI), --user uid:gid must appear.
+        assert "--user" in cmd
+        assert "1234:5678" in cmd
+
+    def test_user_flag_absent_when_disabled(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(os, "getuid", lambda: 1234)
+        monkeypatch.setattr(os, "getgid", lambda: 5678)
+        cmd = build_command(
+            ["train"],
+            workdir=tmp_path,
+            checkout=tmp_path,
+            use_host_user=False,
+        )
+        assert "--user" not in cmd
 
 
 # ---------------------------------------------------------------------------
@@ -350,14 +454,14 @@ class TestLaunch:
 
         def fake_stream(cmd: list[str]) -> int:
             events["streamed"] = cmd
-            return 7
+            return 0  # success path
 
         monkeypatch.setattr(container, "preflight", fake_preflight)
         monkeypatch.setattr(container, "_stream", fake_stream)
 
         code = launch(["train", "--config", "run.toml"], workdir=tmp_path, checkout=tmp_path)
 
-        assert code == 7
+        assert code == 0
         assert events["preflight"] == NGC_IMAGE
         streamed = events["streamed"]
         assert isinstance(streamed, list)
@@ -383,4 +487,64 @@ class TestLaunch:
         monkeypatch.setattr(container, "_stream", must_not_stream)
         with pytest.raises(CliError) as exc_info:
             launch(["train"], workdir=tmp_path, checkout=tmp_path)
+        assert exc_info.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# 4b. launch exit-code → CliError mapping contract
+# ---------------------------------------------------------------------------
+
+
+class TestLaunchExitCodeMapping:
+    """Exit-code contract: launch() maps container exit codes to CliError.
+
+    _stream/_run_quiet return raw ints internally; the mapping lives only in
+    launch(). preflight is stubbed out for all tests in this class.
+    """
+
+    def test_exit_0_returns_0(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(container, "_stream", lambda cmd: 0)
+        result = launch(["train"], workdir=tmp_path, checkout=tmp_path, skip_preflight=True)
+        assert result == 0
+
+    def test_exit_1_raises_cli_error_code_1(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(container, "_stream", lambda cmd: 1)
+        with pytest.raises(CliError) as exc_info:
+            launch(["train"], workdir=tmp_path, checkout=tmp_path, skip_preflight=True)
+        assert exc_info.value.code == 1
+
+    def test_exit_2_raises_cli_error_code_2(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(container, "_stream", lambda cmd: 2)
+        with pytest.raises(CliError) as exc_info:
+            launch(["train"], workdir=tmp_path, checkout=tmp_path, skip_preflight=True)
+        assert exc_info.value.code == 2
+
+    def test_exit_137_raises_code_2_with_oom_hint(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(container, "_stream", lambda cmd: 137)
+        with pytest.raises(CliError) as exc_info:
+            launch(["train"], workdir=tmp_path, checkout=tmp_path, skip_preflight=True)
+        err = exc_info.value
+        assert err.code == 2
+        assert "137" in err.message
+        assert "drop_caches" in err.remediation
+
+    def test_exit_125_raises_cli_error_code_2(self, tmp_path: Path, monkeypatch) -> None:
+        """exit 125 = docker-level error (image not found, bad flags)."""
+        monkeypatch.setattr(container, "_stream", lambda cmd: 125)
+        with pytest.raises(CliError) as exc_info:
+            launch(["train"], workdir=tmp_path, checkout=tmp_path, skip_preflight=True)
+        assert exc_info.value.code == 2
+
+    def test_exit_127_raises_cli_error_code_2(self, tmp_path: Path, monkeypatch) -> None:
+        """exit 127 = command not found inside or outside the container."""
+        monkeypatch.setattr(container, "_stream", lambda cmd: 127)
+        with pytest.raises(CliError) as exc_info:
+            launch(["train"], workdir=tmp_path, checkout=tmp_path, skip_preflight=True)
+        assert exc_info.value.code == 2
+
+    def test_arbitrary_nonzero_raises_cli_error_code_2(self, tmp_path: Path, monkeypatch) -> None:
+        """Any exit code not in {0, 1, 2, 137} maps to CliError(code=2)."""
+        monkeypatch.setattr(container, "_stream", lambda cmd: 42)
+        with pytest.raises(CliError) as exc_info:
+            launch(["train"], workdir=tmp_path, checkout=tmp_path, skip_preflight=True)
         assert exc_info.value.code == 2
