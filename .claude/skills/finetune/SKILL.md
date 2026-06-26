@@ -13,8 +13,8 @@ description: >
   training loop", "train a LoRA adapter", "validate my dataset", "dry-run the
   training plan", or "drive the train → eval → export loop end-to-end". Dry-run
   mode (GPU-free) works on any machine; a real run requires the tuning stack
-  (`uv pip install 'unsloth-cli[train]'`) and a CUDA-capable GPU. First-party to
-  unsloth-cli; not vendored from guildmaster.
+  (which ships with `unsloth-cli` — `uv tool install unsloth-cli`) and a
+  CUDA-capable GPU. First-party to unsloth-cli; not vendored from guildmaster.
 ---
 
 # finetune — drive the validate → train → eval → export loop
@@ -163,8 +163,8 @@ The script propagates the exit code of the first failing `sloth` call verbatim:
 
 - **Dry-run**: stdlib Python 3.11+ (no torch, no GPU). `sloth` must be installed
   or the repo must be on PATH with `uv` available.
-- **Real run**: the optional training extra (`uv pip install 'unsloth-cli[train]'`)
-  and a CUDA-capable GPU. See `sloth explain train` for the annotated TOML
+- **Real run**: the tuning stack (ships with `unsloth-cli` — `uv tool install
+  unsloth-cli`) and a CUDA-capable GPU. See `sloth explain train` for the annotated TOML
   template.
 
 ## Provenance

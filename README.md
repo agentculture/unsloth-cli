@@ -94,22 +94,23 @@ Training runs are driven by a TOML config file. Omitted optional keys fall back
 to Spark-friendly defaults tuned for small-GPU (single-card Spark) operation.
 
 ```toml
-[model]
-name = "Qwen/Qwen3-4B"           # supported: Qwen3 4B / 9B adapter-class targets
-
-[train]
-method = "lora"                   # "lora" or "qlora" — the only supported methods
+[run]
+model   = "unsloth/Qwen3-4B"      # supported: Qwen3 4B / 9B adapter-class targets
+method  = "qlora"                 # "lora" or "qlora" — the only supported methods (default: qlora)
 dataset = "data/train.jsonl"
-output = "adapters/my-lora"
-rank = 16                         # LoRA rank   (default: 16)
-alpha = 32                        # LoRA alpha  (default: 32)
-target_modules = ["q_proj", "v_proj"]
+output  = "adapters/my-lora"
 
-[train.hyperparams]
+[hyperparameters]
+lora_r        = 16                # LoRA rank          (default: 16)
+lora_alpha    = 16                # LoRA alpha scaling (default: 16)
+lora_dropout  = 0.0               # default: 0.0
 learning_rate = 2e-4              # default: 2e-4
-epochs = 3                        # default: 3
-batch_size = 2                    # default: 2  (Spark-friendly: keeps VRAM low)
-gradient_accumulation = 4         # default: 4
+max_seq_len   = 2048              # default: 2048
+batch_size    = 2                 # default: 2  (Spark-friendly: keeps VRAM low)
+grad_accum    = 4                 # default: 4
+max_steps     = 60                # default: 60 (quick smoke-run; raise for production)
+seed          = 3407              # default: 3407
+load_in_4bit  = true              # default: true (required for qlora)
 ```
 
 A metadata file is written next to the adapter output recording model, method,

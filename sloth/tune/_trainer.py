@@ -45,9 +45,9 @@ from sloth.tune.metadata import write_metadata
 from sloth.tune.scope import check_scope
 
 _INSTALL_HINT = (
-    "The fine-tuning backend ships as an optional extra (unsloth + torch + trl). "
-    "Install it with `uv tool install unsloth-cli` (or "
-    "`uv pip install 'unsloth-cli[train]'`) on a CUDA-capable machine, then re-run."
+    "The fine-tuning backend (unsloth + torch + trl) ships with unsloth-cli. "
+    "Reinstall it with `uv tool install unsloth-cli` (or `uv sync` in a checkout) "
+    "on a CUDA-capable machine, then re-run."
 )
 
 

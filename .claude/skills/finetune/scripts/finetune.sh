@@ -72,7 +72,7 @@ The loop stops on the first non-zero exit code, forwarding the CLI's error:/hint
 
 Requirements:
   dry-run  — stdlib Python 3.11+, no GPU, no torch.
-  real run — tuning stack (uv pip install 'unsloth-cli[train]') + CUDA GPU.
+  real run — the tuning stack ships with unsloth-cli (uv tool install unsloth-cli) + a CUDA GPU.
 
 Examples:
   # Smoke-check a config without a GPU:
