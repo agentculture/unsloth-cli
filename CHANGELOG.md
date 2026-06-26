@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-06-26
+
+### Added
+
+- `sloth train` / `sloth eval` / `sloth export` verbs for Spark-friendly LoRA/QLoRA adapter fine-tuning of Qwen models (issue #6)
+- Dependency-free `sloth/tune/` core: JSONL dataset validation (chat + task schemas), TOML run-config loader with Spark-friendly defaults, training-metadata writer (model/method/dataset sha256+lines/hyperparams/timestamp), and a model-scope guard that refuses out-of-scope large-dense full fine-tuning
+- Lazy LoRA/QLoRA trainer (`sloth/tune/_trainer.py`) that imports unsloth/torch only inside its run function, with a GPU-free `--dry-run` plan path
+- `/finetune` skill driving the validate -> train -> eval -> export loop non-interactively
+- explain catalog entries for the three new verbs
+
+### Changed
+
+- unsloth + torch are now BASE runtime dependencies — `uv tool install unsloth-cli` brings the full tuning stack — retiring the prior zero-runtime-dependency rule; introspection verbs stay torch-free and fast via lazy imports, and the afi rubric gate stays green
+- CLAUDE.md and README now document the base-dependency policy, the lazy-import discipline, and the fine-tune vs memory/RAG vs retrieval boundary
+- markdownlint excludes `.venv` (vendored package READMEs now present via base deps) and devague-generated specs/plans
+
 ## [0.3.1] - 2026-06-26
 
 ### Changed
