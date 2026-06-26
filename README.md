@@ -42,6 +42,121 @@ Every command supports `--json`. Results go to stdout, errors/diagnostics to
 stderr (never mixed). Exit codes: `0` success, `1` user error, `2` environment
 error, `3+` reserved.
 
+## Fine-tuning
+
+unsloth-cli ships three flat verbs for LoRA/QLoRA adapter tuning of Qwen models,
+plus a `/finetune` skill that drives the full loop. The Unsloth/PyTorch stack
+arrives with `uv tool install unsloth-cli`; the introspection verbs (`whoami`,
+`learn`, `explain`, etc.) stay fast via lazy imports — torch is never loaded at
+module import time.
+
+### Out of scope
+
+**Full fine-tuning of large dense models is not supported.** The CLI targets
+LoRA and QLoRA adapters on small-to-medium Qwen models (Qwen 3.x 4B / 9B and
+comparable adapter-class targets). Pointing `sloth train` at a large dense
+full-fine-tune target emits an explicit warning and refuses or downgrades to
+adapter-only — it does not attempt the job silently.
+
+### Commands
+
+| Verb | What it does |
+|------|--------------|
+| `sloth train` | Validate JSONL dataset → run LoRA/QLoRA adapter job → write run metadata |
+| `sloth eval` | Run an adapter against a small local eval suite (no network) |
+| `sloth export` | Convert an adapter to safetensors (servable by lobes, runnable by colleague) |
+
+The `/finetune` skill drives the full loop non-interactively:
+validate dataset → `sloth train` → `sloth eval` → `sloth export`.
+
+Every verb supports `--json` and routes errors through `error:` / `hint:` on stderr.
+
+### Dataset schemas
+
+Two JSONL schemas are supported. Validation runs before spending any GPU time;
+malformed lines are reported with the offending line number and a remediation hint.
+
+**Chat format** — for instruction-following and conversational behavior:
+
+```json
+{"messages": [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
+```
+
+**Task format** — for structured input/output tasks:
+
+```json
+{"task": "write-issue", "input": "...", "expected_output": "..."}
+```
+
+### Run config (TOML) and Spark-friendly defaults
+
+Training runs are driven by a TOML config file. Omitted optional keys fall back
+to Spark-friendly defaults tuned for small-GPU (single-card Spark) operation.
+
+```toml
+[model]
+name = "Qwen/Qwen3-4B"           # supported: Qwen3 4B / 9B adapter-class targets
+
+[train]
+method = "lora"                   # "lora" or "qlora" — the only supported methods
+dataset = "data/train.jsonl"
+output = "adapters/my-lora"
+rank = 16                         # LoRA rank   (default: 16)
+alpha = 32                        # LoRA alpha  (default: 32)
+target_modules = ["q_proj", "v_proj"]
+
+[train.hyperparams]
+learning_rate = 2e-4              # default: 2e-4
+epochs = 3                        # default: 3
+batch_size = 2                    # default: 2  (Spark-friendly: keeps VRAM low)
+gradient_accumulation = 4         # default: 4
+```
+
+A metadata file is written next to the adapter output recording model, method,
+dataset SHA-256 and line count, hyperparameters, and an ISO-8601 timestamp.
+Re-running the same config file and dataset reproduces the same training setup.
+
+### What belongs in fine-tuning vs. memory / RAG
+
+This is a design rule, not a footnote. The fine-tune/RAG boundary decides where
+a capability lives in the mesh.
+
+**Fine-tune** stores *stable behavior and reflexes* — things that should be
+baked into how the model responds, not looked up on every call:
+
+- CLI-contract discipline (error/hint format, exit-code policy, stream split)
+- AgentCulture / CULTURE.DEV terminology and patterns
+- Agent-first habits (prefer action verbs, emit structured `--json`, route errors correctly)
+- Issue-writing format and AgentCulture PR/review norms
+- Teacher behavior for `learn` and `explain` responses
+
+**Memory / RAG** stores *changing facts* — things that vary per session, user,
+or deployment and would become stale if baked into weights:
+
+- Current project state, open issues, branch status, recent commits
+- Secrets, tokens, credentials, or any per-deployment configuration
+- User-specific preferences or operator-specific memory
+- Facts better served by retrieval (live documentation, changelogs, external APIs)
+
+**Decision rule for contributors:** *"Would this still be correct six months from
+now on any deployment of the mesh?"* If yes, consider fine-tuning. If it changes
+over time or is per-user, use memory / RAG.
+
+### Role-specific adapters
+
+The design targets small, role-specific adapters rather than one large mixed blob.
+Example adapter names that map to discrete behaviors:
+
+- `culture-contract-lora` — CLI-contract discipline and AgentCulture norms
+- `agentculture-cli-teacher-lora` — teacher behavior for `learn` / `explain`
+- `repo-maintainer-lora` — issue-writing format and PR review norms
+- `tool-router-lora` — tool selection and routing decisions
+- `agent-first-coach-lora` — agent-first habits and patterns
+
+The resulting adapters are written in standard PEFT / safetensors layout so
+[lobes](https://github.com/agentculture/lobes-cli) can serve them and
+[colleague](https://github.com/agentculture/colleague) can run them as model backends.
+
 ## Make it your own
 
 1. Rename the package `sloth/` and the `unsloth-cli`
