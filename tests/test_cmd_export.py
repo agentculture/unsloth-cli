@@ -72,6 +72,32 @@ def test_unsupported_format(tmp_path: Path) -> None:
     assert "safetensors" in err.remediation.lower()
 
 
+def test_adapter_dir_missing_peft_files_raises(tmp_path: Path) -> None:
+    """An adapter dir lacking the canonical PEFT files must fail, not silently succeed."""
+    empty = tmp_path / "empty_adapter"
+    empty.mkdir()
+    args = _make_args(adapter=str(empty))
+    with pytest.raises(CliError) as exc_info:
+        cmd_export(args)
+    err = exc_info.value
+    assert err.code == 1
+    assert "adapter_config.json" in err.message
+    assert err.remediation
+
+
+def test_adapter_dir_missing_one_peft_file_raises(tmp_path: Path) -> None:
+    """A partial adapter (config present, weights missing) must also fail."""
+    partial = tmp_path / "partial_adapter"
+    partial.mkdir()
+    (partial / "adapter_config.json").write_text('{"peft_type": "LORA"}', encoding="utf-8")
+    args = _make_args(adapter=str(partial))
+    with pytest.raises(CliError) as exc_info:
+        cmd_export(args)
+    err = exc_info.value
+    assert err.code == 1
+    assert "adapter_model.safetensors" in err.message
+
+
 # ---------------------------------------------------------------------------
 # Happy-path tests
 # ---------------------------------------------------------------------------

@@ -222,3 +222,52 @@ def test_run_config_is_a_dataclass(tmp_path: Path) -> None:
     import dataclasses
 
     assert dataclasses.is_dataclass(RunConfig)
+
+
+# ---------------------------------------------------------------------------
+# Criterion 1f — invalid hyperparameter types/ranges raise CliError(code=1)
+# ---------------------------------------------------------------------------
+
+_BASE_RUN = """
+[run]
+model = "unsloth/Qwen3-4B"
+dataset = "data/train.jsonl"
+output = "adapters/out"
+"""
+
+
+def test_non_int_hyperparameter_raises_cli_error(tmp_path: Path) -> None:
+    toml_file = _write_toml(tmp_path, _BASE_RUN + '\n[hyperparameters]\nlora_r = "big"\n')
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
+    assert "lora_r" in str(exc_info.value.message)
+
+
+def test_bool_for_int_hyperparameter_is_rejected(tmp_path: Path) -> None:
+    # bool is an int subclass — must still be rejected for a numeric field.
+    toml_file = _write_toml(tmp_path, _BASE_RUN + "\n[hyperparameters]\nmax_steps = true\n")
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
+
+
+def test_out_of_range_int_hyperparameter_raises_cli_error(tmp_path: Path) -> None:
+    toml_file = _write_toml(tmp_path, _BASE_RUN + "\n[hyperparameters]\nlora_r = 0\n")
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
+
+
+def test_out_of_range_dropout_raises_cli_error(tmp_path: Path) -> None:
+    toml_file = _write_toml(tmp_path, _BASE_RUN + "\n[hyperparameters]\nlora_dropout = 1.5\n")
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
+
+
+def test_non_bool_load_in_4bit_raises_cli_error(tmp_path: Path) -> None:
+    toml_file = _write_toml(tmp_path, _BASE_RUN + '\n[hyperparameters]\nload_in_4bit = "yes"\n')
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1

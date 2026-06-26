@@ -352,3 +352,15 @@ def test_register_dry_run_and_json_flags(tmp_path: Path) -> None:
     args = parser.parse_args(["train", "--config", str(tmp_path / "r.toml"), "--dry-run", "--json"])
     assert args.dry_run is True
     assert args.json is True
+
+
+def test_train_help_states_scope_warning() -> None:
+    """`sloth train --help` must state the LoRA/QLoRA-only scope up front."""
+    parser = argparse.ArgumentParser(prog="sloth")
+    sub = parser.add_subparsers(dest="command")
+    register(sub)
+    train_parser = sub.choices["train"]
+    help_text = train_parser.format_help().lower()
+    assert "full fine-tuning" in help_text
+    assert "out of scope" in help_text
+    assert "lora" in help_text and "qlora" in help_text

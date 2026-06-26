@@ -22,7 +22,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Union
 
 from sloth.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 
@@ -39,6 +38,66 @@ KNOWN_SCHEMAS = frozenset({"chat", "task"})
 # ---------------------------------------------------------------------------
 # Per-schema validators
 # ---------------------------------------------------------------------------
+
+
+def _validate_chat_message(msg: object, idx: int, line_no: int) -> None:
+    """Raise CliError if a single chat *msg* (at position *idx*) is malformed.
+
+    Split out of :func:`_validate_chat_record` so the per-message checks live at a
+    single nesting level — keeping each function's branching simple.
+    """
+    if not isinstance(msg, dict):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=(
+                f"line {line_no}: messages[{idx}] must be a JSON object, "
+                f"got {type(msg).__name__}"
+            ),
+            remediation='Each message must be {"role": "user|assistant|system", "content": "..."}',
+        )
+
+    if "role" not in msg:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f'line {line_no}: messages[{idx}] missing required key "role"',
+            remediation='Each message must include "role": one of "system", "user", "assistant".',
+        )
+
+    if "content" not in msg:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f'line {line_no}: messages[{idx}] missing required key "content"',
+            remediation='Each message must include "content": a string.',
+        )
+
+    role = msg["role"]
+    if not isinstance(role, str):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=(
+                f'line {line_no}: messages[{idx}]["role"] must be a string, '
+                f"got {type(role).__name__}"
+            ),
+            remediation=f'"role" must be one of: {sorted(VALID_ROLES)}.',
+        )
+
+    if role not in VALID_ROLES:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f'line {line_no}: messages[{idx}]["role"] {role!r} is not a valid role',
+            remediation=f'"role" must be one of: {sorted(VALID_ROLES)}.',
+        )
+
+    content = msg["content"]
+    if not isinstance(content, str):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=(
+                f'line {line_no}: messages[{idx}]["content"] must be a string, '
+                f"got {type(content).__name__}"
+            ),
+            remediation='"content" must be a plain string.',
+        )
 
 
 def _validate_chat_record(record: object, line_no: int) -> None:
@@ -81,62 +140,7 @@ def _validate_chat_record(record: object, line_no: int) -> None:
         )
 
     for idx, msg in enumerate(messages):
-        if not isinstance(msg, dict):
-            raise CliError(
-                code=EXIT_USER_ERROR,
-                message=(
-                    f"line {line_no}: messages[{idx}] must be a JSON object, "
-                    f"got {type(msg).__name__}"
-                ),
-                remediation=(
-                    'Each message must be {"role": "user|assistant|system", "content": "..."}'
-                ),
-            )
-
-        if "role" not in msg:
-            raise CliError(
-                code=EXIT_USER_ERROR,
-                message=f'line {line_no}: messages[{idx}] missing required key "role"',
-                remediation=(
-                    'Each message must include "role": one of "system", "user", "assistant".'
-                ),
-            )
-
-        if "content" not in msg:
-            raise CliError(
-                code=EXIT_USER_ERROR,
-                message=f'line {line_no}: messages[{idx}] missing required key "content"',
-                remediation='Each message must include "content": a string.',
-            )
-
-        role = msg["role"]
-        if not isinstance(role, str):
-            raise CliError(
-                code=EXIT_USER_ERROR,
-                message=(
-                    f'line {line_no}: messages[{idx}]["role"] must be a string, '
-                    f"got {type(role).__name__}"
-                ),
-                remediation=f'"role" must be one of: {sorted(VALID_ROLES)}.',
-            )
-
-        if role not in VALID_ROLES:
-            raise CliError(
-                code=EXIT_USER_ERROR,
-                message=f'line {line_no}: messages[{idx}]["role"] {role!r} is not a valid role',
-                remediation=f'"role" must be one of: {sorted(VALID_ROLES)}.',
-            )
-
-        content = msg["content"]
-        if not isinstance(content, str):
-            raise CliError(
-                code=EXIT_USER_ERROR,
-                message=(
-                    f'line {line_no}: messages[{idx}]["content"] must be a string, '
-                    f"got {type(content).__name__}"
-                ),
-                remediation='"content" must be a plain string.',
-            )
+        _validate_chat_message(msg, idx, line_no)
 
 
 def _validate_task_record(record: object, line_no: int) -> None:
@@ -198,7 +202,7 @@ def detect_schema(record: dict) -> str | None:
 
 
 def validate_dataset(
-    path: Union[str, os.PathLike],
+    path: str | os.PathLike,
     schema: str,
 ) -> list[dict]:
     """Validate a JSONL file against *schema* and return the parsed records.
@@ -223,6 +227,9 @@ def validate_dataset(
         If the file cannot be opened.
     CliError(code=1, ...)
         If *schema* is not a known schema name.
+    CliError(code=1, ...)
+        If the file holds no records (empty or blank-only) — caught here so
+        ``train`` fails fast instead of after the trainer has loaded the model.
     """
     if schema not in KNOWN_SCHEMAS:
         raise CliError(
@@ -263,5 +270,16 @@ def validate_dataset(
 
             validator(record, raw_line_no)
             records.append(record)
+
+    if not records:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"dataset {file_path} contains no records (empty or blank-only)",
+            remediation=(
+                "Add at least one JSON object record per line, e.g. "
+                '{"messages": [{"role": "user", "content": "..."}]} (chat) or '
+                '{"task": "...", "input": "...", "expected_output": "..."} (task).'
+            ),
+        )
 
     return records

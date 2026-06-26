@@ -98,11 +98,15 @@ def _build_plan(config: RunConfig, *, dry_run: bool, scope) -> dict[str, Any]:
 
 @dataclass
 class _Backend:
-    """Bundle of the lazily-imported ML callables used by the real training path."""
+    """Bundle of the lazily-imported ML callables used by the real training path.
 
-    FastLanguageModel: Any
-    SFTTrainer: Any
-    SFTConfig: Any
+    Field names are snake_case (not the PascalCase of the imported classes) to
+    satisfy the field-naming convention; each holds the corresponding callable.
+    """
+
+    fast_language_model: Any  # unsloth.FastLanguageModel
+    sft_trainer: Any  # trl.SFTTrainer
+    sft_config: Any  # trl.SFTConfig
     torch: Any
 
 
@@ -122,9 +126,9 @@ def _load_backend() -> _Backend:
     from unsloth import FastLanguageModel  # noqa: PLC0415
 
     return _Backend(
-        FastLanguageModel=FastLanguageModel,
-        SFTTrainer=SFTTrainer,
-        SFTConfig=SFTConfig,
+        fast_language_model=FastLanguageModel,
+        sft_trainer=SFTTrainer,
+        sft_config=SFTConfig,
         torch=torch,
     )
 
@@ -186,13 +190,18 @@ def _run_real(config: RunConfig, plan: dict[str, Any], backend: _Backend) -> dic
     """Load the model, apply LoRA/QLoRA, train, save the adapter, write metadata."""
     load_in_4bit = bool(config.load_in_4bit) or config.method == "qlora"
 
-    model, tokenizer = backend.FastLanguageModel.from_pretrained(
+    # Validate + load the dataset BEFORE the expensive model load, so a schema or
+    # empty-dataset failure surfaces a CliError without spending any GPU/model-load
+    # time ("validate before spending GPU").
+    train_records = _load_train_records(config.dataset)
+
+    model, tokenizer = backend.fast_language_model.from_pretrained(
         model_name=config.model,
         max_seq_length=config.max_seq_len,
         load_in_4bit=load_in_4bit,
         dtype=None,
     )
-    model = backend.FastLanguageModel.get_peft_model(
+    model = backend.fast_language_model.get_peft_model(
         model,
         r=config.lora_r,
         lora_alpha=config.lora_alpha,
@@ -200,9 +209,7 @@ def _run_real(config: RunConfig, plan: dict[str, Any], backend: _Backend) -> dic
         random_state=config.seed,
     )
 
-    train_records = _load_train_records(config.dataset)
-
-    sft_config = backend.SFTConfig(
+    sft_config = backend.sft_config(
         output_dir=config.output,
         per_device_train_batch_size=config.batch_size,
         gradient_accumulation_steps=config.grad_accum,
@@ -210,7 +217,7 @@ def _run_real(config: RunConfig, plan: dict[str, Any], backend: _Backend) -> dic
         max_steps=config.max_steps,
         seed=config.seed,
     )
-    trainer = backend.SFTTrainer(
+    trainer = backend.sft_trainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=train_records,

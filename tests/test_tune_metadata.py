@@ -184,3 +184,19 @@ class TestRoundTrip:
         with pytest.raises(CliError) as exc_info:
             read_metadata(adapter_dir)
         assert exc_info.value.code == 2
+
+
+class TestDatasetDigestLineCount:
+    """line_count must equal the number of JSONL records, matching validate_dataset."""
+
+    def test_no_trailing_newline_is_not_off_by_one(self, tmp_path: Path) -> None:
+        path = tmp_path / "no_trailing.jsonl"
+        path.write_text('{"a": 1}\n{"b": 2}\n{"c": 3}', encoding="utf-8")  # no final \n
+        _, count = dataset_digest(path)
+        assert count == 3
+
+    def test_blank_lines_are_not_counted(self, tmp_path: Path) -> None:
+        path = tmp_path / "with_blanks.jsonl"
+        path.write_text('{"a": 1}\n\n{"b": 2}\n   \n', encoding="utf-8")
+        _, count = dataset_digest(path)
+        assert count == 2

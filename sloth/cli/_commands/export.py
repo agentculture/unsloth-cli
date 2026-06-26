@@ -64,6 +64,21 @@ def cmd_export(args: argparse.Namespace) -> int:
             remediation="pass an existing adapter directory via --adapter <dir>",
         )
 
+    # --- Require the canonical PEFT files BEFORE exporting ---
+    # Without this guard a directory missing adapter_config.json /
+    # adapter_model.safetensors would "export" to an empty file list and report
+    # success, silently producing an unusable (un-servable, un-runnable) export.
+    missing = [fname for fname in PEFT_FILES if not (adapter / fname).is_file()]
+    if missing:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"adapter directory {adapter} is missing required PEFT files: {missing}",
+            remediation=(
+                "Point --adapter at a trained adapter directory containing "
+                f"{PEFT_FILES} (e.g. the output of `sloth train`)."
+            ),
+        )
+
     # --- Validate format ---
     fmt = args.format.lower()
     if fmt not in SUPPORTED_FORMATS:

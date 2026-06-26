@@ -105,9 +105,9 @@ def _make_fake_backend() -> tuple[SimpleNamespace, dict]:
         return kw
 
     backend = SimpleNamespace(
-        FastLanguageModel=FakeFLM,
-        SFTTrainer=FakeTrainer,
-        SFTConfig=fake_sft_config,
+        fast_language_model=FakeFLM,
+        sft_trainer=FakeTrainer,
+        sft_config=fake_sft_config,
         torch=SimpleNamespace(),
     )
     return backend, events

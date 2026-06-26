@@ -49,6 +49,15 @@ from sloth.tune.scope import check_scope
 #: Schema assumed when the dataset's first record cannot be classified.
 DEFAULT_SCHEMA = "chat"
 
+#: Always-visible scope statement. Shown in ``sloth train --help`` (and echoed by
+#: ``explain train``) so the LoRA/QLoRA-only boundary is stated up front, before a
+#: run starts — not only when an out-of-scope request is rejected at runtime.
+SCOPE_NOTICE = (
+    "Scope: LoRA and QLoRA adapter training only. Full fine-tuning of large "
+    "dense models is out of scope and will be refused — use method='lora' or "
+    "method='qlora'."
+)
+
 
 # ---------------------------------------------------------------------------
 # Schema inference (pure — no torch)
@@ -162,6 +171,10 @@ def register(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "train",
         help="Validate a dataset and run (or plan) a LoRA/QLoRA adapter job.",
+        description=(
+            "Validate a dataset and run (or plan) a LoRA/QLoRA adapter job. " + SCOPE_NOTICE
+        ),
+        epilog=SCOPE_NOTICE,
     )
     p.add_argument(
         "--config",

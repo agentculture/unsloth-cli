@@ -37,9 +37,12 @@ _METADATA_FILENAME = "training_metadata.json"
 def dataset_digest(path: Path) -> tuple[str, int]:
     """Return ``(sha256_hexdigest, line_count)`` for the dataset at *path*.
 
-    Streams the file in 64 KiB chunks so large datasets do not require loading
-    the entire file into memory.  Counts lines by inspecting decoded text so
-    that the count matches the number of JSONL records.
+    Streams the file one line at a time so large datasets do not require loading
+    the entire file into memory.  ``line_count`` is the number of **non-blank**
+    lines — i.e. the number of JSONL records — matching
+    :func:`sloth.tune.datasets.validate_dataset`, which skips blank lines.
+    Counting records (rather than ``b"\\n"`` bytes) keeps the count correct when
+    the final record lacks a trailing newline and ignores blank separator lines.
 
     Raises
     ------
@@ -50,9 +53,10 @@ def dataset_digest(path: Path) -> tuple[str, int]:
     line_count = 0
     try:
         with path.open("rb") as fh:
-            for chunk in iter(lambda: fh.read(65536), b""):
-                h.update(chunk)
-                line_count += chunk.count(b"\n")
+            for raw_line in fh:
+                h.update(raw_line)
+                if raw_line.strip():
+                    line_count += 1
     except OSError as exc:
         raise CliError(
             code=EXIT_ENV_ERROR,

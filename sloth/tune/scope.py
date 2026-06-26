@@ -97,8 +97,11 @@ class ScopeResult:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+# Possessive quantifiers (``\d++``) make this regex linear: once the digit run is
+# consumed it is never given back, so no input can trigger the polynomial
+# backtracking that an ambiguous ``\d+(?:\.\d+)?`` would (CWE-1333 / Sonar S5852).
 _PARAM_COUNT_RE = re.compile(
-    r"(?<![a-z])(\d+(?:\.\d+)?)b(?!\w)",
+    r"(?<![a-z])(\d++(?:\.\d++)?)b(?!\w)",
     re.IGNORECASE,
 )
 

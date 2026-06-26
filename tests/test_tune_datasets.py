@@ -284,3 +284,25 @@ class TestDetectSchema:
 
     def test_unknown_returns_none(self) -> None:
         assert detect_schema({"foo": "bar"}) is None
+
+
+# ---------------------------------------------------------------------------
+# Empty / blank-only datasets fail fast (validate before spending GPU)
+# ---------------------------------------------------------------------------
+
+
+class TestEmptyDataset:
+    def test_empty_file_raises_user_error(self, tmp_path: Path) -> None:
+        path = tmp_path / "empty.jsonl"
+        path.write_text("", encoding="utf-8")
+        with pytest.raises(CliError) as exc_info:
+            validate_dataset(path, "chat")
+        assert exc_info.value.code == 1
+        assert "no records" in str(exc_info.value.message)
+
+    def test_blank_only_file_raises_user_error(self, tmp_path: Path) -> None:
+        path = tmp_path / "blank.jsonl"
+        path.write_text("\n   \n\n", encoding="utf-8")
+        with pytest.raises(CliError) as exc_info:
+            validate_dataset(path, "task")
+        assert exc_info.value.code == 1

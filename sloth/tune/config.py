@@ -119,6 +119,77 @@ class RunConfig:
 
 
 # ---------------------------------------------------------------------------
+# Hyperparameter validation
+# ---------------------------------------------------------------------------
+
+
+def _require_int(hp: dict, key: str, default: int, *, minimum: int) -> int:
+    """Return ``hp[key]`` as an ``int >= minimum``, falling back to *default*.
+
+    Rejects non-int values (and ``bool``, which is an ``int`` subclass) and
+    out-of-range values with a ``CliError(code=1)`` that names the key — so a
+    malformed ``run.toml`` fails here, not deep inside the ML stack.
+    """
+    value = hp.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"hyperparameter '{key}' must be an integer, got {type(value).__name__}",
+            remediation=f"Set `{key} = <int>` (>= {minimum}) in the [hyperparameters] section.",
+        )
+    if value < minimum:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"hyperparameter '{key}' must be >= {minimum}, got {value}",
+            remediation=f"Set `{key}` to an integer >= {minimum} in [hyperparameters].",
+        )
+    return value
+
+
+def _require_float(
+    hp: dict,
+    key: str,
+    default: float,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    """Return ``hp[key]`` as a ``float`` in ``[minimum, maximum]``, else *default*.
+
+    Accepts ``int`` or ``float`` (but not ``bool``) and validates the optional
+    inclusive bounds, raising ``CliError(code=1)`` naming the key on failure.
+    """
+    value = hp.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"hyperparameter '{key}' must be a number, got {type(value).__name__}",
+            remediation=f"Set `{key} = <number>` in the [hyperparameters] section.",
+        )
+    fvalue = float(value)
+    if (minimum is not None and fvalue < minimum) or (maximum is not None and fvalue > maximum):
+        bound = f"[{minimum}, {maximum}]" if maximum is not None else f">= {minimum}"
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"hyperparameter '{key}' must be in {bound}, got {fvalue}",
+            remediation=f"Set `{key}` to a number in {bound} in [hyperparameters].",
+        )
+    return fvalue
+
+
+def _require_bool(hp: dict, key: str, default: bool) -> bool:
+    """Return ``hp[key]`` as a ``bool``, else *default*; raise on any other type."""
+    value = hp.get(key, default)
+    if not isinstance(value, bool):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"hyperparameter '{key}' must be a boolean, got {type(value).__name__}",
+            remediation=f"Set `{key} = true` or `{key} = false` in [hyperparameters].",
+        )
+    return value
+
+
+# ---------------------------------------------------------------------------
 # Loader
 # ---------------------------------------------------------------------------
 
@@ -185,7 +256,7 @@ def load_config(path: str | Path) -> RunConfig:
             ),
         )
 
-    # --- hyperparameters (all optional) -------------------------------------
+    # --- hyperparameters (all optional, but type/range-checked) -------------
     hp: dict = raw.get("hyperparameters", {})
 
     return RunConfig(
@@ -193,14 +264,16 @@ def load_config(path: str | Path) -> RunConfig:
         dataset=run_section["dataset"],
         output=run_section["output"],
         method=method,
-        lora_r=hp.get("lora_r", DEFAULT_LORA_R),
-        lora_alpha=hp.get("lora_alpha", DEFAULT_LORA_ALPHA),
-        lora_dropout=hp.get("lora_dropout", DEFAULT_LORA_DROPOUT),
-        learning_rate=hp.get("learning_rate", DEFAULT_LEARNING_RATE),
-        max_seq_len=hp.get("max_seq_len", DEFAULT_MAX_SEQ_LEN),
-        batch_size=hp.get("batch_size", DEFAULT_BATCH_SIZE),
-        grad_accum=hp.get("grad_accum", DEFAULT_GRAD_ACCUM),
-        max_steps=hp.get("max_steps", DEFAULT_MAX_STEPS),
-        seed=hp.get("seed", DEFAULT_SEED),
-        load_in_4bit=hp.get("load_in_4bit", DEFAULT_LOAD_IN_4BIT),
+        lora_r=_require_int(hp, "lora_r", DEFAULT_LORA_R, minimum=1),
+        lora_alpha=_require_int(hp, "lora_alpha", DEFAULT_LORA_ALPHA, minimum=1),
+        lora_dropout=_require_float(
+            hp, "lora_dropout", DEFAULT_LORA_DROPOUT, minimum=0.0, maximum=1.0
+        ),
+        learning_rate=_require_float(hp, "learning_rate", DEFAULT_LEARNING_RATE, minimum=0.0),
+        max_seq_len=_require_int(hp, "max_seq_len", DEFAULT_MAX_SEQ_LEN, minimum=1),
+        batch_size=_require_int(hp, "batch_size", DEFAULT_BATCH_SIZE, minimum=1),
+        grad_accum=_require_int(hp, "grad_accum", DEFAULT_GRAD_ACCUM, minimum=1),
+        max_steps=_require_int(hp, "max_steps", DEFAULT_MAX_STEPS, minimum=1),
+        seed=_require_int(hp, "seed", DEFAULT_SEED, minimum=0),
+        load_in_4bit=_require_bool(hp, "load_in_4bit", DEFAULT_LOAD_IN_4BIT),
     )
