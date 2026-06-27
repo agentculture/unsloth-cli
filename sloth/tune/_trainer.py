@@ -512,9 +512,10 @@ def run_training(config: RunConfig, *, dry_run: bool = False) -> dict[str, Any]:
             message="The fine-tuning backend (unsloth + torch + trl) is not installed.",
             remediation=_INSTALL_HINT,
         ) from exc
-    except Exception as exc:  # noqa: BLE001 — classify OOM, re-raise the rest
+    except Exception as exc:  # noqa: BLE001
         # Unsloth's GPU probe at import can raise a CUDA/accelerator OOM. That is an
-        # environment error (exit 2) with a memory remediation, not a code-1 bug.
+        # environment error (exit 2) with a memory remediation, not a code-1 bug;
+        # classify it and re-raise everything else unchanged.
         if _is_gpu_oom(exc):
             raise CliError(
                 code=EXIT_ENV_ERROR,
@@ -527,7 +528,8 @@ def run_training(config: RunConfig, *, dry_run: bool = False) -> dict[str, Any]:
         return _run_real(config, plan, backend)
     except CliError:
         raise
-    except Exception as exc:  # noqa: BLE001 — classify OOM, re-raise the rest
+    except Exception as exc:  # noqa: BLE001
+        # Map a CUDA/accelerator OOM during training to exit 2; re-raise the rest.
         if _is_gpu_oom(exc):
             raise CliError(
                 code=EXIT_ENV_ERROR,
