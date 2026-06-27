@@ -202,6 +202,43 @@ def _default_checkout() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _reject_root_mount(host_path: str, container_path: str) -> None:
+    """Refuse a bind-mount touching the filesystem root (host or container side).
+
+    A ``/`` on either side would overlay the whole host filesystem into the run
+    (``-v /:/`` or ``-v /:/workspace``), exposing/altering arbitrary host files.
+    """
+    if host_path == "/" or container_path == "/":
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=(
+                "refusing to bind-mount the filesystem root " f"({host_path}:{container_path})"
+            ),
+            remediation=(
+                "Run sloth from a project directory, not '/', and keep the config, "
+                "dataset, and output paths out of the filesystem root."
+            ),
+        )
+
+
+def _extra_mount_args(
+    extra_mounts: list[tuple[str, str]] | None, used_targets: set[str]
+) -> list[str]:
+    """Return the ``-v host:container`` args for *extra_mounts*.
+
+    Deduped by container target against (and recording into) *used_targets*: a
+    tuple whose ``container_path`` is already a mount target is skipped. Any mount
+    of the filesystem root is refused via :func:`_reject_root_mount`.
+    """
+    args: list[str] = []
+    for host_path, container_path in extra_mounts or ():
+        _reject_root_mount(host_path, container_path)
+        if container_path not in used_targets:
+            used_targets.add(container_path)
+            args += ["-v", f"{host_path}:{container_path}"]
+    return args
+
+
 def build_command(
     sloth_args: list[str],
     *,
@@ -321,27 +358,8 @@ def build_command(
         used_container_targets.add(HF_CACHE_MOUNT)
         cmd += ["-v", f"{hf_cache_path}:{HF_CACHE_MOUNT}"]
 
-    # Extra bind-mounts, deduped by container target. A ``container_path`` of "/" is
-    # refused outright: it would overlay the container root with a host directory
-    # (``-v /:/`` if a caller resolved a path against the filesystem root), exposing the
-    # whole host fs inside the run.
-    if extra_mounts:
-        for host_path, container_path in extra_mounts:
-            if container_path == "/" or host_path == "/":
-                raise CliError(
-                    code=EXIT_USER_ERROR,
-                    message=(
-                        "refusing to bind-mount the filesystem root "
-                        f"({host_path}:{container_path})"
-                    ),
-                    remediation=(
-                        "Run sloth from a project directory, not '/', and keep the config, "
-                        "dataset, and output paths out of the filesystem root."
-                    ),
-                )
-            if container_path not in used_container_targets:
-                used_container_targets.add(container_path)
-                cmd += ["-v", f"{host_path}:{container_path}"]
+    # Extra bind-mounts, deduped by container target (filesystem-root mounts refused).
+    cmd += _extra_mount_args(extra_mounts, used_container_targets)
 
     cmd += [
         "-w",
