@@ -56,6 +56,32 @@ _NGC_HINT = (
     "(which includes the required CUDA drivers, unsloth, torch, and trl)."
 )
 
+_OOM_HINT = (
+    "The GPU ran out of memory. On the DGX Spark's Unified Memory Architecture, free "
+    "host memory and flush the page cache (sudo sh -c 'sync; echo 3 > "
+    "/proc/sys/vm/drop_caches'), stop other GPU processes, then retry. You can also "
+    "reduce batch_size / max_seq_len, or use method='qlora' (4-bit) for a smaller "
+    "footprint (the container already sets PYTORCH_ALLOC_CONF=expandable_segments:True)."
+)
+
+
+def _is_gpu_oom(exc: BaseException) -> bool:
+    """Return True when *exc* looks like a CUDA/accelerator out-of-memory error.
+
+    Detects by class name and message so we need not import torch to reference its
+    ``OutOfMemoryError`` / ``AcceleratorError`` types. Unsloth raises these at
+    *import* time (GPU probe) and during training when memory is exhausted — both
+    are environment errors (exit 2), not "file a bug" code-1 errors.
+    """
+    name = type(exc).__name__.lower()
+    msg = str(exc).lower()
+    return (
+        "outofmemory" in name
+        or "acceleratorerror" in name
+        or "out of memory" in msg
+        or "cuda error: out of memory" in msg
+    )
+
 
 # ---------------------------------------------------------------------------
 # Plan construction (pure — no torch)
@@ -127,10 +153,18 @@ def _load_backend() -> _Backend:
     Raises:
         ImportError: if any component of the ML stack is unavailable.
     """
-    import torch  # noqa: PLC0415 — intentional lazy import
+    # Unsloth MUST be imported *before* trl/transformers/peft so its runtime
+    # patches apply. Imported after them, unsloth warns and skips optimizations —
+    # and trl's SFTConfig `<EOS_TOKEN>` sentinel is left unpatched, raising
+    # "eos_token '<EOS_TOKEN>' is not found in the vocabulary" at train() time.
+    # unsloth MUST be imported before torch/trl (see note above); keep this order —
+    # do not let the import sorter reorder this block alphabetically.
+    # isort: off
+    from unsloth import FastLanguageModel  # noqa: PLC0415 — intentional lazy import; import FIRST
+    import torch  # noqa: PLC0415
     from trl import SFTConfig, SFTTrainer  # noqa: PLC0415
-    from unsloth import FastLanguageModel  # noqa: PLC0415
 
+    # isort: on
     return _Backend(
         fast_language_model=FastLanguageModel,
         sft_trainer=SFTTrainer,
@@ -180,11 +214,30 @@ def _detect_dataset_schema(path: Path) -> str:
     return schema
 
 
-def _load_train_records(dataset: str) -> list[dict]:
-    """Validate the dataset and return its parsed records (raises CliError on failure)."""
-    path = Path(dataset)
-    schema = _detect_dataset_schema(path)
-    return validate_dataset(path, schema=schema)
+def _format_records(records: list[dict], schema: str, tokenizer: Any) -> list[dict]:
+    """Render validated records into ``{"text": ...}`` rows for SFTTrainer.
+
+    Chat records are rendered with the model's chat template; task records use the
+    same ``Task:/Input:/Output:`` prompt shape as :func:`run_eval`, terminated with
+    the tokenizer's EOS so the model learns to stop. Pre-rendering an explicit
+    ``text`` column avoids trl/unsloth conversational auto-detection, which would
+    otherwise raise ``"Unsloth: You must specify a `formatting_func`"``.
+    """
+    if schema == "chat":
+        return [
+            {"text": tokenizer.apply_chat_template(record["messages"], tokenize=False)}
+            for record in records
+        ]
+    eos = tokenizer.eos_token or ""
+    return [
+        {
+            "text": (
+                f"Task: {record['task']}\nInput: {record['input']}\n"
+                f"Output: {record['expected_output']}{eos}"
+            )
+        }
+        for record in records
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -199,15 +252,13 @@ def _run_real(config: RunConfig, plan: dict[str, Any], backend: _Backend) -> dic
     # Validate + load the dataset BEFORE the expensive model load, so a schema or
     # empty-dataset failure surfaces a CliError without spending any GPU/model-load
     # time ("validate before spending GPU").
-    train_records = _load_train_records(config.dataset)
+    dataset_path = Path(config.dataset)
+    schema = _detect_dataset_schema(dataset_path)
+    train_records = validate_dataset(dataset_path, schema=schema)
 
-    # Wrap the raw list[dict] as a datasets.Dataset so SFTTrainer gets the typed
-    # object it expects. Lazy-imported here (not at module top) so:
-    #   (a) the module stays importable without ``datasets`` installed, and
-    #   (b) tests can monkeypatch sys.modules["datasets"] to inject a fake.
+    # Lazy-imported here (not at module top) so the module stays importable without
+    # ``datasets`` installed and tests can inject a fake via sys.modules.
     from datasets import Dataset  # noqa: PLC0415 — intentional lazy import
-
-    train_dataset = Dataset.from_list(train_records)
 
     try:
         model, tokenizer = backend.fast_language_model.from_pretrained(
@@ -224,6 +275,14 @@ def _run_real(config: RunConfig, plan: dict[str, Any], backend: _Backend) -> dic
             random_state=config.seed,
         )
 
+        # Render each record into a single ``text`` column so SFTTrainer does not
+        # depend on trl/unsloth conversational auto-detection (which otherwise
+        # raises "Unsloth: You must specify a `formatting_func`"). Chat records use
+        # the model's chat template; task records use the same prompt shape as
+        # ``sloth eval``. Done after the tokenizer exists (the chat template lives
+        # on it).
+        train_dataset = Dataset.from_list(_format_records(train_records, schema, tokenizer))
+
         sft_config = backend.sft_config(
             output_dir=config.output,
             per_device_train_batch_size=config.batch_size,
@@ -231,10 +290,13 @@ def _run_real(config: RunConfig, plan: dict[str, Any], backend: _Backend) -> dic
             learning_rate=config.learning_rate,
             max_steps=config.max_steps,
             seed=config.seed,
+            dataset_text_field="text",
         )
+        # trl >= 0.12 renamed the ``tokenizer`` kwarg to ``processing_class``;
+        # trl 0.24 (the pinned in-container version) removed ``tokenizer`` entirely.
         trainer = backend.sft_trainer(
             model=model,
-            tokenizer=tokenizer,
+            processing_class=tokenizer,
             train_dataset=train_dataset,
             args=sft_config,
         )
@@ -366,11 +428,14 @@ def run_eval(adapter_path: str, suite_path: str) -> dict[str, Any]:
     # before the container launch, but re-validate inside the container).
     records = validate_dataset(Path(suite_path), schema="task")
 
-    # Eval loop.
+    # Eval loop. Tokenized inputs must live on the same device as the (GPU-resident,
+    # 4-bit) model, else generate() raises "Expected all tensors to be on the same
+    # device" — index_select on a CPU index against CUDA weights.
+    device = next(model.parameters()).device
     eval_results: list[dict[str, Any]] = []
     for i, record in enumerate(records):
         prompt = f"Task: {record['task']}\nInput: {record['input']}\nOutput:"
-        inputs = tokenizer(prompt, return_tensors="pt")
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
         with torch.no_grad():
             outputs = model.generate(**inputs, max_new_tokens=100)
         prediction = tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -447,5 +512,28 @@ def run_training(config: RunConfig, *, dry_run: bool = False) -> dict[str, Any]:
             message="The fine-tuning backend (unsloth + torch + trl) is not installed.",
             remediation=_INSTALL_HINT,
         ) from exc
+    except Exception as exc:  # noqa: BLE001
+        # Unsloth's GPU probe at import can raise a CUDA/accelerator OOM. That is an
+        # environment error (exit 2) with a memory remediation, not a code-1 bug;
+        # classify it and re-raise everything else unchanged.
+        if _is_gpu_oom(exc):
+            raise CliError(
+                code=EXIT_ENV_ERROR,
+                message=f"GPU out of memory while initializing the backend: {exc}",
+                remediation=_OOM_HINT,
+            ) from exc
+        raise
 
-    return _run_real(config, plan, backend)
+    try:
+        return _run_real(config, plan, backend)
+    except CliError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        # Map a CUDA/accelerator OOM during training to exit 2; re-raise the rest.
+        if _is_gpu_oom(exc):
+            raise CliError(
+                code=EXIT_ENV_ERROR,
+                message=f"GPU out of memory during training: {exc}",
+                remediation=_OOM_HINT,
+            ) from exc
+        raise

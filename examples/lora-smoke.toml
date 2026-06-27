@@ -1,0 +1,26 @@
+# LoRA smoke config — a tiny, Spark-friendly adapter run (16-bit base).
+#
+# Run from the repo root:
+#   sloth train --config examples/lora-smoke.toml
+#
+# `method = "lora"` keeps the base model in 16-bit (load_in_4bit = false), which
+# uses more memory than QLoRA but skips 4-bit quantization. This config is sized
+# for a quick smoke run (max_steps = 10), not a production adapter.
+
+[run]
+model   = "unsloth/Qwen3-1.7B"       # small base model (downloaded + cached on first run)
+method  = "lora"                     # "lora" or "qlora" — the only supported methods
+dataset = "examples/chat-smoke.jsonl"
+output  = "runs/lora-smoke"
+
+[hyperparameters]
+lora_r        = 8
+lora_alpha    = 16
+lora_dropout  = 0.0
+learning_rate = 2e-4
+max_seq_len   = 1024
+batch_size    = 1
+grad_accum    = 4
+max_steps     = 10
+seed          = 3407
+load_in_4bit  = false                # 16-bit base for plain LoRA

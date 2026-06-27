@@ -133,9 +133,10 @@ def cmd_eval(args: argparse.Namespace) -> int | None:
             sloth_args.append("--json")
         sloth_args.append("--in-container")
         # Identity mounts so the host-absolute paths in sloth_args resolve
-        # unchanged inside the container without any path rewriting.
+        # unchanged inside the container without any path rewriting. ``sorted``
+        # makes the docker argv deterministic (a set has no stable iteration order).
         mount_parents = {adapter_abs.parent, suite_abs.parent}
-        extra_mounts = [(str(p), str(p)) for p in mount_parents]
+        extra_mounts = [(str(p), str(p)) for p in sorted(mount_parents)]
         container.launch(
             sloth_args,
             workdir=str(adapter_abs.parent),

@@ -1,0 +1,4 @@
+{"task": "answer", "input": "Where do results go?", "expected_output": "Results go to stdout; errors and diagnostics go to stderr. The two streams are never mixed."}
+{"task": "answer", "input": "What does exit code 1 mean?", "expected_output": "Exit code 1 is a user-input error. 0 is success, 2 is an environment/setup error, 3 and above are reserved."}
+{"task": "answer", "input": "Which fine-tuning methods are supported?", "expected_output": "Only LoRA and QLoRA adapter tuning. Full fine-tuning of large dense models is out of scope and is refused or downgraded to adapter-only."}
+{"task": "answer", "input": "What format are exported adapters in?", "expected_output": "Standard PEFT safetensors layout, so lobes can serve them and colleague can run them as a model backend."}

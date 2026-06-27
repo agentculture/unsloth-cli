@@ -1,0 +1,29 @@
+# QLoRA smoke config — a tiny, Spark-friendly adapter run.
+#
+# Run from the repo root:
+#   sloth train --config examples/qlora-smoke.toml
+#
+# `method = "qlora"` loads the base model in 4-bit (load_in_4bit) so it trains in
+# a couple of GB of unified memory on the DGX Spark (GB10) — small enough to run
+# even when the box is busy serving other models. This config is sized for a
+# quick smoke run (max_steps = 10), not a production adapter. For a production
+# adapter, raise max_steps, point `dataset` at a real corpus, and scale `model`
+# up to the production target (e.g. Qwen/Qwen3.5-4B) on a box with free memory.
+
+[run]
+model   = "unsloth/Qwen3-1.7B"       # small base model (downloaded + cached on first run)
+method  = "qlora"                    # "lora" or "qlora" — the only supported methods
+dataset = "examples/chat-smoke.jsonl"
+output  = "runs/qlora-smoke"
+
+[hyperparameters]
+lora_r        = 8                    # small rank keeps the adapter tiny
+lora_alpha    = 16
+lora_dropout  = 0.0
+learning_rate = 2e-4
+max_seq_len   = 1024
+batch_size    = 1                    # Spark-friendly: minimal VRAM
+grad_accum    = 4
+max_steps     = 10                   # smoke run; raise for production
+seed          = 3407
+load_in_4bit  = true                 # required for qlora

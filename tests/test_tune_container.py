@@ -145,19 +145,69 @@ class TestBuildCommand:
         # checkout mount
         assert f"{tmp_path / 'checkout'}:{CHECKOUT_MOUNT}" in joined
 
-    def test_installs_dep_layer_with_uv_pip_system(self, tmp_path: Path) -> None:
+    def test_installs_dep_layer_into_a_system_site_packages_venv(self, tmp_path: Path) -> None:
         joined = _joined(self._cmd(tmp_path))
-        assert "uv pip install --system" in joined
-        # full-resolution layer
+        # Deps install into a --system-site-packages venv (inherits the container's
+        # torch/torchao) — NOT `uv pip install --system`, which fails on the NGC
+        # image both as root (PEP-668) and under --user (root-owned site-packages).
+        assert "uv venv --system-site-packages" in joined
+        assert "uv pip install" in joined
+        assert "uv pip install --system" not in joined
+        # full-resolution layer (pinned, validated set)
         for pkg in DEP_LAYER_PACKAGES:
             assert pkg in joined, f"missing dep-layer package: {pkg}"
-        assert "uv pip install --system transformers peft hf_transfer" in joined
+        assert "transformers==4.57.1" in joined
+        assert "peft==0.18.0" in joined
         assert "datasets==4.3.0" in joined
-        assert "trl==0.26.1" in joined
+        assert "trl==0.24.0" in joined
         # --no-deps layer
-        assert "uv pip install --system --no-deps unsloth unsloth_zoo bitsandbytes" in joined
+        assert "uv pip install --no-deps unsloth unsloth_zoo bitsandbytes" in joined
         for pkg in DEP_LAYER_NODEPS_PACKAGES:
             assert pkg in joined, f"missing --no-deps package: {pkg}"
+
+    def test_sets_expandable_segments_env(self, tmp_path: Path) -> None:
+        # Spark UMA allocator tuning is always set (current name + deprecated alias).
+        joined = _joined(self._cmd(tmp_path))
+        assert "-e PYTORCH_ALLOC_CONF=expandable_segments:True" in joined
+        assert "-e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" in joined
+
+    def test_mounts_hf_cache_and_sets_hf_home_when_present(self, tmp_path: Path) -> None:
+        hf = tmp_path / "hfcache"
+        hf.mkdir()
+        joined = _joined(
+            build_command(
+                ["train", "--config", "run.toml"],
+                workdir=tmp_path,
+                checkout=tmp_path / "checkout",
+                hf_cache=hf,
+            )
+        )
+        assert f"-v {hf}:{container.HF_CACHE_MOUNT}" in joined
+        assert f"-e HF_HOME={container.HF_CACHE_MOUNT}" in joined
+
+    def test_skips_hf_cache_when_absent(self, tmp_path: Path) -> None:
+        joined = _joined(
+            build_command(
+                ["train", "--config", "run.toml"],
+                workdir=tmp_path,
+                checkout=tmp_path / "checkout",
+                hf_cache=tmp_path / "does-not-exist",
+            )
+        )
+        assert container.HF_CACHE_MOUNT not in joined
+        assert "HF_HOME" not in joined
+
+    def test_extra_env_pairs_rendered(self, tmp_path: Path) -> None:
+        joined = _joined(
+            build_command(
+                ["train", "--config", "run.toml"],
+                workdir=tmp_path,
+                checkout=tmp_path / "checkout",
+                hf_cache=tmp_path / "none",
+                env=[("FOO", "bar")],
+            )
+        )
+        assert "-e FOO=bar" in joined
 
     def test_never_a_bare_pip_install(self, tmp_path: Path) -> None:
         joined = _joined(self._cmd(tmp_path))
@@ -282,6 +332,39 @@ class TestExtraMounts:
             extra_mounts=None,
         )
         assert cmd_default == cmd_none
+
+    def test_root_container_mount_refused(self, tmp_path: Path) -> None:
+        # A "/" container target would overlay the container root with a host dir
+        # (-v /:/ exposes the whole host fs) — build_command must refuse it.
+        with pytest.raises(CliError) as exc:
+            build_command(
+                ["train"],
+                workdir=tmp_path,
+                checkout=tmp_path / "checkout",
+                extra_mounts=[("/", "/")],
+            )
+        assert exc.value.code == 1
+        assert "root" in str(exc.value).lower()
+
+    def test_root_host_mount_refused(self, tmp_path: Path) -> None:
+        # Even with a non-root container target, a "/" host path is refused.
+        with pytest.raises(CliError):
+            build_command(
+                ["train"],
+                workdir=tmp_path,
+                checkout=tmp_path / "checkout",
+                extra_mounts=[("/", "/host-root")],
+            )
+
+    def test_root_workdir_refused(self, tmp_path: Path) -> None:
+        # The workdir is mounted as /workspace; "/" would mount the whole host fs.
+        with pytest.raises(CliError) as exc:
+            build_command(
+                ["train"],
+                workdir="/",
+                checkout=tmp_path / "checkout",
+            )
+        assert exc.value.code == 1
 
 
 # ---------------------------------------------------------------------------

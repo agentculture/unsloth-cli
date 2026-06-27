@@ -34,8 +34,8 @@ Design notes
 * The dep layer is pinned to NVIDIA's Spark recipe but installed with **uv**:
   uv is bootstrapped inside the container with the pinned astral standalone
   installer (:data:`UV_INSTALL_URL`, version :data:`UV_INSTALLER_VERSION`) when
-  absent, then ``uv pip install --system`` installs the layer. No ``pip install``
-  runs anywhere.
+  absent, then ``uv pip install`` installs the layer into a
+  ``--system-site-packages`` venv. No ``pip install`` runs anywhere.
 * Extra bind-mounts: callers may pass ``extra_mounts=[(host, container), ...]``.
   The convention is identity-mounts (``host_path == container_path``) so that
   host-absolute paths in *sloth_args* (dataset, output, adapter, suite dirs)
@@ -63,17 +63,23 @@ from sloth.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 #: Pinned and deterministic; bumping it is a documented, deliberate change.
 NGC_IMAGE: str = "nvcr.io/nvidia/pytorch:25.11-py3"
 
-#: Dependency layer installed with ``uv pip install --system`` (full resolution).
+#: Dependency layer installed with ``uv pip install`` into the in-container venv.
+#: Pinned to a set validated against NGC 25.11's torch 2.10 + the container's
+#: torchao 0.14 (left untouched). The pins are load-bearing, not cosmetic:
+#: unsloth 2026.6.9 requires ``peft>=0.18.0`` and ``trl<=0.24.0`` (so the prior
+#: unpinned ``trl==0.26.1`` was out of range), and peft>=0.19 hard-requires
+#: torchao>0.16 — which itself needs torch>=2.11 that the container lacks — so peft
+#: is held at 0.18.x and transformers at the matching 4.57.1.
 DEP_LAYER_PACKAGES: tuple[str, ...] = (
-    "transformers",
-    "peft",
+    "transformers==4.57.1",
+    "peft==0.18.0",
     "hf_transfer",
     "datasets==4.3.0",
-    "trl==0.26.1",
+    "trl==0.24.0",
 )
 
-#: Dependency layer installed with ``uv pip install --system --no-deps`` — these
-#: must NOT drag their own torch/transformers in; the container's torch is used.
+#: Dependency layer installed with ``uv pip install --no-deps`` — these must NOT
+#: drag their own torch/transformers in; the container's torch is used.
 DEP_LAYER_NODEPS_PACKAGES: tuple[str, ...] = (
     "unsloth",
     "unsloth_zoo",
@@ -92,6 +98,30 @@ DOCKER_ULIMITS: tuple[str, ...] = ("memlock=-1", "stack=67108864")
 #: Container-side mount points for the working dir and this checkout.
 WORKDIR_MOUNT: str = "/workspace"
 CHECKOUT_MOUNT: str = "/opt/unsloth-cli"
+
+#: In-container venv path (under ``$HOME``, writable by the ``--user`` uid). Created
+#: with ``--system-site-packages`` so it inherits the NGC container's torch +
+#: torchao while the dep layer installs into a writable location. ``uv pip install
+#: --system`` fails both ways: PEP-668 "externally-managed-environment" as root, and
+#: permission-denied on the root-owned system site-packages under ``--user``.
+VENV_DIR: str = "$HOME/.unsloth-cli-venv"
+
+#: Container path where the host Hugging Face cache is bind-mounted, so models are
+#: reused across ephemeral ``--rm`` runs instead of re-downloaded. ``HF_HOME`` is
+#: pointed here (see :func:`build_command`).
+HF_CACHE_MOUNT: str = "/opt/hf-cache"
+
+#: Default host Hugging Face cache mounted into the container (overridable per call).
+DEFAULT_HF_CACHE: Path = Path.home() / ".cache" / "huggingface"
+
+#: Environment always set on the container: expandable CUDA segments to avoid the
+#: large up-front reservations that OOM on the DGX Spark's Unified Memory
+#: Architecture. Both the current (``PYTORCH_ALLOC_CONF``) and the deprecated alias
+#: (``PYTORCH_CUDA_ALLOC_CONF``) are set so it works across torch versions.
+DOCKER_ENV: tuple[tuple[str, str], ...] = (
+    ("PYTORCH_ALLOC_CONF", "expandable_segments:True"),
+    ("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"),
+)
 
 #: Single remediation string reused by every :func:`preflight` failure. It names
 #: both the pinned image and the ``nvidia-container-toolkit`` package so an agent
@@ -115,12 +145,12 @@ def _inner_script(sloth_args: list[str]) -> str:
     Bootstraps uv with the pinned astral installer (:data:`UV_INSTALL_URL`) when
     absent — guarded by a ``curl`` availability check that exits 2 with a clear
     message if curl is missing — installs the pinned dependency layer with
-    ``uv pip install --system`` (never ``pip``), then runs
-    ``python -m sloth <args>`` against the bind-mounted checkout. *sloth_args* is
-    shell-quoted with :func:`shlex.join`.
+    ``uv pip install`` into a ``--system-site-packages`` venv (never ``pip``), then
+    runs ``python -m sloth <args>`` against the bind-mounted checkout. *sloth_args*
+    is shell-quoted with :func:`shlex.join`.
     """
-    install_deps = "uv pip install --system " + shlex.join(DEP_LAYER_PACKAGES)
-    install_nodeps = "uv pip install --system --no-deps " + shlex.join(DEP_LAYER_NODEPS_PACKAGES)
+    install_deps = "uv pip install " + shlex.join(DEP_LAYER_PACKAGES)
+    install_nodeps = "uv pip install --no-deps " + shlex.join(DEP_LAYER_NODEPS_PACKAGES)
     entrypoint = f"PYTHONPATH={CHECKOUT_MOUNT} python -m sloth " + shlex.join(sloth_args)
     curl_guard = (
         "  command -v curl >/dev/null 2>&1"
@@ -136,7 +166,21 @@ def _inner_script(sloth_args: list[str]) -> str:
             curl_guard,
             f"  curl -LsSf {UV_INSTALL_URL} | sh",
             "fi",
+            # Create a writable venv that inherits the container's torch + torchao via
+            # --system-site-packages, then install the dep layer into it and activate
+            # it. This is required because ``uv pip install --system`` fails on the NGC
+            # image both as root (PEP-668 externally-managed) and under --user
+            # (root-owned site-packages is not writable).
+            f'uv venv --system-site-packages "{VENV_DIR}"',
+            f'. "{VENV_DIR}/bin/activate"',
             install_deps,
+            # Drop the venv-local torch/torchvision that the dep layer drags in (a
+            # PyPI torch==2.x+cu13 wheel) so the container's Blackwell-native nv torch
+            # shows through via --system-site-packages. Otherwise the venv torch
+            # shadows it and mismatches the system nv torchvision
+            # ("RuntimeError: operator torchvision::nms does not exist").
+            "uv pip uninstall torch 2>/dev/null || true",
+            "uv pip uninstall torchvision 2>/dev/null || true",
             install_nodeps,
             entrypoint,
         ]
@@ -158,6 +202,43 @@ def _default_checkout() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _reject_root_mount(host_path: str, container_path: str) -> None:
+    """Refuse a bind-mount touching the filesystem root (host or container side).
+
+    A ``/`` on either side would overlay the whole host filesystem into the run
+    (``-v /:/`` or ``-v /:/workspace``), exposing/altering arbitrary host files.
+    """
+    if host_path == "/" or container_path == "/":
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=(
+                "refusing to bind-mount the filesystem root " f"({host_path}:{container_path})"
+            ),
+            remediation=(
+                "Run sloth from a project directory, not '/', and keep the config, "
+                "dataset, and output paths out of the filesystem root."
+            ),
+        )
+
+
+def _extra_mount_args(
+    extra_mounts: list[tuple[str, str]] | None, used_targets: set[str]
+) -> list[str]:
+    """Return the ``-v host:container`` args for *extra_mounts*.
+
+    Deduped by container target against (and recording into) *used_targets*: a
+    tuple whose ``container_path`` is already a mount target is skipped. Any mount
+    of the filesystem root is refused via :func:`_reject_root_mount`.
+    """
+    args: list[str] = []
+    for host_path, container_path in extra_mounts or ():
+        _reject_root_mount(host_path, container_path)
+        if container_path not in used_targets:
+            used_targets.add(container_path)
+            args += ["-v", f"{host_path}:{container_path}"]
+    return args
+
+
 def build_command(
     sloth_args: list[str],
     *,
@@ -167,6 +248,8 @@ def build_command(
     gpus: str = "all",
     extra_mounts: list[tuple[str, str]] | None = None,
     use_host_user: bool = True,
+    hf_cache: str | Path | None = None,
+    env: list[tuple[str, str]] | None = None,
 ) -> list[str]:
     """Build the deterministic ``docker run`` argv that runs *sloth_args* in NGC.
 
@@ -204,15 +287,36 @@ def build_command(
         ``--user <uid>:<gid>`` to the ``docker run`` argv so bind-mounted outputs
         are owned by the calling user instead of root. Set to ``False`` when the
         container image requires root or when running on non-POSIX hosts.
+    hf_cache:
+        Host Hugging Face cache directory to bind-mount at :data:`HF_CACHE_MOUNT`
+        (with ``HF_HOME`` pointed at it) so models/datasets are reused across
+        ephemeral ``--rm`` runs instead of re-downloaded. Defaults to
+        :data:`DEFAULT_HF_CACHE`; the mount is added only when the directory
+        exists. Pass a non-existent path to skip the mount.
+    env:
+        Extra ``(key, value)`` environment pairs to set with ``-e`` in addition to
+        the always-on :data:`DOCKER_ENV` (Spark UMA allocator tuning).
 
     Returns
     -------
     list[str]
         A ready-to-run ``docker run`` argv (list form — no shell on the host).
-        Calling this twice with the same inputs yields an identical list.
+        Calling this twice with the same inputs on the same host yields an
+        identical list (the HF-cache mount depends on whether the dir exists).
     """
     workdir_path = Path(workdir) if workdir is not None else Path.cwd()
     checkout_path = Path(checkout) if checkout is not None else _default_checkout()
+    hf_cache_path = Path(hf_cache) if hf_cache is not None else DEFAULT_HF_CACHE
+    mount_hf = hf_cache_path.is_dir()
+
+    # The workdir is bind-mounted as the container workspace; the filesystem root
+    # would mount the entire host fs (``-v /:/workspace``) into the run. Refuse it.
+    if str(workdir_path) == "/":
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message="refusing to run with the filesystem root as the working directory",
+            remediation="Run sloth from a project directory, not '/'.",
+        )
 
     # Track used container mount targets for deduplication (extra_mounts dedup).
     used_container_targets: set[str] = {WORKDIR_MOUNT, CHECKOUT_MOUNT}
@@ -229,6 +333,15 @@ def build_command(
     for limit in DOCKER_ULIMITS:
         cmd += ["--ulimit", limit]
 
+    # Always-on environment (Spark UMA allocator tuning), then HF_HOME (only when the
+    # cache is mounted), then any caller-supplied env.
+    for key, value in DOCKER_ENV:
+        cmd += ["-e", f"{key}={value}"]
+    if mount_hf:
+        cmd += ["-e", f"HF_HOME={HF_CACHE_MOUNT}"]
+    for key, value in env or ():
+        cmd += ["-e", f"{key}={value}"]
+
     # Host-user ownership: bind-mounted outputs are written as the calling user.
     if use_host_user and os.name == "posix":
         cmd += ["--user", f"{os.getuid()}:{os.getgid()}"]
@@ -240,12 +353,13 @@ def build_command(
         f"{checkout_path}:{CHECKOUT_MOUNT}",
     ]
 
-    # Extra bind-mounts, deduped by container target.
-    if extra_mounts:
-        for host_path, container_path in extra_mounts:
-            if container_path not in used_container_targets:
-                used_container_targets.add(container_path)
-                cmd += ["-v", f"{host_path}:{container_path}"]
+    # Hugging Face cache mount (model/dataset reuse across runs).
+    if mount_hf:
+        used_container_targets.add(HF_CACHE_MOUNT)
+        cmd += ["-v", f"{hf_cache_path}:{HF_CACHE_MOUNT}"]
+
+    # Extra bind-mounts, deduped by container target (filesystem-root mounts refused).
+    cmd += _extra_mount_args(extra_mounts, used_container_targets)
 
     cmd += [
         "-w",
