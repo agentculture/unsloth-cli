@@ -28,6 +28,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `_trainer` now renders each dataset record into a single `text` column (chat template / task prompt) so SFTTrainer does not require a `formatting_func`
 - `run_eval` now moves tokenized inputs to the model's device before `generate()` (was raising `Expected all tensors to be on the same device`)
 - A CUDA/accelerator out-of-memory error now maps to `CliError(code=2)` with a memory remediation instead of a code-1 'file a bug' (unsloth raises it at import on a memory-starved box)
+- **Security (review fix):** `train` no longer identity-mounts the invocation working directory — it was already bind-mounted as the container workdir, and running from `/` would have emitted a `-v /:/` overlay of the host root filesystem inside the container. `build_command` now refuses any bind-mount of the filesystem root (workdir or extra mount) with `CliError(code=1)`
+- **Reproducibility (review fix):** `train` and `eval` now sort the identity mount-parent set before building `extra_mounts`, so the rendered docker command (and `train --dry-run` output) is deterministic across runs (a `set` has no stable iteration order)
 
 ## [0.4.1] - 2026-06-26
 

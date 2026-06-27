@@ -163,8 +163,13 @@ def _resolve_container_invocation(
 
     # Identity mounts so host-absolute paths (the forwarded config, the dataset, and
     # the output dir) resolve unchanged inside the container (host_path == container_path).
-    mount_parents = {base_dir, config_path.parent, dataset_path.parent, output_path.parent}
-    extra_mounts: list[tuple[str, str]] = [(str(p), str(p)) for p in mount_parents]
+    # ``base_dir`` is deliberately NOT identity-mounted: it is already bind-mounted as the
+    # container workdir (``-v base_dir:/workspace``), so an identity mount would be
+    # redundant — and when ``sloth train`` runs from ``/`` it would emit a dangerous
+    # ``-v /:/`` overlaying the container root with the host root filesystem. ``sorted``
+    # makes the docker argv deterministic (a set has no stable iteration order).
+    mount_parents = {config_path.parent, dataset_path.parent, output_path.parent}
+    extra_mounts: list[tuple[str, str]] = [(str(p), str(p)) for p in sorted(mount_parents)]
 
     # Forward the ABSOLUTE config path; identity mounts make it resolve inside
     # the container without rewriting to /workspace.

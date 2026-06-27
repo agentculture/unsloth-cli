@@ -544,6 +544,56 @@ def test_host_real_run_extra_mounts_cover_config_dataset_output(
     ), f"expected absolute config path, got: {forwarded_config}"
 
 
+def test_host_real_run_does_not_identity_mount_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The invocation cwd is NOT identity-mounted into extra_mounts.
+
+    Security fix: cwd is already bind-mounted as the container workdir
+    (-v cwd:/workspace), so identity-mounting it is redundant — and running
+    ``sloth train`` from ``/`` would otherwise emit a ``-v /:/`` overlay of the
+    host root filesystem.
+    """
+    dataset = tmp_path / "data" / "train.jsonl"
+    dataset.parent.mkdir(parents=True)
+    dataset.write_text(
+        '{"messages": [{"role": "user", "content": "hi"},'
+        '{"role": "assistant", "content": "hello"}]}\n',
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "adapters" / "out"
+    toml_path = tmp_path / "run.toml"
+    toml_path.write_text(
+        "[run]\n"
+        'model   = "unsloth/Qwen3-4B"\n'
+        'method  = "qlora"\n'
+        f'dataset = "{dataset}"\n'
+        f'output  = "{out_dir}"\n',
+        encoding="utf-8",
+    )
+
+    # Pretend the CLI was invoked from the filesystem root — the worst case.
+    monkeypatch.setattr(train_mod.Path, "cwd", staticmethod(lambda: Path("/")))
+
+    captured: dict[str, Any] = {}
+
+    def _capture_launch(sloth_args: list[str], **kwargs: Any) -> int:
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(container_mod, "launch", _capture_launch)
+
+    rc = cmd_train(_make_args(toml_path, dry_run=False))
+    assert rc in (None, 0)
+
+    extra_mounts = captured.get("extra_mounts") or []
+    mounted_container_paths = {ct for _, ct in extra_mounts}
+    # Neither "/" nor the cwd may appear as an identity mount.
+    assert "/" not in mounted_container_paths, f"cwd '/' identity-mounted: {extra_mounts}"
+    # The real data dirs are still covered.
+    assert str(dataset.parent) in mounted_container_paths
+
+
 # ---------------------------------------------------------------------------
 # t4 acceptance — in-container mode: run_training called, no container.launch
 # ---------------------------------------------------------------------------

@@ -333,6 +333,39 @@ class TestExtraMounts:
         )
         assert cmd_default == cmd_none
 
+    def test_root_container_mount_refused(self, tmp_path: Path) -> None:
+        # A "/" container target would overlay the container root with a host dir
+        # (-v /:/ exposes the whole host fs) — build_command must refuse it.
+        with pytest.raises(CliError) as exc:
+            build_command(
+                ["train"],
+                workdir=tmp_path,
+                checkout=tmp_path / "checkout",
+                extra_mounts=[("/", "/")],
+            )
+        assert exc.value.code == 1
+        assert "root" in str(exc.value).lower()
+
+    def test_root_host_mount_refused(self, tmp_path: Path) -> None:
+        # Even with a non-root container target, a "/" host path is refused.
+        with pytest.raises(CliError):
+            build_command(
+                ["train"],
+                workdir=tmp_path,
+                checkout=tmp_path / "checkout",
+                extra_mounts=[("/", "/host-root")],
+            )
+
+    def test_root_workdir_refused(self, tmp_path: Path) -> None:
+        # The workdir is mounted as /workspace; "/" would mount the whole host fs.
+        with pytest.raises(CliError) as exc:
+            build_command(
+                ["train"],
+                workdir="/",
+                checkout=tmp_path / "checkout",
+            )
+        assert exc.value.code == 1
+
 
 # ---------------------------------------------------------------------------
 # 2c. use_host_user contract

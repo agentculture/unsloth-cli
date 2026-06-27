@@ -34,8 +34,8 @@ Design notes
 * The dep layer is pinned to NVIDIA's Spark recipe but installed with **uv**:
   uv is bootstrapped inside the container with the pinned astral standalone
   installer (:data:`UV_INSTALL_URL`, version :data:`UV_INSTALLER_VERSION`) when
-  absent, then ``uv pip install --system`` installs the layer. No ``pip install``
-  runs anywhere.
+  absent, then ``uv pip install`` installs the layer into a
+  ``--system-site-packages`` venv. No ``pip install`` runs anywhere.
 * Extra bind-mounts: callers may pass ``extra_mounts=[(host, container), ...]``.
   The convention is identity-mounts (``host_path == container_path``) so that
   host-absolute paths in *sloth_args* (dataset, output, adapter, suite dirs)
@@ -78,8 +78,8 @@ DEP_LAYER_PACKAGES: tuple[str, ...] = (
     "trl==0.24.0",
 )
 
-#: Dependency layer installed with ``uv pip install --system --no-deps`` — these
-#: must NOT drag their own torch/transformers in; the container's torch is used.
+#: Dependency layer installed with ``uv pip install --no-deps`` — these must NOT
+#: drag their own torch/transformers in; the container's torch is used.
 DEP_LAYER_NODEPS_PACKAGES: tuple[str, ...] = (
     "unsloth",
     "unsloth_zoo",
@@ -145,9 +145,9 @@ def _inner_script(sloth_args: list[str]) -> str:
     Bootstraps uv with the pinned astral installer (:data:`UV_INSTALL_URL`) when
     absent — guarded by a ``curl`` availability check that exits 2 with a clear
     message if curl is missing — installs the pinned dependency layer with
-    ``uv pip install --system`` (never ``pip``), then runs
-    ``python -m sloth <args>`` against the bind-mounted checkout. *sloth_args* is
-    shell-quoted with :func:`shlex.join`.
+    ``uv pip install`` into a ``--system-site-packages`` venv (never ``pip``), then
+    runs ``python -m sloth <args>`` against the bind-mounted checkout. *sloth_args*
+    is shell-quoted with :func:`shlex.join`.
     """
     install_deps = "uv pip install " + shlex.join(DEP_LAYER_PACKAGES)
     install_nodeps = "uv pip install --no-deps " + shlex.join(DEP_LAYER_NODEPS_PACKAGES)
@@ -272,6 +272,15 @@ def build_command(
     hf_cache_path = Path(hf_cache) if hf_cache is not None else DEFAULT_HF_CACHE
     mount_hf = hf_cache_path.is_dir()
 
+    # The workdir is bind-mounted as the container workspace; the filesystem root
+    # would mount the entire host fs (``-v /:/workspace``) into the run. Refuse it.
+    if str(workdir_path) == "/":
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message="refusing to run with the filesystem root as the working directory",
+            remediation="Run sloth from a project directory, not '/'.",
+        )
+
     # Track used container mount targets for deduplication (extra_mounts dedup).
     used_container_targets: set[str] = {WORKDIR_MOUNT, CHECKOUT_MOUNT}
 
@@ -312,9 +321,24 @@ def build_command(
         used_container_targets.add(HF_CACHE_MOUNT)
         cmd += ["-v", f"{hf_cache_path}:{HF_CACHE_MOUNT}"]
 
-    # Extra bind-mounts, deduped by container target.
+    # Extra bind-mounts, deduped by container target. A ``container_path`` of "/" is
+    # refused outright: it would overlay the container root with a host directory
+    # (``-v /:/`` if a caller resolved a path against the filesystem root), exposing the
+    # whole host fs inside the run.
     if extra_mounts:
         for host_path, container_path in extra_mounts:
+            if container_path == "/" or host_path == "/":
+                raise CliError(
+                    code=EXIT_USER_ERROR,
+                    message=(
+                        "refusing to bind-mount the filesystem root "
+                        f"({host_path}:{container_path})"
+                    ),
+                    remediation=(
+                        "Run sloth from a project directory, not '/', and keep the config, "
+                        "dataset, and output paths out of the filesystem root."
+                    ),
+                )
             if container_path not in used_container_targets:
                 used_container_targets.add(container_path)
                 cmd += ["-v", f"{host_path}:{container_path}"]

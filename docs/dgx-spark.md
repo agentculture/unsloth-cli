@@ -108,7 +108,7 @@ torch/torchao) and install the dep layer into it.
 
 The container is `--rm` (ephemeral). Without mounting the host HF cache, every run
 re-downloads the base model. The orchestration bind-mounts your
-`~/.cache/huggingface` to `/opt/hf-cache` and points `HF_HOME` there, so models
+`$HOME/.cache/huggingface` to `/opt/hf-cache` and points `HF_HOME` there, so models
 are downloaded once and reused.
 
 ### 4. trl/unsloth API specifics (handled in the trainer)
