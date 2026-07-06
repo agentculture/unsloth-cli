@@ -63,6 +63,7 @@ def _argv_has_json(argv: list[str] | None) -> bool:
 
 def _build_parser() -> argparse.ArgumentParser:
     from sloth.cli._commands import cli as _cli_group
+    from sloth.cli._commands import config as _config_cmd
     from sloth.cli._commands import doctor as _doctor_cmd
     from sloth.cli._commands import eval as _eval_cmd
     from sloth.cli._commands import explain as _explain_cmd
@@ -70,6 +71,7 @@ def _build_parser() -> argparse.ArgumentParser:
     from sloth.cli._commands import learn as _learn_cmd
     from sloth.cli._commands import overview as _overview_cmd
     from sloth.cli._commands import train as _train_cmd
+    from sloth.cli._commands import validate as _validate_cmd
     from sloth.cli._commands import whoami as _whoami_cmd
 
     parser = _CliArgumentParser(
