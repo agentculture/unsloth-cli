@@ -63,6 +63,7 @@ def _argv_has_json(argv: list[str] | None) -> bool:
 
 def _build_parser() -> argparse.ArgumentParser:
     from sloth.cli._commands import cli as _cli_group
+    from sloth.cli._commands import compare as _compare_cmd
     from sloth.cli._commands import config as _config_cmd
     from sloth.cli._commands import doctor as _doctor_cmd
     from sloth.cli._commands import eval as _eval_cmd
@@ -70,6 +71,8 @@ def _build_parser() -> argparse.ArgumentParser:
     from sloth.cli._commands import export as _export_cmd
     from sloth.cli._commands import learn as _learn_cmd
     from sloth.cli._commands import overview as _overview_cmd
+    from sloth.cli._commands import runs as _runs_cmd
+    from sloth.cli._commands import summarize as _summarize_cmd
     from sloth.cli._commands import train as _train_cmd
     from sloth.cli._commands import validate as _validate_cmd
     from sloth.cli._commands import whoami as _whoami_cmd
@@ -100,6 +103,12 @@ def _build_parser() -> argparse.ArgumentParser:
     _train_cmd.register(sub)
     _eval_cmd.register(sub)
     _export_cmd.register(sub)
+    # Run registry (issue #12 / colleague#291 S4b): train appends to
+    # <runs-root>/runs.jsonl; runs/summarize/compare read it back — no
+    # directory walking. Same torch-free discipline as the verbs above.
+    _runs_cmd.register(sub)
+    _summarize_cmd.register(sub)
+    _compare_cmd.register(sub)
     # Register your own noun groups here:
     #   from sloth.cli._commands import my_noun as _my_noun_group
     #   _my_noun_group.register(sub)
