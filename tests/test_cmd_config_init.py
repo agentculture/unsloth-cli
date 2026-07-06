@@ -88,6 +88,25 @@ def test_writes_run_toml_that_loads_via_load_config(tmp_path: Path) -> None:
     assert cfg.method == "qlora"  # DEFAULT_METHOD
 
 
+def test_special_chars_in_values_round_trip_through_load_config(tmp_path: Path) -> None:
+    """model/dataset/output values containing backslashes and double-quotes
+    (e.g. Windows-style paths) must produce a run.toml that load_config
+    parses without error — the raw f-string interpolation this regression
+    guards against emits invalid TOML for such values."""
+    output = tmp_path / "out"
+    model = 'unsloth/Qwen3-4B "special"'
+    dataset = r"C:\Users\ori\train.jsonl"
+    rc = cmd_config_init(
+        _make_args(model=model, dataset=dataset, output=str(output)),
+    )
+    assert rc in (None, 0)
+
+    cfg = load_config(output / "run.toml")
+    assert cfg.model == model
+    assert cfg.dataset == dataset
+    assert cfg.output == str(output)
+
+
 def test_generated_hyperparameters_match_tune_config_defaults(tmp_path: Path) -> None:
     """Every [hyperparameters] value matches the documented default constants."""
     output = tmp_path / "out"
@@ -342,11 +361,16 @@ def test_bare_config_noun_does_not_crash(capsys: pytest.CaptureFixture[str]) -> 
     """`sloth config` with no sub-verb prints usage instead of an unhandled
     AttributeError (found during review: `args.func` was never defaulted on
     the bare 'config' parser, so _dispatch's generic exception wrap surfaced
-    'unexpected: AttributeError' instead of a clean, structured error)."""
+    'unexpected: AttributeError' instead of a clean, structured error).
+
+    Help is diagnostic output, not a result, so it must land on stderr —
+    stdout stays result-only per the output contract.
+    """
     rc = main(["config"])
     assert rc == 0
-    out = capsys.readouterr().out
-    assert "config" in out.lower()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "config" in captured.err.lower()
 
 
 def test_bare_config_noun_json_flag_does_not_crash(capsys: pytest.CaptureFixture[str]) -> None:

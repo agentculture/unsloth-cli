@@ -248,7 +248,9 @@ def test_bare_runs_prints_help_and_exits_0(
     args = parser.parse_args(["runs"])
     rc = args.func(args)
     assert rc == 0
-    assert capsys.readouterr().out.strip()
+    captured = capsys.readouterr()
+    assert captured.err.strip()
+    assert not captured.out.strip()
 
 
 # ---------------------------------------------------------------------------

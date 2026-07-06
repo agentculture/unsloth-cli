@@ -9,6 +9,7 @@ walking.
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,8 @@ _VERBS = [
     "runs show <run_id> — the full registry record + whether its output dir still exists",
     "runs overview — this description",
 ]
+
+_JSON_HELP = "Emit structured JSON."
 
 
 def _resolve_runs_root(args: argparse.Namespace) -> Path:
@@ -51,23 +54,22 @@ def cmd_runs_list(args: argparse.Namespace) -> int:
 
     records_sorted = sorted(records, key=lambda r: str(r.get("started", "")), reverse=True)
     json_mode = bool(getattr(args, "json", False))
+
     if json_mode:
         emit_result(records_sorted, json_mode=True)
-        return 0
-
-    if not records_sorted:
+    elif not records_sorted:
         emit_result(f"no runs registered under {runs_root}", json_mode=False)
-        return 0
+    else:
+        header = f"{'run_id':<32} {'status':<8} {'model':<24} {'method':<6} started"
+        lines = [header, "-" * len(header)]
+        for rec in records_sorted:
+            lines.append(
+                f"{str(rec.get('run_id', '?')):<32} {str(rec.get('status', '?')):<8} "
+                f"{str(rec.get('model', '?')):<24} {str(rec.get('method', '?')):<6} "
+                f"{rec.get('started', '?')}"
+            )
+        emit_result("\n".join(lines), json_mode=False)
 
-    header = f"{'run_id':<32} {'status':<8} {'model':<24} {'method':<6} started"
-    lines = [header, "-" * len(header)]
-    for rec in records_sorted:
-        lines.append(
-            f"{str(rec.get('run_id', '?')):<32} {str(rec.get('status', '?')):<8} "
-            f"{str(rec.get('model', '?')):<24} {str(rec.get('method', '?')):<6} "
-            f"{rec.get('started', '?')}"
-        )
-    emit_result("\n".join(lines), json_mode=False)
     return 0
 
 
@@ -88,9 +90,7 @@ def cmd_runs_show(args: argparse.Namespace) -> int:
     if record is None:
         raise CliError(
             code=EXIT_USER_ERROR,
-            message=(
-                f"run_id '{args.run_id}' not found in " f"{registry_mod.registry_path(runs_root)}"
-            ),
+            message=f"run_id '{args.run_id}' not found in {registry_mod.registry_path(runs_root)}",
             remediation=f"List known run_ids with: sloth runs list --runs-root {runs_root}",
         )
 
@@ -101,10 +101,10 @@ def cmd_runs_show(args: argparse.Namespace) -> int:
     json_mode = bool(getattr(args, "json", False))
     if json_mode:
         emit_result(report, json_mode=True)
-        return 0
+    else:
+        lines = [f"{key}: {value}" for key, value in report.items()]
+        emit_result("\n".join(lines), json_mode=False)
 
-    lines = [f"{key}: {value}" for key, value in report.items()]
-    emit_result("\n".join(lines), json_mode=False)
     return 0
 
 
@@ -155,7 +155,8 @@ def register(sub: argparse._SubParsersAction) -> None:
     def _no_verb(_args: argparse.Namespace) -> int:
         # `sloth runs` with no sub-verb prints usage (mirrors `config`'s
         # no-sub-verb behaviour) rather than crashing on a missing `args.func`.
-        p.print_help()
+        # Help is a diagnostic, not a result, so it goes to stderr.
+        p.print_help(sys.stderr)
         return 0
 
     p.set_defaults(func=_no_verb, json=False)
@@ -170,7 +171,7 @@ def register(sub: argparse._SubParsersAction) -> None:
         metavar="DIR",
         help="Directory containing runs.jsonl (default: the current directory).",
     )
-    p_list.add_argument("--json", action="store_true", help="Emit structured JSON.")
+    p_list.add_argument("--json", action="store_true", help=_JSON_HELP)
     p_list.set_defaults(func=cmd_runs_list)
 
     # --- runs show -------------------------------------------------------------
@@ -183,12 +184,12 @@ def register(sub: argparse._SubParsersAction) -> None:
         metavar="DIR",
         help="Directory containing runs.jsonl (default: the current directory).",
     )
-    p_show.add_argument("--json", action="store_true", help="Emit structured JSON.")
+    p_show.add_argument("--json", action="store_true", help=_JSON_HELP)
     p_show.set_defaults(func=cmd_runs_show)
 
     # --- runs overview -----------------------------------------------------
     p_overview = sub_runs.add_parser(
         "overview", help="Describe the 'runs' noun (registry file shape)."
     )
-    p_overview.add_argument("--json", action="store_true", help="Emit structured JSON.")
+    p_overview.add_argument("--json", action="store_true", help=_JSON_HELP)
     p_overview.set_defaults(func=cmd_runs_overview)

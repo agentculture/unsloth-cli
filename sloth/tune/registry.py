@@ -192,10 +192,16 @@ def start_run(config: RunConfig, *, timestamp: str | None = None) -> RunRecord:
     run_id = make_run_id(config_hash, started)
     sha256, line_count = dataset_digest(Path(config.dataset))
 
+    # Store the ABSOLUTE output path so a later `resolve_target()`/`runs show`
+    # invoked from a different CWD (even with an explicit `--runs-root`) still
+    # resolves correctly — a verbatim, often-relative `config.output` breaks
+    # that. `config.output` itself and the config_hash input stay untouched.
+    output_abs = Path(config.output).resolve(strict=False)
+
     record = RunRecord(
         run_id=run_id,
         config_hash=config_hash,
-        output_dir=str(config.output),
+        output_dir=str(output_abs),
         model=config.model,
         method=config.method,
         dataset={"sha256": sha256, "line_count": line_count},
@@ -204,7 +210,7 @@ def start_run(config: RunConfig, *, timestamp: str | None = None) -> RunRecord:
         status=STATUS_RUNNING,
     )
 
-    path = registry_path_for(config.output)
+    path = registry_path_for(output_abs)
     line = json.dumps(record.to_dict(), sort_keys=True) + "\n"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -243,7 +249,7 @@ def finish_run(
         code=2 on any I/O failure while rewriting the registry.
     """
     finished = finished or datetime.now(timezone.utc).isoformat()
-    updated = dataclasses.replace(record, status=status, finished=finished)
+    updated: RunRecord = dataclasses.replace(record, status=status, finished=finished)
 
     path = registry_path_for(record.output_dir)
     if not path.is_file():
@@ -324,9 +330,18 @@ def read_registry(runs_root: str | Path) -> tuple[list[dict[str, Any]], list[str
     if not path.is_file():
         return [], []
 
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise CliError(
+            code=EXIT_ENV_ERROR,
+            message=f"could not read run registry at {path}: {exc}",
+            remediation="Check that the registry file is readable.",
+        ) from exc
+
     records: list[dict[str, Any]] = []
     diagnostics: list[str] = []
-    for line_no, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    for line_no, raw in enumerate(text.splitlines(), start=1):
         stripped = raw.strip()
         if not stripped:
             continue
@@ -384,7 +399,13 @@ def resolve_target(target: str, runs_root: str | Path | None = None) -> Path:
     root = Path(runs_root) if runs_root is not None else Path.cwd()
     record = find_run(root, target)
     if record is not None:
-        return Path(record["output_dir"])
+        output_dir = record["output_dir"]
+        if Path(output_dir).is_absolute():
+            return Path(output_dir)
+        # Backward-compat: a pre-existing registry line recorded a RELATIVE
+        # output_dir. The runs-root invariant (runs_root == parent of output)
+        # means the output dir's basename lives directly under runs_root.
+        return Path(root) / Path(output_dir).name
 
     raise CliError(
         code=EXIT_USER_ERROR,

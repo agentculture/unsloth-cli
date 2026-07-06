@@ -13,7 +13,7 @@ nested under a noun.
 from __future__ import annotations
 
 import argparse
-from typing import Any
+from typing import Any, Iterable
 
 from sloth.cli._output import emit_result
 from sloth.tune.registry import resolve_target
@@ -21,6 +21,19 @@ from sloth.tune.summary import build_summary
 
 #: Top-level metadata keys (outside hyperparameters/dataset) compared directly.
 _METADATA_TOP_KEYS = ("model", "method")
+
+
+def _dict_key_deltas(a: dict[str, Any], b: dict[str, Any], keys: Iterable[str]) -> dict[str, Any]:
+    """Return ``{key: {"a": val, "b": val}}`` for every *key* whose value in *a*
+    differs from its value in *b*. A key absent from either dict compares
+    against ``None``.
+    """
+    deltas: dict[str, Any] = {}
+    for key in keys:
+        va, vb = a.get(key), b.get(key)
+        if va != vb:
+            deltas[key] = {"a": va, "b": vb}
+    return deltas
 
 
 def _config_deltas(meta_a: dict[str, Any] | None, meta_b: dict[str, Any] | None) -> dict[str, Any]:
@@ -31,21 +44,13 @@ def _config_deltas(meta_a: dict[str, Any] | None, meta_b: dict[str, Any] | None)
     either side (``None``) is treated as an empty record, so a delta report is
     still produced (naming what *is* known) rather than raised as an error.
     """
-    deltas: dict[str, Any] = {}
-
     a_top = meta_a or {}
     b_top = meta_b or {}
-    for key in _METADATA_TOP_KEYS:
-        va, vb = a_top.get(key), b_top.get(key)
-        if va != vb:
-            deltas[key] = {"a": va, "b": vb}
+    deltas = _dict_key_deltas(a_top, b_top, _METADATA_TOP_KEYS)
 
     a_hp = (meta_a or {}).get("hyperparameters") or {}
     b_hp = (meta_b or {}).get("hyperparameters") or {}
-    for key in sorted(set(a_hp) | set(b_hp)):
-        va, vb = a_hp.get(key), b_hp.get(key)
-        if va != vb:
-            deltas[key] = {"a": va, "b": vb}
+    deltas.update(_dict_key_deltas(a_hp, b_hp, sorted(set(a_hp) | set(b_hp))))
 
     a_ds = (meta_a or {}).get("dataset") or {}
     b_ds = (meta_b or {}).get("dataset") or {}
@@ -74,15 +79,14 @@ def cmd_compare(args: argparse.Namespace) -> int:
     json_mode = bool(getattr(args, "json", False))
     if json_mode:
         emit_result(report, json_mode=True)
-        return 0
-
-    lines = [f"a: {summary_a['output_dir']}", f"b: {summary_b['output_dir']}", "", "deltas:"]
-    if deltas:
-        for key, vals in deltas.items():
-            lines.append(f"  {key}: a={vals['a']!r} b={vals['b']!r}")
     else:
-        lines.append("  (none — configs match)")
-    emit_result("\n".join(lines), json_mode=False)
+        lines = [f"a: {summary_a['output_dir']}", f"b: {summary_b['output_dir']}", "", "deltas:"]
+        if deltas:
+            for key, vals in deltas.items():
+                lines.append(f"  {key}: a={vals['a']!r} b={vals['b']!r}")
+        else:
+            lines.append("  (none — configs match)")
+        emit_result("\n".join(lines), json_mode=False)
     return 0
 
 

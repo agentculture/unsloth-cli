@@ -16,12 +16,13 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 
 import pytest
 
-from sloth.cli._errors import CliError
+from sloth.cli._errors import EXIT_ENV_ERROR, CliError
 from sloth.tune.config import RunConfig
 from sloth.tune.registry import (
     RUNS_FILENAME,
@@ -138,7 +139,11 @@ class TestStartRun:
         assert record.finished is None
         assert record.model == cfg.model
         assert record.method == cfg.method
-        assert record.output_dir == str(cfg.output)
+        # output_dir is stored ABSOLUTE (resolved), even though cfg.output
+        # here already happens to be absolute (pytest's tmp_path) — the
+        # resolve() call must not alter an already-absolute, symlink-free path.
+        assert record.output_dir == str(Path(cfg.output).resolve(strict=False))
+        assert Path(record.output_dir).is_absolute()
         assert record.dataset["line_count"] == 1
 
         path = registry_path_for(cfg.output)
@@ -147,6 +152,18 @@ class TestStartRun:
         on_disk = json.loads(lines[0])
         assert on_disk["run_id"] == record.run_id
         assert on_disk["status"] == "running"
+
+    def test_relative_output_is_stored_absolute(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A relative ``config.output`` must be resolved to an absolute path
+        before being recorded, so a later lookup from a different CWD works."""
+        monkeypatch.chdir(tmp_path)
+        cfg = _make_config(tmp_path, output=str(Path("adapters") / "out"))
+        record = start_run(cfg)
+
+        assert record.output_dir == str((tmp_path / "adapters" / "out").resolve(strict=False))
+        assert Path(record.output_dir).is_absolute()
 
     def test_creates_runs_root_if_missing(self, tmp_path: Path) -> None:
         cfg = _make_config(tmp_path, output=str(tmp_path / "brand-new" / "out"))
@@ -319,6 +336,22 @@ class TestReadRegistry:
         assert len(records) == 1
         assert len(diagnostics) == 2
 
+    def test_unreadable_file_raises_cli_error_env(self, tmp_path: Path) -> None:
+        if os.geteuid() == 0:
+            pytest.skip("running as root bypasses file permissions")
+        root = tmp_path / "adapters"
+        root.mkdir()
+        path = registry_path(root)
+        path.write_text(json.dumps({"run_id": "x"}) + "\n", encoding="utf-8")
+        path.chmod(0o000)
+        try:
+            with pytest.raises(CliError) as exc_info:
+                read_registry(root)
+            assert exc_info.value.code == EXIT_ENV_ERROR
+            assert exc_info.value.remediation
+        finally:
+            path.chmod(0o644)
+
 
 # ---------------------------------------------------------------------------
 # find_run
@@ -374,3 +407,33 @@ class TestResolveTarget:
         record = start_run(cfg)
         resolved = resolve_target(record.run_id)  # no runs_root passed -> cwd
         assert resolved == Path(cfg.output)
+
+    def test_legacy_relative_output_dir_resolves_under_runs_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Backward-compat: a pre-existing registry may carry a RELATIVE
+        ``output_dir`` (written before this fix). Querying it with an
+        absolute ``--runs-root`` from an unrelated CWD must still resolve to
+        ``runs_root/<basename>`` (the runs-root invariant: runs_root is the
+        parent of output)."""
+        runs_root = tmp_path / "adapters"
+        runs_root.mkdir()
+        legacy_record = {
+            "run_id": "legacy0000000-20260706T000000Z",
+            "config_hash": "legacy0000000",
+            "output_dir": "out",  # relative — pre-fix shape
+            "model": "unsloth/Qwen3-4B",
+            "method": "qlora",
+            "dataset": {"sha256": "deadbeef", "line_count": 1},
+            "started": "2026-07-06T00:00:00+00:00",
+            "finished": None,
+            "status": "running",
+        }
+        registry_path(runs_root).write_text(json.dumps(legacy_record) + "\n", encoding="utf-8")
+
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+
+        resolved = resolve_target(legacy_record["run_id"], runs_root.resolve())
+        assert resolved == runs_root.resolve() / "out"

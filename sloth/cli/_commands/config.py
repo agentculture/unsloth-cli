@@ -22,6 +22,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -39,7 +40,43 @@ from sloth.tune.config import (
     DEFAULT_MAX_STEPS,
     DEFAULT_METHOD,
     DEFAULT_SEED,
+    load_config,
 )
+
+# ---------------------------------------------------------------------------
+# TOML string escaping
+# ---------------------------------------------------------------------------
+
+_TOML_BASIC_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
+def _toml_str(value: str) -> str:
+    """Render *value* as a quoted TOML basic string (escapes ``\\`` and ``"``).
+
+    Backslash and double-quote are escaped first, the control characters TOML's
+    basic-string grammar names get their short escape, and any other control
+    character falls back to a ``\\uXXXX`` escape. The return value includes the
+    surrounding double quotes.
+    """
+    out = []
+    for ch in value:
+        escape = _TOML_BASIC_ESCAPES.get(ch)
+        if escape is not None:
+            out.append(escape)
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\u{ord(ch):04x}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
 
 # ---------------------------------------------------------------------------
 # Command handler
@@ -74,10 +111,10 @@ def cmd_config_init(args: argparse.Namespace) -> int | None:
     # --- build TOML ----------------------------------------------------------
     toml_lines = [
         "[run]",
-        f'model   = "{model}"',
-        f'method  = "{method}"',
-        f'dataset = "{dataset}"',
-        f'output  = "{output}"',
+        f"model   = {_toml_str(model)}",
+        f"method  = {_toml_str(method)}",
+        f"dataset = {_toml_str(dataset)}",
+        f"output  = {_toml_str(output)}",
         "",
         "[hyperparameters]",
         f"lora_r         = {DEFAULT_LORA_R}",
@@ -97,6 +134,16 @@ def cmd_config_init(args: argparse.Namespace) -> int | None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(toml_text, encoding="utf-8")
     emit_diagnostic(f"wrote {path}")
+
+    # --- self-validate: the generated file must always pass load_config -----
+    try:
+        load_config(path)
+    except CliError as exc:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"generated config at {path} failed load_config validation: {exc.message}",
+            remediation="This is a bug in `sloth config init` — please report it.",
+        ) from exc
 
     # --- emit report --------------------------------------------------------
     report: dict[str, Any] = {
@@ -139,7 +186,8 @@ def register(sub: argparse._SubParsersAction) -> None:
     def _no_verb(_args: argparse.Namespace) -> int:
         # `sloth config` with no sub-verb prints usage instead of crashing on a
         # missing `args.func` (mirrors `main()`'s no-command-given behaviour).
-        p.print_help()
+        # Help is diagnostic output, not a result, so it goes to stderr.
+        p.print_help(sys.stderr)
         return 0
 
     p.set_defaults(func=_no_verb, json=False)
@@ -187,7 +235,7 @@ def register(sub: argparse._SubParsersAction) -> None:
         "--path",
         default=None,
         metavar="PATH",
-        help=("Override the output path for run.toml " "(default: <output>/run.toml)."),
+        help="Override the output path for run.toml (default: <output>/run.toml).",
     )
     p_init.add_argument("--json", action="store_true", help="Emit structured JSON.")
     p_init.set_defaults(func=cmd_config_init)

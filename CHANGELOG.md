@@ -28,6 +28,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `train` now registers each run into the run registry as it completes
 
+### Fixed
+
+- **Registry (review fix):** `start_run` now stores `output_dir` as an absolute
+  path, and `resolve_target` resolves a legacy relative record under its
+  `--runs-root` instead of the caller's CWD — so `summarize`/`compare`/`runs
+  show` no longer point at the wrong/missing directory when invoked from another
+  working directory (qodo #2)
+- **Registry (review fix):** `read_registry` now catches `OSError` from
+  `read_text()` and raises `CliError(code=2)` with a readable-file remediation,
+  so an unreadable registry is a clean environment error, not an uncaught
+  exception misclassified as a user error (qodo #3)
+- **Config (review fix):** `config init` now TOML-escapes the interpolated
+  `model`/`method`/`dataset`/`output` values and self-validates the written file
+  via `load_config`, so values containing quotes or backslashes (e.g. Windows
+  paths) can no longer generate invalid TOML that breaks the "always passes
+  validation" guarantee (qodo #4)
+- **Output contract (review fix):** `sloth config` / `sloth runs` with no
+  sub-verb now write their help to stderr, keeping stdout reserved for
+  machine-readable results (qodo #1)
+- Internal cleanups from the SonarCloud pass: reduced `_config_deltas` cognitive
+  complexity, single-exit-point CLI handlers, a `RunRecord` return annotation on
+  `finish_run`, a `_JSON_HELP` constant, and merged implicitly-concatenated
+  strings — no behavior change
+
 ## [0.5.0] - 2026-06-27
 
 ### Added

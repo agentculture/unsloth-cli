@@ -32,27 +32,26 @@ def cmd_summarize(args: argparse.Namespace) -> int:
     json_mode = bool(getattr(args, "json", False))
     if json_mode:
         emit_result(summary, json_mode=True)
-        return 0
-
-    lines = [f"output_dir: {summary['output_dir']}"]
-    metadata = summary.get("metadata")
-    if metadata:
-        lines.append(f"model:      {metadata.get('model')}")
-        lines.append(f"method:     {metadata.get('method')}")
-        lines.append(f"dataset:    {metadata.get('dataset')}")
-        lines.append("hyperparameters:")
-        for key, value in (metadata.get("hyperparameters") or {}).items():
-            lines.append(f"  {key}: {value}")
-    training = summary.get("training")
-    if training:
-        lines.append(f"checkpoint:  {training.get('checkpoint')}")
-        lines.append(f"final_step:  {training.get('final_step')}")
-        lines.append(f"final_loss:  {training.get('final_loss')}")
-        if training.get("best_metric") is not None:
-            lines.append(f"best_metric: {training.get('best_metric')}")
-    for note in summary.get("notes") or []:
-        lines.append(f"note: {note}")
-    emit_result("\n".join(lines), json_mode=False)
+    else:
+        lines = [f"output_dir: {summary['output_dir']}"]
+        metadata = summary.get("metadata")
+        if metadata:
+            lines.append(f"model:      {metadata.get('model')}")
+            lines.append(f"method:     {metadata.get('method')}")
+            lines.append(f"dataset:    {metadata.get('dataset')}")
+            lines.append("hyperparameters:")
+            for key, value in (metadata.get("hyperparameters") or {}).items():
+                lines.append(f"  {key}: {value}")
+        training = summary.get("training")
+        if training:
+            lines.append(f"checkpoint:  {training.get('checkpoint')}")
+            lines.append(f"final_step:  {training.get('final_step')}")
+            lines.append(f"final_loss:  {training.get('final_loss')}")
+            if training.get("best_metric") is not None:
+                lines.append(f"best_metric: {training.get('best_metric')}")
+        for note in summary.get("notes") or []:
+            lines.append(f"note: {note}")
+        emit_result("\n".join(lines), json_mode=False)
     return 0
 
 
