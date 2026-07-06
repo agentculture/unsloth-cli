@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-07-06
+
+### Added
+
+- `unsloth-cli validate` — standalone dataset validation, split out of `train` so
+  a dataset can be checked before committing to a run
+- `unsloth-cli config init` — writes a starting `run.toml` with validated defaults
+- A run registry (`sloth/tune/registry.py`): an atomic-append/atomic-rewrite
+  `runs.jsonl` beside a runs root, so past runs are enumerable without directory
+  walking
+- `unsloth-cli runs list` / `unsloth-cli runs show <run_id>` — enumerate/inspect
+  past runs from the registry
+- `unsloth-cli summarize <run_id|dir>` — one JSON summary of a past run
+  (`training_metadata.json` + `trainer_state.json`)
+- `unsloth-cli compare <a> <b>` — side-by-side config deltas + summaries for two
+  past runs
+- New `explain` catalog entries for `validate`, `config init`, `runs`,
+  `summarize`, and `compare`
+
+### Changed
+
+- `train` now registers each run into the run registry as it completes
+
 ## [0.5.0] - 2026-06-27
 
 ### Added
