@@ -722,6 +722,86 @@ def test_real_run_json_surfaces_metadata_path(
 
 
 # ---------------------------------------------------------------------------
+# Run registry hook (issue #12 / colleague#291 S4b) — see sloth/tune/registry.py
+# ---------------------------------------------------------------------------
+
+
+def test_dry_run_appends_no_registry_line(good_config: Path, tmp_path: Path) -> None:
+    """--dry-run never reaches the in-container branch, so runs.jsonl is never
+    created — a dry-run plan is resolved read-only (the documented rule)."""
+    rc = cmd_train(_make_args(good_config, dry_run=True))
+    assert rc in (None, 0)
+    # good_config's output is under tmp_path/adapters/out -> runs-root tmp_path/adapters.
+    assert not (tmp_path / "adapters" / "runs.jsonl").exists()
+
+
+def test_in_container_real_run_appends_running_then_ok(
+    good_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A successful --in-container run transitions running -> ok in the registry."""
+    from sloth.tune.registry import read_registry
+
+    def _fake_run_training(config: RunConfig, *, dry_run: bool = False) -> dict[str, Any]:
+        return {
+            "model": config.model,
+            "method": config.method,
+            "dataset": config.dataset,
+            "output": config.output,
+            "hyperparameters": {},
+            "scope": {"ok": True, "out_of_scope": False, "warning": None},
+            "dry_run": False,
+            "status": "trained",
+            "adapter_dir": config.output,
+            "metadata_path": f"{config.output}/training_metadata.json",
+        }
+
+    monkeypatch.setattr(train_mod, "run_training", _fake_run_training)
+    rc = cmd_train(_make_args(good_config, dry_run=False, in_container=True))
+    assert rc in (None, 0)
+
+    runs_root = Path(good_config).parent / "adapters"
+    records, diagnostics = read_registry(runs_root)
+    assert diagnostics == []
+    assert len(records) == 1
+    assert records[0]["status"] == "ok"
+    assert records[0]["finished"] is not None
+
+
+def test_in_container_failed_run_records_failed_and_reraises(
+    good_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run_training failure is recorded as status=failed AND the original
+    error still propagates out of cmd_train (the registry write never
+    swallows the failure)."""
+    from sloth.tune.registry import read_registry
+
+    def _boom(config: RunConfig, *, dry_run: bool = False) -> dict[str, Any]:
+        raise CliError(code=2, message="GPU out of memory", remediation="free some VRAM")
+
+    monkeypatch.setattr(train_mod, "run_training", _boom)
+    with pytest.raises(CliError) as exc_info:
+        cmd_train(_make_args(good_config, dry_run=False, in_container=True))
+    assert exc_info.value.code == 2
+
+    runs_root = Path(good_config).parent / "adapters"
+    records, _ = read_registry(runs_root)
+    assert len(records) == 1
+    assert records[0]["status"] == "failed"
+
+
+def test_host_real_run_does_not_append_registry_line_itself(
+    good_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host branch (4c) only launches docker — the *container's* recursive
+    --in-container invocation is what appends, so calling cmd_train on the
+    host with container.launch mocked must not create runs.jsonl itself."""
+    monkeypatch.setattr(container_mod, "launch", Mock(return_value=0))
+    rc = cmd_train(_make_args(good_config, dry_run=False))
+    assert rc in (None, 0)
+    assert not (Path(good_config).parent / "adapters" / "runs.jsonl").exists()
+
+
+# ---------------------------------------------------------------------------
 # register() wires the subparser correctly
 # ---------------------------------------------------------------------------
 

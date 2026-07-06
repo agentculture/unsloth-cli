@@ -26,9 +26,17 @@ buildable/deployable package baseline. Clone it, rename the package, edit
 - `unsloth-cli overview` — descriptive snapshot of the agent.
 - `unsloth-cli doctor` — check the agent-identity invariants.
 - `unsloth-cli cli overview` — describe the CLI surface.
+- `unsloth-cli validate` — validate a JSONL dataset file standalone.
+- `unsloth-cli config init` — write a starting `run.toml` with validated defaults.
 - `unsloth-cli train` — validate a dataset and run/plan a LoRA/QLoRA adapter job.
 - `unsloth-cli eval` — score an adapter against a local task-schema eval suite.
 - `unsloth-cli export` — export an adapter to a PEFT/safetensors layout.
+- `unsloth-cli runs list` / `runs show <run_id>` — enumerate/inspect past runs
+  from the run registry (`<runs-root>/runs.jsonl`) — no directory walking.
+- `unsloth-cli summarize <run_id|dir>` — one JSON summary of a past run
+  (training_metadata.json + trainer_state.json).
+- `unsloth-cli compare <a> <b>` — side-by-side config deltas + summaries for
+  two past runs.
 
 ## Exit-code policy
 
@@ -116,6 +124,77 @@ itself (distinct from the global `overview`, which describes the agent).
 
     unsloth-cli cli overview
     unsloth-cli cli overview --json
+"""
+
+_VALIDATE = """\
+# unsloth-cli validate
+
+Validate a JSONL dataset file standalone — without loading a `run.toml` or
+running `sloth train`. Calls the *same*
+`sloth.tune.datasets.validate_dataset` function that `sloth train` uses
+internally, so the accepted rules never drift between the two verbs.
+
+The dataset schema is inferred from the first record when `--schema` is
+omitted: `chat` (`{"messages": [{role, content}, ...]}`) or `task`
+(`{"task", "input", "expected_output"}`); the auto-detected schema is echoed
+to stderr as a diagnostic. This module is pure stdlib — no torch/unsloth
+import, so it stays usable on a machine with no GPU stack installed.
+
+## Usage
+
+    unsloth-cli validate --dataset data/train.jsonl
+    unsloth-cli validate --dataset data/train.jsonl --schema task
+    unsloth-cli validate --dataset data/train.jsonl --json
+
+## Key flags
+
+- `--dataset PATH` (required) — path to the JSONL dataset file.
+- `--schema {chat,task}` — schema to validate against (default: auto-detect
+  from the first record).
+- `--json` — emit `{valid, schema, line_count}` as structured JSON to stdout.
+
+## Exit codes
+
+- `0` success — dataset is valid.
+- `1` user-input error — missing file, invalid JSON, or a record that fails
+  schema validation (the validator's own `CliError` propagates verbatim).
+- `2` environment error — the dataset file exists but cannot be opened
+  (e.g. a permission error).
+"""
+
+_CONFIG_INIT = """\
+# unsloth-cli config init
+
+Write a starting `run.toml` for `sloth train`, with the `[hyperparameters]`
+section populated from the same documented defaults `sloth.tune.config`
+uses (`DEFAULT_LORA_R`, `DEFAULT_LEARNING_RATE`, etc.) — the generated file
+always round-trips through `sloth.tune.config.load_config` validation.
+Refuses to overwrite an existing file unless `--force` is passed.
+
+## Usage
+
+    unsloth-cli config init --model unsloth/Qwen3-4B \\
+        --dataset data/train.jsonl --output adapters/out
+    unsloth-cli config init --model unsloth/Qwen3-4B \\
+        --dataset data/train.jsonl --output adapters/out --method lora
+    unsloth-cli config init --model unsloth/Qwen3-4B \\
+        --dataset data/train.jsonl --output adapters/out --force --json
+
+## Key flags
+
+- `--model ID` (required) — model identifier (e.g. `unsloth/Qwen3-4B`).
+- `--dataset PATH` (required) — path to the JSONL dataset file.
+- `--output DIR` (required) — output directory for the adapter.
+- `--method {lora,qlora}` — adapter method (default: `qlora`).
+- `--force` — overwrite an existing `run.toml`.
+- `--path PATH` — override the written config path (default: `<output>/run.toml`).
+- `--json` — emit the write result as structured JSON.
+
+## Exit codes
+
+- `0` success — config written.
+- `1` user-input error — the target file already exists and `--force` was
+  not passed.
 """
 
 _TRAIN = """\
@@ -219,6 +298,102 @@ adapter is normalised in place. Only the `safetensors` format is supported today
 """
 
 
+_RUNS = """\
+# unsloth-cli runs
+
+Noun group over the **run registry**: `sloth train` appends one line per real
+(non-dry-run) attempt to `<runs-root>/runs.jsonl`, where **runs-root is the
+parent directory of the run's `output` dir**. `runs list`/`runs show` read it
+back so an agent can enumerate and inspect past runs without walking
+directories.
+
+Registry line shape: `{run_id, config_hash, output_dir, model, method,
+dataset{sha256,line_count}, started, finished, status}`. `status` only ever
+transitions `"running" -> "ok" | "failed"` — there is no pid tracking in v1,
+so a killed `train` leaves `status: "running"` forever, reported honestly
+as-is (never silently reclassified as "stale"/"incomplete").
+
+## Usage
+
+    unsloth-cli runs list
+    unsloth-cli runs list --runs-root adapters/ --json
+    unsloth-cli runs show <run_id>
+    unsloth-cli runs show <run_id> --json
+    unsloth-cli runs overview
+
+## Key flags
+
+- `--runs-root DIR` — directory containing `runs.jsonl` (default: the current
+  directory).
+- `--json` — emit structured JSON.
+
+## Exit codes
+
+- `0` success — including an honest empty list when no registry exists yet.
+- `1` user-input error — `runs show` with an unknown `run_id`.
+"""
+
+_SUMMARIZE = """\
+# unsloth-cli summarize
+
+Join a past run's `training_metadata.json` with the final/best loss and step
+count from its newest `checkpoint-N/trainer_state.json` into one JSON summary.
+`<target>` is either a `run_id` (looked up in the registry — see
+`unsloth-cli runs`) or a literal output directory; an existing directory takes
+precedence when a string happens to be both.
+
+Both halves are optional: a run with no checkpoint yet, or a missing
+`training_metadata.json`, still summarizes — the gap is recorded in a `notes`
+list rather than raised as an error.
+
+## Usage
+
+    unsloth-cli summarize <run_id>
+    unsloth-cli summarize adapters/qwen3-4b-qlora
+    unsloth-cli summarize <run_id> --runs-root adapters/ --json
+
+## Key flags
+
+- `--runs-root DIR` — directory containing `runs.jsonl`, used to resolve a
+  `run_id` (default: the current directory). Ignored when `<target>` is
+  already an existing directory.
+- `--json` — emit the summary as structured JSON.
+
+## Exit codes
+
+- `0` success
+- `1` user-input error — `<target>` resolves to neither a `run_id` nor an
+  existing directory.
+"""
+
+_COMPARE = """\
+# unsloth-cli compare
+
+Side-by-side comparison of two past runs: the `training_metadata.json`
+hyperparameter/config keys that differ between `<a>` and `<b>`, plus each
+run's full `unsloth-cli summarize` summary. Each of `<a>`/`<b>` resolves the
+same way `summarize`'s `<target>` does (a `run_id` or a literal output
+directory).
+
+## Usage
+
+    unsloth-cli compare <run_id_a> <run_id_b>
+    unsloth-cli compare adapters/exp-1 adapters/exp-2 --json
+
+## Key flags
+
+- `--runs-root DIR` — directory containing `runs.jsonl`, used to resolve a
+  `run_id` on either side (default: the current directory).
+- `--json` — emit `{a, b, deltas}` as structured JSON.
+
+## Exit codes
+
+- `0` success
+- `1` user-input error — either `<a>` or `<b>` resolves to neither a `run_id`
+  nor an existing directory.
+"""
+
+
 ENTRIES: dict[tuple[str, ...], str] = {
     (): _ROOT,
     ("unsloth-cli",): _ROOT,
@@ -233,7 +408,16 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("doctor",): _DOCTOR,
     ("cli",): _CLI,
     ("cli", "overview"): _CLI,
+    ("validate",): _VALIDATE,
+    ("config",): _CONFIG_INIT,
+    ("config", "init"): _CONFIG_INIT,
     ("train",): _TRAIN,
     ("eval",): _EVAL,
     ("export",): _EXPORT,
+    ("runs",): _RUNS,
+    ("runs", "list"): _RUNS,
+    ("runs", "show"): _RUNS,
+    ("runs", "overview"): _RUNS,
+    ("summarize",): _SUMMARIZE,
+    ("compare",): _COMPARE,
 }

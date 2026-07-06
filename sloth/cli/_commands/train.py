@@ -20,13 +20,28 @@ Flow::
      print the docker command that would run the real job.
    * ``--in-container`` (hidden, recursion guard): running *inside* the NGC
      container — delegates directly to :func:`~sloth.tune._trainer.run_training`
-     without launching another container.
+     without launching another container. This is the run's **real-run path**,
+     so it is the ONE place that writes to the run registry (see "Run
+     registry" below); ``--dry-run`` never reaches this branch and therefore
+     never appends a registry line.
    * default (host real run): call :func:`~sloth.tune.container.launch` to
      orchestrate the NGC container, forwarding the same args plus
      ``--in-container``.
 
 This module imports no torch/unsloth — the heavy stack lives only inside the
 trainer's ``_load_backend`` seam, lazily. Importing ``train`` stays torch-free.
+
+Run registry (issue #12 / colleague#291 S4b)
+---------------------------------------------
+Every REAL (non-dry-run) training attempt — whether it reaches
+:func:`run_training` directly (tests, or the ``--in-container`` recursion
+guard) or via the NGC container recursing back into this same branch — gets
+one line appended to ``<runs-root>/runs.jsonl`` (:mod:`sloth.tune.registry`;
+runs-root = the PARENT dir of ``config.output``): ``status: "running"`` is
+appended BEFORE :func:`run_training` runs, then atomically rewritten to
+``"ok"``/``"failed"`` after it returns/raises. ``--dry-run`` (branch 4a) never
+reaches this code path, so a dry-run plan never touches the registry — the
+plan is resolved read-only.
 
 Dataset-schema choice
 ---------------------
@@ -48,6 +63,7 @@ from typing import Any
 import sloth.tune.container as container_mod
 from sloth.cli._errors import EXIT_USER_ERROR, CliError
 from sloth.cli._output import emit_diagnostic, emit_result
+from sloth.tune import registry as registry_mod
 from sloth.tune._trainer import run_training
 from sloth.tune.config import RunConfig, load_config
 from sloth.tune.datasets import detect_schema, validate_dataset
@@ -258,8 +274,17 @@ def cmd_train(args: argparse.Namespace) -> int | None:
         return
 
     # 4b) In-container: recursion guard — run the real trainer, no docker launch.
+    # This is the real-run path (see the "Run registry" module-docstring
+    # section): a registry line is appended "running" before run_training and
+    # atomically rewritten "ok"/"failed" after — dry-run (4a) never reaches here.
     if in_container:
-        plan = run_training(config, dry_run=False)
+        run_record = registry_mod.start_run(config)
+        try:
+            plan = run_training(config, dry_run=False)
+        except Exception:
+            registry_mod.finish_run(run_record, status=registry_mod.STATUS_FAILED)
+            raise
+        registry_mod.finish_run(run_record, status=registry_mod.STATUS_OK)
         if json_mode:
             emit_result(plan, json_mode=True)
         else:

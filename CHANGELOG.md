@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-07-06
+
+### Added
+
+- `unsloth-cli validate` — standalone dataset validation, split out of `train` so
+  a dataset can be checked before committing to a run
+- `unsloth-cli config init` — writes a starting `run.toml` with validated defaults
+- A run registry (`sloth/tune/registry.py`): an atomic-append/atomic-rewrite
+  `runs.jsonl` beside a runs root, so past runs are enumerable without directory
+  walking
+- `unsloth-cli runs list` / `unsloth-cli runs show <run_id>` — enumerate/inspect
+  past runs from the registry
+- `unsloth-cli summarize <run_id|dir>` — one JSON summary of a past run
+  (`training_metadata.json` + `trainer_state.json`)
+- `unsloth-cli compare <a> <b>` — side-by-side config deltas + summaries for two
+  past runs
+- New `explain` catalog entries for `validate`, `config init`, `runs`,
+  `summarize`, and `compare`
+
+### Changed
+
+- `train` now registers each run into the run registry as it completes
+
+### Fixed
+
+- **Registry (review fix):** `start_run` now stores `output_dir` as an absolute
+  path, and `resolve_target` resolves a legacy relative record under its
+  `--runs-root` instead of the caller's CWD — so `summarize`/`compare`/`runs
+  show` no longer point at the wrong/missing directory when invoked from another
+  working directory (qodo #2)
+- **Registry (review fix):** `read_registry` now catches `OSError` from
+  `read_text()` and raises `CliError(code=2)` with a readable-file remediation,
+  so an unreadable registry is a clean environment error, not an uncaught
+  exception misclassified as a user error (qodo #3)
+- **Config (review fix):** `config init` now TOML-escapes the interpolated
+  `model`/`method`/`dataset`/`output` values and self-validates the written file
+  via `load_config`, so values containing quotes or backslashes (e.g. Windows
+  paths) can no longer generate invalid TOML that breaks the "always passes
+  validation" guarantee (qodo #4)
+- **Output contract (review fix):** `sloth config` / `sloth runs` with no
+  sub-verb now write their help to stderr, keeping stdout reserved for
+  machine-readable results (qodo #1)
+- Internal cleanups from the SonarCloud pass: reduced `_config_deltas` cognitive
+  complexity, single-exit-point CLI handlers, a `RunRecord` return annotation on
+  `finish_run`, a `_JSON_HELP` constant, and merged implicitly-concatenated
+  strings — no behavior change
+
 ## [0.5.0] - 2026-06-27
 
 ### Added
