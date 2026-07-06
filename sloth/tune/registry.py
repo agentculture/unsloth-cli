@@ -71,7 +71,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from sloth.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 from sloth.tune.config import RunConfig
@@ -249,7 +249,10 @@ def finish_run(
         code=2 on any I/O failure while rewriting the registry.
     """
     finished = finished or datetime.now(timezone.utc).isoformat()
-    updated: RunRecord = dataclasses.replace(record, status=status, finished=finished)
+    # cast(): dataclasses.replace() is typed as returning a bare DataclassInstance,
+    # which trips SonarPython's return-type checks (S5886/S5890); the cast asserts
+    # the concrete RunRecord type without reconstructing every field by hand.
+    updated = cast(RunRecord, dataclasses.replace(record, status=status, finished=finished))
 
     path = registry_path_for(record.output_dir)
     if not path.is_file():
