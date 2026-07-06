@@ -95,6 +95,8 @@ def _build_parser() -> argparse.ArgumentParser:
     _cli_group.register(sub)
     # Fine-tuning verbs (issue #6): validate → train an adapter, eval it, export it.
     # Their modules keep torch/unsloth lazy, so registering them here stays torch-free.
+    _validate_cmd.register(sub)
+    _config_cmd.register(sub)
     _train_cmd.register(sub)
     _eval_cmd.register(sub)
     _export_cmd.register(sub)

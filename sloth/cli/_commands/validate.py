@@ -12,17 +12,17 @@ Usage::
 Exit codes:
     0 — dataset is valid (report emitted to stdout)
     1 — invalid dataset, missing file, or bad schema (error to stderr)
+    2 — environment error (dataset file exists but cannot be opened)
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 from typing import Any
 
-from sloth.cli._errors import CliError
+from sloth.cli._errors import EXIT_USER_ERROR, CliError
 from sloth.cli._output import emit_diagnostic, emit_result
 from sloth.tune.datasets import detect_schema, validate_dataset
 
@@ -52,7 +52,7 @@ def cmd_validate(args: argparse.Namespace) -> int | None:
     # --- check file exists --------------------------------------------------
     if not dataset_path.is_file():
         raise CliError(
-            code=1,
+            code=EXIT_USER_ERROR,
             message=f"dataset file not found: {dataset_path}",
             remediation="Pass an existing JSONL file with --dataset <path>.",
         )
@@ -74,8 +74,7 @@ def cmd_validate(args: argparse.Namespace) -> int | None:
 
         schema = detect_schema(record) if record else DEFAULT_SCHEMA
         emit_diagnostic(f"auto-detected schema: {schema!r}")
-    else:
-        schema = schema  # already validated by argparse choices
+    # else: schema was passed explicitly and already validated by argparse choices.
 
     # --- validate (shared code path with train) -----------------------------
     records = validate_dataset(dataset_path, schema)

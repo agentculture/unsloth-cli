@@ -26,6 +26,8 @@ buildable/deployable package baseline. Clone it, rename the package, edit
 - `unsloth-cli overview` — descriptive snapshot of the agent.
 - `unsloth-cli doctor` — check the agent-identity invariants.
 - `unsloth-cli cli overview` — describe the CLI surface.
+- `unsloth-cli validate` — validate a JSONL dataset file standalone.
+- `unsloth-cli config init` — write a starting `run.toml` with validated defaults.
 - `unsloth-cli train` — validate a dataset and run/plan a LoRA/QLoRA adapter job.
 - `unsloth-cli eval` — score an adapter against a local task-schema eval suite.
 - `unsloth-cli export` — export an adapter to a PEFT/safetensors layout.
@@ -116,6 +118,77 @@ itself (distinct from the global `overview`, which describes the agent).
 
     unsloth-cli cli overview
     unsloth-cli cli overview --json
+"""
+
+_VALIDATE = """\
+# unsloth-cli validate
+
+Validate a JSONL dataset file standalone — without loading a `run.toml` or
+running `sloth train`. Calls the *same*
+`sloth.tune.datasets.validate_dataset` function that `sloth train` uses
+internally, so the accepted rules never drift between the two verbs.
+
+The dataset schema is inferred from the first record when `--schema` is
+omitted: `chat` (`{"messages": [{role, content}, ...]}`) or `task`
+(`{"task", "input", "expected_output"}`); the auto-detected schema is echoed
+to stderr as a diagnostic. This module is pure stdlib — no torch/unsloth
+import, so it stays usable on a machine with no GPU stack installed.
+
+## Usage
+
+    unsloth-cli validate --dataset data/train.jsonl
+    unsloth-cli validate --dataset data/train.jsonl --schema task
+    unsloth-cli validate --dataset data/train.jsonl --json
+
+## Key flags
+
+- `--dataset PATH` (required) — path to the JSONL dataset file.
+- `--schema {chat,task}` — schema to validate against (default: auto-detect
+  from the first record).
+- `--json` — emit `{valid, schema, line_count}` as structured JSON to stdout.
+
+## Exit codes
+
+- `0` success — dataset is valid.
+- `1` user-input error — missing file, invalid JSON, or a record that fails
+  schema validation (the validator's own `CliError` propagates verbatim).
+- `2` environment error — the dataset file exists but cannot be opened
+  (e.g. a permission error).
+"""
+
+_CONFIG_INIT = """\
+# unsloth-cli config init
+
+Write a starting `run.toml` for `sloth train`, with the `[hyperparameters]`
+section populated from the same documented defaults `sloth.tune.config`
+uses (`DEFAULT_LORA_R`, `DEFAULT_LEARNING_RATE`, etc.) — the generated file
+always round-trips through `sloth.tune.config.load_config` validation.
+Refuses to overwrite an existing file unless `--force` is passed.
+
+## Usage
+
+    unsloth-cli config init --model unsloth/Qwen3-4B \\
+        --dataset data/train.jsonl --output adapters/out
+    unsloth-cli config init --model unsloth/Qwen3-4B \\
+        --dataset data/train.jsonl --output adapters/out --method lora
+    unsloth-cli config init --model unsloth/Qwen3-4B \\
+        --dataset data/train.jsonl --output adapters/out --force --json
+
+## Key flags
+
+- `--model ID` (required) — model identifier (e.g. `unsloth/Qwen3-4B`).
+- `--dataset PATH` (required) — path to the JSONL dataset file.
+- `--output DIR` (required) — output directory for the adapter.
+- `--method {lora,qlora}` — adapter method (default: `qlora`).
+- `--force` — overwrite an existing `run.toml`.
+- `--path PATH` — override the written config path (default: `<output>/run.toml`).
+- `--json` — emit the write result as structured JSON.
+
+## Exit codes
+
+- `0` success — config written.
+- `1` user-input error — the target file already exists and `--force` was
+  not passed.
 """
 
 _TRAIN = """\
@@ -233,6 +306,9 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("doctor",): _DOCTOR,
     ("cli",): _CLI,
     ("cli", "overview"): _CLI,
+    ("validate",): _VALIDATE,
+    ("config",): _CONFIG_INIT,
+    ("config", "init"): _CONFIG_INIT,
     ("train",): _TRAIN,
     ("eval",): _EVAL,
     ("export",): _EXPORT,

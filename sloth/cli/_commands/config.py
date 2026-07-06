@@ -7,9 +7,12 @@ passes :func:`~sloth.tune.config.load_config` validation.
 
 Usage::
 
-    sloth config init --model unsloth/Qwen3-4B --dataset data/train.jsonl --output adapters/out
-    sloth config init --model unsloth/Qwen3-4B --dataset data/train.jsonl --output adapters/out --method lora
-    sloth config init --model unsloth/Qwen3-4B --dataset data/train.jsonl --output adapters/out --json
+    sloth config init --model unsloth/Qwen3-4B --dataset data/train.jsonl \\
+        --output adapters/out
+    sloth config init --model unsloth/Qwen3-4B --dataset data/train.jsonl \\
+        --output adapters/out --method lora
+    sloth config init --model unsloth/Qwen3-4B --dataset data/train.jsonl \\
+        --output adapters/out --json
 
 Exit codes:
     0 — config written (report emitted to stdout)
@@ -22,7 +25,7 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-from sloth.cli._errors import CliError
+from sloth.cli._errors import EXIT_USER_ERROR, CliError
 from sloth.cli._output import emit_diagnostic, emit_result
 from sloth.tune.config import (
     DEFAULT_BATCH_SIZE,
@@ -63,7 +66,7 @@ def cmd_config_init(args: argparse.Namespace) -> int | None:
     # --- refuse to overwrite without --force --------------------------------
     if path.is_file() and not force:
         raise CliError(
-            code=1,
+            code=EXIT_USER_ERROR,
             message=f"config file already exists: {path}",
             remediation="Use --force to overwrite, or pass a different --output / --path.",
         )
@@ -132,6 +135,14 @@ def register(sub: argparse._SubParsersAction) -> None:
         help="Configuration management subcommands.",
         description="Configuration management subcommands (e.g. init).",
     )
+
+    def _no_verb(_args: argparse.Namespace) -> int:
+        # `sloth config` with no sub-verb prints usage instead of crashing on a
+        # missing `args.func` (mirrors `main()`'s no-command-given behaviour).
+        p.print_help()
+        return 0
+
+    p.set_defaults(func=_no_verb, json=False)
     sub_config = p.add_subparsers(dest="config_command")
 
     # --- config init --------------------------------------------------------
