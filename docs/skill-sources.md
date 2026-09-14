@@ -6,10 +6,16 @@ AgentCulture **skills supplier** after the steward → guildmaster cutover
 (`steward doctor`, the sibling-pattern baseline); only the skills-supplier role
 moved. This file tracks provenance so re-syncs stay deterministic.
 
-Three skills (`think`, `spec-to-plan`, `assign-to-workforce`) originate in
-[`agentculture/devague`](https://github.com/agentculture/devague); guildmaster
-only **re-broadcasts** them. Cite guildmaster's copy; track devague as the true
-origin.
+The eight devague **operator skills** (`scope`, `think`, `challenge`,
+`spec-to-plan`, `assign-to-workforce`, `deviate`, `validate-delivery`,
+`summarize-delivery`) originate in
+[`agentculture/devague`](https://github.com/agentculture/devague) and are
+vendored **directly from devague's `main`** (the source URLs `devague learn
+skills:all` prints), not via guildmaster's re-broadcast. Three are CLI-driving
+(a `scripts/<name>.sh` resolver); the other five are method-only (`SKILL.md`
+only — they call the `devague` CLI directly). Together they cover the full
+eight-leg loop, including the obligations → evidence → deltas behavioral
+validation ledger (`devague oblige` / `evidence` / `delta` / `today`).
 
 Every vendored `SKILL.md` carries `type: command`. unsloth-cli
 declares a culture agent (`culture.yaml`, `backend: claude`), and
@@ -26,9 +32,14 @@ is load-bearing, even where guildmaster's upstream copy omits it.
 | `pypi-maintainer` | `../guildmaster/.claude/skills/pypi-maintainer/` | guildmaster | Switch a package install between PyPI / TestPyPI / local editable (`scripts/switch-source.sh`). Verbatim except added `type: command`. | 2026-05-26 (guildmaster 0.6.0) |
 | `run-tests` | `../guildmaster/.claude/skills/run-tests/` | guildmaster | pytest + xdist + coverage (`scripts/test.sh`). Verbatim except added `type: command`. | 2026-05-26 (guildmaster 0.6.0) |
 | `sonarclaude` | `../guildmaster/.claude/skills/sonarclaude/` | guildmaster | SonarCloud API queries (`scripts/sonar.sh`). Verbatim except added `type: command`. | 2026-05-26 (guildmaster 0.6.0) |
-| `think` | `../guildmaster/.claude/skills/think/` | **devague** (re-broadcast via guildmaster) | idea→spec leg of the devague workflow chain. Verbatim (already carried `type: command` at guildmaster). Origin/broadcast prose left verbatim. | 2026-05-26 (guildmaster 0.6.0) |
-| `spec-to-plan` | `../guildmaster/.claude/skills/spec-to-plan/` | **devague** (re-broadcast via guildmaster) | spec→plan leg of the devague workflow chain. Verbatim (already carried `type: command`). | 2026-05-26 (guildmaster 0.6.0) |
-| `assign-to-workforce` | `../guildmaster/.claude/skills/assign-to-workforce/` | **devague** (re-broadcast via guildmaster) | plan→parallel-implementation leg of the devague workflow chain. Verbatim (already carried `type: command`). | 2026-05-26 (guildmaster 0.6.0) |
+| `scope` | `agentculture/devague` `main` `.claude/skills/scope/` | **devague** | Optional opening leg: idea → explored scope (`devague scope`). Method-only. Verbatim. | 2026-09-14 (devague 0.24.1, `ec15362`) |
+| `think` | `agentculture/devague` `main` `.claude/skills/think/` | **devague** | idea→spec leg (flat `devague` verbs). CLI-driving (`scripts/think.sh`). Verbatim. | 2026-09-14 (devague 0.24.1, `ec15362`) |
+| `challenge` | `agentculture/devague` `main` `.claude/skills/challenge/` | **devague** | Risk-scaled blind-spot pass on an exported spec, before `plan new`. Method-only. Verbatim. | 2026-09-14 (devague 0.24.1, `ec15362`) |
+| `spec-to-plan` | `agentculture/devague` `main` `.claude/skills/spec-to-plan/` | **devague** | spec→plan leg (`devague plan`). CLI-driving (`scripts/spec-to-plan.sh`). Verbatim. | 2026-09-14 (devague 0.24.1, `ec15362`) |
+| `assign-to-workforce` | `agentculture/devague` `main` `.claude/skills/assign-to-workforce/` | **devague** | plan→parallel-implementation leg. CLI-driving (`scripts/assign-to-workforce.sh`). Verbatim except the `agex pr open` → `devex pr open` rename (see below). | 2026-09-14 (devague 0.24.1, `ec15362`) |
+| `deviate` | `agentculture/devague` `main` `.claude/skills/deviate/` | **devague** | Execution-time, human-approved departures from the plan (`devague deviate`). Method-only. Verbatim. | 2026-09-14 (devague 0.24.1, `ec15362`) |
+| `validate-delivery` | `agentculture/devague` `main` `.claude/skills/validate-delivery/` | **devague** | Runs the plan's behavioral tests; files obligations / evidence / deltas (`devague oblige` / `evidence` / `delta`). Method-only. Verbatim. | 2026-09-14 (devague 0.24.1, `ec15362`) |
+| `summarize-delivery` | `agentculture/devague` `main` `.claude/skills/summarize-delivery/` | **devague** | Closure leg: committed planned-vs-actual accountability artifact (`devague summary`). Method-only. Verbatim. | 2026-09-14 (devague 0.24.1, `ec15362`) |
 
 ## Re-sync procedure
 
@@ -49,6 +60,17 @@ cp -R ../guildmaster/.claude/skills/<skill> .claude/skills/
 #     (load-bearing for the culture/claude backend's core.skill_loader).
 # No script bodies are edited (cite-don't-import). The communicate signature
 # resolves from culture.yaml via agtag — no literal to patch.
+
+# devague operator skills — pull from devague's main (what `devague learn
+# skills:all` points at), not from guildmaster:
+git -C ../devague fetch origin
+for s in scope think challenge spec-to-plan assign-to-workforce deviate \
+         validate-delivery summarize-delivery; do
+  rm -rf .claude/skills/$s
+  git -C ../devague archive origin/main .claude/skills/$s | tar -x -C .
+done
+# Then re-apply the `agex pr open` → `devex pr open` rename in
+# assign-to-workforce (SKILL.md + scripts/assign-to-workforce.sh).
 ```
 
 If a re-sync would lose a unsloth-cli adaptation, lift the change

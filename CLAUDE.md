@@ -270,9 +270,11 @@ not.
 
 ## Vendored skills (cite-don't-import)
 
-`.claude/skills/` holds 11 skills vendored **verbatim** from `guildmaster` (the
-skills supplier; `think`/`spec-to-plan`/`assign-to-workforce` originate in
-`devague` and are re-broadcast). Provenance and the re-sync procedure live in
+`.claude/skills/` holds the skills vendored **verbatim** from `guildmaster` (the
+skills supplier) plus the **8 devague operator skills** (`scope`, `think`,
+`challenge`, `spec-to-plan`, `assign-to-workforce`, `deviate`,
+`validate-delivery`, `summarize-delivery`) vendored directly from devague's
+`main` (refresh with `devague learn skills:all`). Provenance and the re-sync procedure live in
 `docs/skill-sources.md`. Rules: edit script bodies **upstream**, not here; every
 `SKILL.md` must carry `type: command` (load-bearing — the culture/claude backend
 silently skips a `SKILL.md` without it); skills are excluded from Sonar analysis
@@ -320,7 +322,7 @@ them. Most siblings are checked out next to this repo under `../`.
 | **agentfront** (was `teken`, was `afi-cli`) | The agent-first runtime + the rubric that `… cli doctor` enforces | The cited CLI source + the dev-only rubric gate. **Renamed:** the tool is now `agentfront`, but this repo still pins `teken>=0.8` (the deprecated alias) and CI runs `teken cli doctor`. Either name works today; expect the pin to migrate to `agentfront`. |
 | **steward** | Agent *alignment* — the sibling-pattern baseline + `steward doctor` | `doctor` here reproduces steward's invariants; `docs/steward/steward-suggestions.md` is its generated report (current finding: add the `ask-colleague` skill). |
 | **guildmaster** | The skills *supplier/manager* | Source of the 11 vendored `.claude/skills/` (provenance in `docs/skill-sources.md`). |
-| **devague** | The think → spec-to-plan → assign-to-workforce planning chain | True origin of those three skills (re-broadcast via guildmaster). |
+| **devague** | The eight-leg scope → think → challenge → spec-to-plan → assign-to-workforce → deviate → validate-delivery → summarize-delivery chain (incl. obligations/evidence/deltas) | Origin of the 8 operator skills, vendored directly from devague `main`. |
 | **devex** | The PR-lifecycle CLI (`devex pr`) | What the `cicd` skill delegates to; needs `devex>=0.21` on PATH. |
 | **agtag** | Issue I/O (`agtag issue`) | What the `communicate` skill wraps; needs `agtag>=0.1` on PATH. |
 | **lobes** (`lobes-cli`) | Runs / assesses / switches the local OpenAI-compatible vLLM model the mesh consumes | Will serve the models the planned fine-tune verbs produce. |
