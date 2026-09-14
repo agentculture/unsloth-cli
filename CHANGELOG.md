@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] - 2026-09-14
+
+### Changed
+
+- Refreshed the devague operator skills from devague main (0.24.1): re-vendored think, spec-to-plan, assign-to-workforce and added scope, challenge, deviate, validate-delivery, summarize-delivery, covering the full eight-leg loop including obligations / evidence / deltas
+- docs/skill-sources.md, CLAUDE.md and README.md now record devague main as the direct source for the eight operator skills, with a re-sync recipe
+
 ## [0.6.0] - 2026-07-06
 
 ### Added
