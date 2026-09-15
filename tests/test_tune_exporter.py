@@ -298,7 +298,7 @@ def test_unknown_format_is_a_user_error(tmp_path):
 
 @pytest.mark.parametrize(
     ("fmt", "save_method"),
-    [("merged-16bit", "merged_16bit"), ("merged-4bit", "merged_4bit")],
+    [("merged-16bit", "merged_16bit"), ("merged-4bit", "merged_4bit_forced")],
 )
 def test_merged_export_calls_save_pretrained_merged(tmp_path, install_backend, fmt, save_method):
     _, events = install_backend()
@@ -563,6 +563,7 @@ def test_export_json_records_every_contract_field(tmp_path, install_backend, mon
     record = json.loads(Path(result["export_json"]).read_text(encoding="utf-8"))
     assert set(record) == {
         "format",
+        "output",
         "quant",
         "base",
         "adapter",

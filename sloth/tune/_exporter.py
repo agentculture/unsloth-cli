@@ -57,7 +57,9 @@ from sloth.tune.datasets import validate_dataset
 # Formats understood by this seam.
 MERGED_FORMATS: dict[str, str] = {
     "merged-16bit": "merged_16bit",
-    "merged-4bit": "merged_4bit",
+    # Unsloth refuses plain "merged_4bit" with an advisory RuntimeError (accuracy
+    # warning for later re-saves); the forced variant is the documented opt-in.
+    "merged-4bit": "merged_4bit_forced",
 }
 COMPRESSED_FORMATS: frozenset[str] = frozenset({"awq", "nvfp4"})
 SUPPORTED_FORMATS: tuple[str, ...] = (
@@ -377,7 +379,27 @@ def _export_gguf(backend: _Backend, plan: dict[str, Any], output: Path) -> None:
     quant = _requested_gguf_quant(plan)
     model, tokenizer = _load_adapter(backend, plan)
     model.save_pretrained_gguf(str(output), tokenizer, quantization_method=quant)
-    _collect_gguf(output, quant, keep_intermediate=bool(plan.get("keep_intermediate")))
+    keep = bool(plan.get("keep_intermediate"))
+    _collect_gguf(output, quant, keep_intermediate=keep)
+    _drop_merged_weights(output, keep_intermediate=keep)
+
+
+def _drop_merged_weights(output: Path, *, keep_intermediate: bool) -> None:
+    """Delete the merged ``*.safetensors`` Unsloth also writes next to a GGUF export.
+
+    ``save_pretrained_gguf`` first materialises the merged bf16 model **inside** the
+    requested directory (live-measured: a 2.34 GB ``model.safetensors`` for
+    LFM2.5-1.2B) before converting. For a GGUF export those weights are an
+    intermediate, so they are removed unless ``keep_intermediate`` is set; the small
+    tokenizer/config files stay.
+    """
+    if keep_intermediate:
+        return
+    for path in output.glob("*.safetensors"):
+        path.unlink()
+    index = output / "model.safetensors.index.json"
+    if index.exists():
+        index.unlink()
 
 
 # ---------------------------------------------------------------------------
@@ -521,8 +543,10 @@ def _write_export_json(
     timestamp: str | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Write ``<output>/export.json`` and mirror the record into the adapter's index."""
+    final_output = plan.get("final_output") or str(output)
     record = {
         "format": plan["format"],
+        "output": final_output,
         "quant": list(plan.get("quant") or []),
         "base": plan.get("base"),
         "adapter": plan.get("adapter"),
@@ -618,11 +642,12 @@ def run_export(plan: dict[str, Any]) -> dict[str, Any]:
         raise
 
     export_json, record = _write_export_json(plan, output, calibration)
+    final_output = plan.get("final_output") or str(output)
     return {
         "format": fmt,
-        "output": str(output),
+        "output": final_output,
         "files": record["files"],
-        "export_json": str(export_json),
+        "export_json": str(Path(final_output) / export_json.name),
         "calibration": record["calibration"],
         "versions": record["versions"],
     }

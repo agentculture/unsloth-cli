@@ -990,7 +990,8 @@ def test_missing_export_launch_kwargs_is_tolerated(
 
     monkeypatch.delattr(container_mod, "export_launch_kwargs", raising=False)
 
-    args = _make_args(adapter=str(adapter), format="nvfp4", output=str(tmp_path / "o"))
+    # gguf: a non-calibrated format, so no --calib / training dataset is required.
+    args = _make_args(adapter=str(adapter), format="gguf", output=str(tmp_path / "o"))
     assert cmd_export(args) == 0
     assert "env" not in fake.calls[0][1]
 

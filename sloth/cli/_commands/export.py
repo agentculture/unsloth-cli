@@ -189,21 +189,44 @@ def _adapter_base_model(adapter: Path) -> str | None:
     return base if isinstance(base, str) and base.strip() else None
 
 
-def _training_dataset(adapter: Path) -> str | None:
-    """Return the training dataset path recorded in ``training_metadata.json``, if any.
+def _final_output(output: Path) -> str:
+    """Strip the ``.partial`` staging suffix the host adds around a container run."""
+    text = str(output)
+    if text.endswith(PARTIAL_SUFFIX):
+        return text[: -len(PARTIAL_SUFFIX)]
+    return text
 
-    The metadata's ``dataset`` field may be a plain path string or a mapping that
-    carries a ``path``; anything else (e.g. a digest-only record) means the
-    dataset is unknown and calibration falls back to ``--calib``.
+
+def _training_dataset(adapter: Path) -> str | None:
+    """Return the training dataset as an **absolute host path**, or ``None``.
+
+    ``training_metadata.json`` records the dataset path exactly as the run config
+    gave it (deviation d1) — usually relative to the directory ``sloth train`` ran
+    in. The container's workdir is the adapter's parent, so a relative path must be
+    resolved here on the host: current directory first, then the adapter's parent,
+    then the adapter dir itself. Unresolvable or absent means the dataset is
+    unknown and calibration falls back to ``--calib``.
     """
     meta = _read_json(adapter / "training_metadata.json") or {}
     dataset = meta.get("dataset")
+    raw: str | None = None
     if isinstance(dataset, str) and dataset.strip():
-        return dataset
-    if isinstance(dataset, dict):
+        raw = dataset
+    elif isinstance(dataset, dict):
         path = dataset.get("path")
         if isinstance(path, str) and path.strip():
-            return path
+            raw = path
+    if raw is None:
+        return None
+    candidate = Path(raw).expanduser()
+    if candidate.is_absolute():
+        # Passed through as recorded; the in-container calibration validation
+        # reports a missing file with a hint before any model load.
+        return str(candidate)
+    for root in (Path.cwd(), adapter.parent, adapter):
+        resolved = (root / candidate).resolve()
+        if resolved.is_file():
+            return str(resolved)
     return None
 
 
@@ -542,7 +565,11 @@ def _merge_mounts(
 
 
 def _container_kwargs(
-    container: Any, adapter: Path, output: Path, calib: Path | None
+    container: Any,
+    adapter: Path,
+    output: Path,
+    calib: Path | None,
+    dataset: Path | None = None,
 ) -> dict[str, Any]:
     """Return the keyword arguments shared by ``build_command`` and ``launch``.
 
@@ -556,6 +583,8 @@ def _container_kwargs(
     parents = {adapter.parent, output.parent}
     if calib is not None:
         parents.add(calib.parent)
+    if dataset is not None:
+        parents.add(dataset.parent)
     own_mounts = [(str(p), str(p)) for p in sorted(parents)]
 
     supplied = getattr(container, "export_launch_kwargs", lambda: {})() or {}
@@ -630,6 +659,8 @@ def cmd_export(args: argparse.Namespace) -> int:
     output_abs = output.resolve()
     estimated = _estimate_bytes(base, fmt, adapter_abs)
     free = _free_bytes(output_abs)
+    dataset_str = _training_dataset(adapter_abs) if fmt in CALIBRATED_FORMATS else None
+    dataset_path = Path(dataset_str) if dataset_str else None
 
     # --- dry-run: resolve the plan, launch nothing, write nothing -----------
     if dry_run:
@@ -638,7 +669,7 @@ def cmd_export(args: argparse.Namespace) -> int:
             import sloth.tune.container as container  # lazy: keeps the stdlib lane clean
 
             partial = Path(str(output_abs) + PARTIAL_SUFFIX)
-            kwargs = _container_kwargs(container, adapter_abs, output_abs, calib)
+            kwargs = _container_kwargs(container, adapter_abs, output_abs, calib, dataset_path)
             sloth_args = _sloth_args(
                 fmt=fmt,
                 adapter=adapter_abs,
@@ -698,9 +729,12 @@ def cmd_export(args: argparse.Namespace) -> int:
                 "calib_samples": calib_samples,
                 "keep_intermediate": keep_intermediate,
                 "dataset": _training_dataset(adapter_abs),
+                # The host renames <output>.partial -> <output> on success; record
+                # the final path so export.json and the result never name .partial.
+                "final_output": _final_output(output_abs),
             }
         )
-        result = {"output": str(output_abs), "format": fmt, **summary}
+        result = {"output": _final_output(output_abs), "format": fmt, **summary}
         if json_mode:
             emit_result(result, json_mode=True)
         else:
@@ -712,6 +746,18 @@ def cmd_export(args: argparse.Namespace) -> int:
 
     # --- host lane: no-clobber → disk gate → atomic container run -----------
     _check_clobber(output_abs, force)
+    # Fail closed on the host: a calibrated format with no resolvable calibration
+    # source must not cost a container launch (dry-run is exempt so plans render).
+    if fmt in CALIBRATED_FORMATS and calib is None and dataset_path is None:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=(
+                f"--format {fmt} needs calibration data and the adapter's training dataset "
+                "could not be resolved from training_metadata.json"
+            ),
+            remediation="Pass --calib <jsonl> (chat or task schema), or export from the "
+            "directory the adapter was trained in so its relative dataset path resolves.",
+        )
     _check_disk(estimated, free, output_abs, fmt)
 
     import sloth.tune.container as container  # lazy: module level stays container-free
@@ -724,7 +770,7 @@ def cmd_export(args: argparse.Namespace) -> int:
         shutil.rmtree(partial)
     partial.mkdir(parents=True)
 
-    kwargs = _container_kwargs(container, adapter_abs, output_abs, calib)
+    kwargs = _container_kwargs(container, adapter_abs, output_abs, calib, dataset_path)
     sloth_args = _sloth_args(
         fmt=fmt,
         adapter=adapter_abs,
