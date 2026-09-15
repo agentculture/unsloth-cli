@@ -180,13 +180,15 @@ def _attach_compressor(backend: _Backend) -> None:
     from llmcompressor.modifiers.quantization import QuantizationModifier  # noqa: PLC0415
 
     try:
-        # llm-compressor 0.11 moved AWQ under modifiers.transform.awq.
-        from llmcompressor.modifiers.awq import AWQModifier  # noqa: PLC0415
-        from llmcompressor.modifiers.transform.awq.mappings import (  # noqa: PLC0415
-            AWQMapping,
-        )
+        # llm-compressor 0.11 moved AWQ under modifiers.transform.awq. The old
+        # ``modifiers.awq.AWQModifier`` path still exists there but is a shim
+        # *function* returning ``[AWQModifier, QuantizationModifier]`` — with only
+        # mapping kwargs that second modifier is bare and oneshot fails with
+        # "QuantizationModifier requires that quantization fields be specified"
+        # (live-measured). Always prefer the class from the new path.
+        from llmcompressor.modifiers.transform.awq import AWQMapping, AWQModifier  # noqa: PLC0415
     except ImportError:  # pragma: no cover - depends on the installed version
-        # 0.10 keeps both in modifiers.awq.
+        # 0.10 keeps both in modifiers.awq (there AWQModifier is the real class).
         from llmcompressor.modifiers.awq import AWQMapping, AWQModifier  # noqa: PLC0415
 
     # llmcompressor.oneshot reads ``dataset.column_names``: a plain list of dicts
@@ -486,6 +488,26 @@ def _build_recipe(backend: _Backend, fmt: str, model: Any) -> list[Any]:
     ]
 
 
+def _disable_dynamo(torch_mod: Any) -> bool:
+    """Run the calibration forward passes eagerly (returns True when applied).
+
+    The export process imports Unsloth first (for the merge), and Unsloth patches
+    transformers' forwards with ``torch.compile``. llm-compressor's calibration then
+    trips Dynamo on those patched functions ("Unsupported: Missing bytecode handler
+    ... MATCH_CLASS", live-measured on NVFP4). Disabling Dynamo makes compiled
+    functions fall back to eager execution; quantisation needs no compilation.
+    """
+    dynamo = getattr(torch_mod, "_dynamo", None)
+    config = getattr(dynamo, "config", None)
+    if config is None:
+        return False
+    try:
+        config.disable = True
+    except Exception:  # noqa: BLE001 - never let a diagnostic knob break an export
+        return False
+    return True
+
+
 def _export_compressed(
     backend: _Backend,
     plan: dict[str, Any],
@@ -508,6 +530,7 @@ def _export_compressed(
     )
 
     _apply_memory_info_shim(backend.torch, backend.compressed_tensors)
+    _disable_dynamo(backend.torch)
 
     rows = _format_records(calibration.records, calibration.schema, tokenizer)
     backend.oneshot(
