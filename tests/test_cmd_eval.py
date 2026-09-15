@@ -718,9 +718,9 @@ def test_host_routes_model_to_container(
     targets = {target for _, target in mounts}
     assert str(tmp_model.resolve().parent) in targets
     assert str(tmp_suite.resolve().parent) in targets
-    # The llama.cpp cache mount (export_launch_kwargs) must be present for GGUF scoring.
-    llama_target = container_mod.EXPORT_HOME + "/.unsloth/llama.cpp"
-    assert llama_target in targets
+    # The export home mount (export_launch_kwargs) must be present: it carries the
+    # llama.cpp cache at <EXPORT_HOME>/.unsloth/llama.cpp needed for GGUF scoring.
+    assert container_mod.EXPORT_HOME in targets
     env = dict(captured.get("env") or [])
     assert env.get("HOME") == container_mod.EXPORT_HOME
 

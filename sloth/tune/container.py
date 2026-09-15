@@ -43,10 +43,10 @@ Design notes
   The convention is identity-mounts (``host_path == container_path``) so that
   host-absolute paths in *sloth_args* (dataset, output, adapter, suite dirs)
   resolve unchanged inside the container without any path rewriting.
-* Export runs need an explicit ``HOME`` (:data:`EXPORT_HOME`) plus a host-owned
-  llama.cpp cache bind-mounted at ``<HOME>/.unsloth/llama.cpp``, because unsloth
-  resolves llama.cpp from ``Path.home()``. :func:`export_launch_kwargs` returns
-  exactly that ``env``/``extra_mounts`` pair.
+* Export runs need an explicit ``HOME`` (:data:`EXPORT_HOME`) that is its own
+  host-owned bind mount (outside the workdir), because unsloth resolves llama.cpp
+  from ``Path.home()``. :func:`export_launch_kwargs` returns exactly that
+  ``env``/``extra_mounts`` pair.
 * Subprocess calls are isolated in tiny helpers (:func:`_docker_available`,
   :func:`_image_available`, :func:`_gpu_runtime_ok`, :func:`_stream`,
   :func:`_run_quiet`) so tests can monkeypatch them without invoking docker.
@@ -149,13 +149,22 @@ DOCKER_ENV: tuple[tuple[str, str], ...] = (
 
 #: Explicit ``HOME`` for container runs that need a stable, writable home — notably
 #: GGUF export, because unsloth resolves its llama.cpp checkout from
-#: ``Path.home()/".unsloth"/"llama.cpp"`` (``unsloth_zoo/llama_cpp.py``). The NGC
-#: image's ``HOME`` under ``--user uid:gid`` is not reliably writable, so it is set
-#: explicitly and lives *under the workdir mount* — which also means
-#: :data:`VENV_DIR` (``$HOME/.unsloth-cli-venv``) lands under the bind-mounted
-#: workdir and therefore **persists across ``--rm`` runs**. That is intended: the
-#: dep layer is installed once per working directory instead of once per run.
-EXPORT_HOME: str = "/workspace/.home"
+#: ``Path.home()/".unsloth"/"llama.cpp"`` (``unsloth_zoo/llama_cpp.py``). It is its
+#: **own bind mount** (see :func:`export_launch_kwargs`), deliberately *outside* the
+#: ``/workspace`` workdir mount: docker creates missing mount-point parents as root,
+#: so a HOME nested under the bind-mounted workdir ended up root-owned and the
+#: container user could not create ``$HOME/.cache/uv`` (measured 2026-09-15). A
+#: dedicated host-owned home also means :data:`VENV_DIR` (``$HOME/.unsloth-cli-venv``)
+#: and the llama.cpp cache **persist across ``--rm`` runs** — the dep layer is
+#: installed once per host, not once per run.
+EXPORT_HOME: str = "/opt/sloth-home"
+
+#: Environment variable overriding the host-side directory mounted at
+#: :data:`EXPORT_HOME`.
+EXPORT_HOME_ENV: str = "SLOTH_EXPORT_HOME"
+
+#: Default host-owned directory mounted at :data:`EXPORT_HOME`.
+DEFAULT_EXPORT_HOME: Path = Path.home() / ".cache" / "unsloth-cli" / "home"
 
 #: Pinned llama.cpp release tag used for unsloth's *prebuilt* llama.cpp install
 #: (``UNSLOTH_LLAMA_TAG``). Validated live 2026-09-15. Unsloth skips the prebuilt
@@ -163,12 +172,15 @@ EXPORT_HOME: str = "/workspace/.home"
 #: run, 28 s cached). Bumping this tag is a deliberate, re-validated change.
 UNSLOTH_LLAMA_TAG: str = "b10909"
 
-#: Environment variable overriding the host-side llama.cpp cache directory.
+#: Environment variable overriding the host-side llama.cpp cache directory. When set,
+#: that directory is bind-mounted at ``<EXPORT_HOME>/.unsloth/llama.cpp`` on top of the
+#: home mount; when unset the cache simply lives inside the home dir at
+#: :data:`DEFAULT_LLAMA_CPP_CACHE`.
 LLAMA_CPP_CACHE_ENV: str = "SLOTH_LLAMA_CPP_CACHE"
 
-#: Default host-owned llama.cpp cache, bind-mounted at
-#: ``<EXPORT_HOME>/.unsloth/llama.cpp`` so the prebuilt install survives ``--rm``.
-DEFAULT_LLAMA_CPP_CACHE: Path = Path.home() / ".cache" / "unsloth-cli" / "llama.cpp"
+#: Default llama.cpp cache location (inside the default export home), so the prebuilt
+#: install survives ``--rm``.
+DEFAULT_LLAMA_CPP_CACHE: Path = DEFAULT_EXPORT_HOME / ".unsloth" / "llama.cpp"
 
 #: Where the Linux kernel reports memory statistics (patched in tests).
 MEMINFO_PATH: Path = Path("/proc/meminfo")
@@ -496,39 +508,52 @@ def _gpu_runtime_ok(image: str = NGC_IMAGE) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _llama_cpp_cache_dir() -> Path:
-    """Return the host llama.cpp cache dir (:data:`LLAMA_CPP_CACHE_ENV` overrides)."""
-    override = os.environ.get(LLAMA_CPP_CACHE_ENV)
+def _export_home_dir() -> Path:
+    """Return the host dir mounted at :data:`EXPORT_HOME` (:data:`EXPORT_HOME_ENV` overrides)."""
+    override = os.environ.get(EXPORT_HOME_ENV)
     if override:
         return Path(override).expanduser()
-    return DEFAULT_LLAMA_CPP_CACHE
+    return DEFAULT_EXPORT_HOME
+
+
+def _llama_cpp_cache_override() -> Path | None:
+    """Return the :data:`LLAMA_CPP_CACHE_ENV` override as a path, or ``None``."""
+    override = os.environ.get(LLAMA_CPP_CACHE_ENV)
+    return Path(override).expanduser() if override else None
 
 
 def export_launch_kwargs() -> dict:
-    """Return the :func:`launch` kwargs an export run needs (env + llama.cpp mount).
+    """Return the :func:`launch` kwargs an export run needs (env + home mount).
 
     Export (GGUF) asks unsloth to fetch/build llama.cpp, and unsloth resolves that
-    checkout from ``Path.home()/".unsloth"/"llama.cpp"``. So two things must line up:
-    ``HOME`` is set explicitly to :data:`EXPORT_HOME`, and a **host-owned** cache dir
-    is bind-mounted at exactly ``<EXPORT_HOME>/.unsloth/llama.cpp``. With the cache
-    populated, unsloth skips the prebuilt install on subsequent runs (measured 48 s
-    first, 28 s cached). :data:`UNSLOTH_LLAMA_TAG` pins which prebuilt release is
-    fetched.
+    checkout from ``Path.home()/".unsloth"/"llama.cpp"``. So ``HOME`` is set explicitly
+    to :data:`EXPORT_HOME` and a **host-owned** directory is bind-mounted there. The
+    host side pre-creates ``<home>/.unsloth/llama.cpp`` so docker never has to create
+    a mount-point parent as root (the failure mode that made ``$HOME`` unwritable
+    when HOME lived under the workdir mount). With the cache populated, unsloth skips
+    the prebuilt install on subsequent runs (measured 48 s first, 28 s cached).
+    :data:`UNSLOTH_LLAMA_TAG` pins which prebuilt release is fetched.
 
-    The host cache dir is created if absent (``os.makedirs(..., exist_ok=True)``).
+    When :data:`LLAMA_CPP_CACHE_ENV` is set, that directory is additionally mounted
+    at ``<EXPORT_HOME>/.unsloth/llama.cpp`` (nested inside the home mount).
 
     Returns
     -------
     dict
         ``{"env": [("HOME", EXPORT_HOME), ("UNSLOTH_LLAMA_TAG", UNSLOTH_LLAMA_TAG)],
-        "extra_mounts": [(host_cache_dir, EXPORT_HOME + "/.unsloth/llama.cpp")]}`` —
-        splat straight into :func:`launch` or :func:`build_command`.
+        "extra_mounts": [(host_home, EXPORT_HOME), ...]}`` — splat straight into
+        :func:`launch` or :func:`build_command`.
     """
-    cache_dir = _llama_cpp_cache_dir()
-    os.makedirs(cache_dir, exist_ok=True)
+    home = _export_home_dir()
+    os.makedirs(home / ".unsloth" / "llama.cpp", exist_ok=True)
+    mounts: list[tuple[str, str]] = [(str(home), EXPORT_HOME)]
+    cache = _llama_cpp_cache_override()
+    if cache is not None:
+        os.makedirs(cache, exist_ok=True)
+        mounts.append((str(cache), EXPORT_HOME + "/.unsloth/llama.cpp"))
     return {
         "env": [("HOME", EXPORT_HOME), ("UNSLOTH_LLAMA_TAG", UNSLOTH_LLAMA_TAG)],
-        "extra_mounts": [(str(cache_dir), EXPORT_HOME + "/.unsloth/llama.cpp")],
+        "extra_mounts": mounts,
     }
 
 

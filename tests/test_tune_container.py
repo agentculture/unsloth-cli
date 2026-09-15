@@ -648,15 +648,22 @@ class TestExportLaunchKwargs:
     """
 
     def test_constants(self) -> None:
-        assert container.EXPORT_HOME == "/workspace/.home"
+        # HOME is its own mount, outside /workspace: docker creates missing mount-point
+        # parents as root, which made a HOME nested under the workdir unwritable.
+        assert container.EXPORT_HOME == "/opt/sloth-home"
+        assert not container.EXPORT_HOME.startswith(container.WORKDIR_MOUNT)
+        assert container.EXPORT_HOME_ENV == "SLOTH_EXPORT_HOME"
+        assert container.DEFAULT_EXPORT_HOME == Path.home() / ".cache" / "unsloth-cli" / "home"
         assert container.UNSLOTH_LLAMA_TAG == "b10909"
         assert container.LLAMA_CPP_CACHE_ENV == "SLOTH_LLAMA_CPP_CACHE"
         assert container.DEFAULT_LLAMA_CPP_CACHE == (
-            Path.home() / ".cache" / "unsloth-cli" / "llama.cpp"
+            container.DEFAULT_EXPORT_HOME / ".unsloth" / "llama.cpp"
         )
 
     def test_kwargs_shape_and_mount_target(self, tmp_path: Path, monkeypatch) -> None:
+        home = tmp_path / "home"
         cache = tmp_path / "llama-cache"
+        monkeypatch.setenv(container.EXPORT_HOME_ENV, str(home))
         monkeypatch.setenv(container.LLAMA_CPP_CACHE_ENV, str(cache))
         kwargs = container.export_launch_kwargs()
         assert kwargs["env"] == [
@@ -664,11 +671,23 @@ class TestExportLaunchKwargs:
             ("UNSLOTH_LLAMA_TAG", container.UNSLOTH_LLAMA_TAG),
         ]
         assert kwargs["extra_mounts"] == [
-            (str(cache), container.EXPORT_HOME + "/.unsloth/llama.cpp")
+            (str(home), container.EXPORT_HOME),
+            (str(cache), container.EXPORT_HOME + "/.unsloth/llama.cpp"),
         ]
+        # The nested mount-point is pre-created host-side so docker never makes it as root.
+        assert (home / ".unsloth" / "llama.cpp").is_dir()
+
+    def test_home_only_mount_without_cache_override(self, tmp_path: Path, monkeypatch) -> None:
+        home = tmp_path / "home"
+        monkeypatch.setenv(container.EXPORT_HOME_ENV, str(home))
+        monkeypatch.delenv(container.LLAMA_CPP_CACHE_ENV, raising=False)
+        kwargs = container.export_launch_kwargs()
+        assert kwargs["extra_mounts"] == [(str(home), container.EXPORT_HOME)]
+        assert (home / ".unsloth" / "llama.cpp").is_dir()
 
     def test_creates_host_cache_dir(self, tmp_path: Path, monkeypatch) -> None:
         cache = tmp_path / "nested" / "llama.cpp"
+        monkeypatch.setenv(container.EXPORT_HOME_ENV, str(tmp_path / "home"))
         monkeypatch.setenv(container.LLAMA_CPP_CACHE_ENV, str(cache))
         assert not cache.exists()
         container.export_launch_kwargs()
@@ -676,16 +695,18 @@ class TestExportLaunchKwargs:
         # Idempotent: a second call on an existing dir must not raise.
         container.export_launch_kwargs()
 
-    def test_default_cache_used_without_override(self, tmp_path: Path, monkeypatch) -> None:
+    def test_default_home_used_without_override(self, tmp_path: Path, monkeypatch) -> None:
         monkeypatch.delenv(container.LLAMA_CPP_CACHE_ENV, raising=False)
-        default = tmp_path / "default-cache"
-        monkeypatch.setattr(container, "DEFAULT_LLAMA_CPP_CACHE", default)
+        monkeypatch.delenv(container.EXPORT_HOME_ENV, raising=False)
+        default = tmp_path / "default-home"
+        monkeypatch.setattr(container, "DEFAULT_EXPORT_HOME", default)
         kwargs = container.export_launch_kwargs()
-        assert kwargs["extra_mounts"][0][0] == str(default)
-        assert default.is_dir()
+        assert kwargs["extra_mounts"] == [(str(default), container.EXPORT_HOME)]
+        assert (default / ".unsloth" / "llama.cpp").is_dir()
 
     def test_kwargs_feed_build_command(self, tmp_path: Path, monkeypatch) -> None:
         cache = tmp_path / "llama-cache"
+        monkeypatch.setenv(container.EXPORT_HOME_ENV, str(tmp_path / "home"))
         monkeypatch.setenv(container.LLAMA_CPP_CACHE_ENV, str(cache))
         kwargs = container.export_launch_kwargs()
         joined = _joined(

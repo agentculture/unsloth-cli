@@ -132,10 +132,14 @@ Unsloth resolves its llama.cpp checkout from `Path.home()/".unsloth"/"llama.cpp"
 reliably writable, and on an `--rm` container anything written there is lost — so
 every GGUF export would re-install llama.cpp. The orchestration therefore:
 
-- sets **`HOME=/workspace/.home`** explicitly (`container.EXPORT_HOME`);
-- bind-mounts a **host-owned** cache dir at exactly `$HOME/.unsloth/llama.cpp`
-  (default `~/.cache/unsloth-cli/llama.cpp`, override with
-  **`SLOTH_LLAMA_CPP_CACHE`**), created on the host if absent;
+- sets **`HOME=/opt/sloth-home`** explicitly (`container.EXPORT_HOME`) and bind-mounts a
+  **host-owned** directory there (default `~/.cache/unsloth-cli/home`, override with
+  **`SLOTH_EXPORT_HOME`**) — its own mount, *outside* `/workspace`, because docker creates
+  missing mount-point parents as root and a HOME nested under the workdir mount was
+  unwritable (`$HOME/.cache/uv: Permission denied`, measured 2026-09-15);
+- pre-creates `$HOME/.unsloth/llama.cpp` inside that host dir (default
+  `~/.cache/unsloth-cli/home/.unsloth/llama.cpp`); **`SLOTH_LLAMA_CPP_CACHE`** mounts a
+  different host dir at that exact path when set;
 - pins the prebuilt release with **`UNSLOTH_LLAMA_TAG=b10909`** (validated live
   2026-09-15).
 
@@ -200,5 +204,5 @@ The first real run creates the in-container venv and installs the dep layer
 | `exit 137` (SIGKILL) | UMA OOM reclaimer. Flush page cache, reduce batch/seq, or use QLoRA. |
 | `Found an incompatible version of torchao` | A drifted dep set. Use the pinned `DEP_LAYER_PACKAGES` (peft 0.18.0). |
 | Model re-downloads every run | HF cache not mounted — check `~/.cache/huggingface` exists and is readable. |
-| llama.cpp re-installs on every export | The llama.cpp cache is not persisting — check `~/.cache/unsloth-cli/llama.cpp` (or `SLOTH_LLAMA_CPP_CACHE`) is writable. |
+| llama.cpp re-installs on every export | The llama.cpp cache is not persisting — check `~/.cache/unsloth-cli/home/.unsloth/llama.cpp` (or `SLOTH_LLAMA_CPP_CACHE`) is writable. |
 | `note: MemFree is …` on stderr | Informational, not a failure: free page cache or stop other GPU residents before a big run. |
