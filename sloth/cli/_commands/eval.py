@@ -42,7 +42,6 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -54,8 +53,7 @@ from sloth.tune._exporter import run_eval_model
 from sloth.tune._trainer import run_eval
 from sloth.tune.datasets import validate_suite
 
-#: Default generation batch size for the eval loop (forwarded to the in-container
-#: seam once it accepts one — see :func:`_call_eval_seam`).
+#: Default generation batch size for the eval loop (forwarded to the in-container seam).
 DEFAULT_BATCH_SIZE = 8
 
 # ---------------------------------------------------------------------------
@@ -309,40 +307,13 @@ def _call_eval_seam(
     quant: str | None,
     batch_size: int,
 ) -> dict[str, Any]:
-    """Call *func* (``run_eval`` or ``run_eval_model``) with the richest kwargs it accepts.
+    """Call *func* (``run_eval`` or ``run_eval_model``) with the full suite contract.
 
-    TODO(t5): ``sloth.tune._trainer.run_eval`` / ``sloth.tune._exporter.run_eval_model``
-    are being extended by a sibling task to accept ``suite_paths``/``quant``/
-    ``batch_size`` keyword arguments (per-file + aggregate scoring, GGUF ``--quant``
-    selection, batched generation). This module does not own those files and must
-    not assume the new signature has landed, so it introspects the callee via
-    :func:`inspect.signature`:
-
-    * once the callee accepts ``suite_paths`` (and optionally ``quant``/
-      ``batch_size``), those are passed through — the full suite list, quant
-      selector, and batch size all reach the seam;
-    * otherwise (today, and in this worktree's own tests, which monkeypatch
-      ``run_eval``/``run_eval_model`` with the CURRENT two-positional-arg
-      signature) this falls back to ``func(target_path, suite_path)`` using only
-      the *first* resolved suite path — a directory suite still validates and
-      launches correctly, but only its first file is actually scored until the
-      richer signature lands.
-
-    This keeps the test suite green against both signatures without editing
-    ``_trainer.py``/``_exporter.py`` (owned by the other task).
+    Both seams accept ``suite_paths`` (every resolved file, scored per file and in
+    aggregate), ``quant`` (GGUF selector; ignored by the adapter path) and
+    ``batch_size`` as keyword arguments.
     """
-    try:
-        params = inspect.signature(func).parameters
-    except (TypeError, ValueError):  # pragma: no cover - defensive; func is always inspectable
-        params = {}
-    if "suite_paths" in params:
-        kwargs: dict[str, Any] = {"suite_paths": suite_paths}
-        if "quant" in params:
-            kwargs["quant"] = quant
-        if "batch_size" in params:
-            kwargs["batch_size"] = batch_size
-        return func(str(target_path), **kwargs)
-    return func(str(target_path), str(suite_paths[0]))
+    return func(str(target_path), suite_paths=suite_paths, quant=quant, batch_size=batch_size)
 
 
 # ---------------------------------------------------------------------------

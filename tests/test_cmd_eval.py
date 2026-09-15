@@ -60,7 +60,11 @@ _FAKE_EVAL_SUMMARY: dict[str, Any] = {
 }
 
 
-def _fake_run_eval_perfect(adapter_path: str, suite_path: str) -> dict[str, Any]:
+def _fake_run_eval_perfect(
+    adapter_path: str, suite_path: str | None = None, *, suite_paths=None, quant=None, batch_size=8
+) -> dict[str, Any]:
+    if suite_path is None:
+        suite_path = str(suite_paths[0])
     """Return a perfect-score eval summary without touching torch/peft."""
     return {
         "total": 2,
@@ -308,7 +312,14 @@ def test_eval_json_partial_score(
         encoding="utf-8",
     )
 
-    def _zero_score(adapter_path: str, suite_path: str) -> dict[str, Any]:
+    def _zero_score(
+        adapter_path: str,
+        suite_path: str | None = None,
+        *,
+        suite_paths=None,
+        quant=None,
+        batch_size=8,
+    ) -> dict[str, Any]:
         return {
             "total": 1,
             "exact_match": 0,
@@ -382,9 +393,16 @@ def test_in_container_calls_run_eval(
     """
     calls: list[tuple[str, str]] = []
 
-    def _capture_run_eval(adapter_path: str, suite_path: str) -> dict[str, Any]:
-        calls.append((adapter_path, suite_path))
-        return _fake_run_eval_perfect(adapter_path, suite_path)
+    def _capture_run_eval(
+        adapter_path: str,
+        suite_path: str | None = None,
+        *,
+        suite_paths=None,
+        quant=None,
+        batch_size=8,
+    ) -> dict[str, Any]:
+        calls.append((adapter_path, suite_path or str(suite_paths[0])))
+        return _fake_run_eval_perfect(adapter_path, suite_path, suite_paths=suite_paths)
 
     monkeypatch.setattr(eval_mod, "run_eval", _capture_run_eval)
 
@@ -739,9 +757,11 @@ def tmp_model(tmp_path: Path) -> Path:
     return d
 
 
-def _fake_run_eval_model(model_dir: str, suite_path: str) -> dict[str, Any]:
+def _fake_run_eval_model(
+    model_dir: str, suite_path: str | None = None, *, suite_paths=None, quant=None, batch_size=8
+) -> dict[str, Any]:
     """A run_eval_model summary (adapter score fields + the model-specific ones)."""
-    summary = _fake_run_eval_perfect(model_dir, suite_path)
+    summary = _fake_run_eval_perfect(model_dir, suite_path, suite_paths=suite_paths)
     summary["model_dir"] = model_dir
     summary["quant_method"] = "compressed-tensors"
     summary["quant_format"] = "pack-quantized"
@@ -841,9 +861,11 @@ def test_in_container_model_calls_run_eval_model(
     """--model --in-container delegates to run_eval_model and emits the extra fields."""
     calls: list[tuple[str, str]] = []
 
-    def _capture(model_dir: str, suite_path: str) -> dict[str, Any]:
-        calls.append((model_dir, suite_path))
-        return _fake_run_eval_model(model_dir, suite_path)
+    def _capture(
+        model_dir: str, suite_path: str | None = None, *, suite_paths=None, quant=None, batch_size=8
+    ) -> dict[str, Any]:
+        calls.append((model_dir, suite_path or str(suite_paths[0])))
+        return _fake_run_eval_model(model_dir, suite_path, suite_paths=suite_paths)
 
     monkeypatch.setattr(eval_mod, "run_eval_model", _capture)
     monkeypatch.setattr(
@@ -1348,31 +1370,3 @@ def test_in_container_forwards_quant_and_batch_size_when_seam_accepts_them(
     assert calls[0]["suite_paths"] == [tmp_suite]
     assert calls[0]["quant"] == "q4_k_m"
     assert calls[0]["batch_size"] == 4
-
-
-def test_in_container_falls_back_to_current_run_eval_signature(
-    tmp_adapter: Path,
-    tmp_suite: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """When run_eval keeps its CURRENT two-positional-arg signature (no
-    suite_paths param), cmd_eval falls back to calling it that way — the
-    original in-container contract keeps working unmodified."""
-    calls: list[tuple[str, str]] = []
-
-    def _current_signature_run_eval(adapter_path: str, suite_path: str) -> dict[str, Any]:
-        calls.append((adapter_path, suite_path))
-        return _fake_run_eval_perfect(adapter_path, suite_path)
-
-    monkeypatch.setattr(eval_mod, "run_eval", _current_signature_run_eval)
-
-    args = _make_args(
-        adapter=str(tmp_adapter),
-        suite=str(tmp_suite),
-        quant="q4_k_m",
-        batch_size=4,
-        in_container=True,
-    )
-    rc = cmd_eval(args)
-    assert rc in (None, 0)
-    assert calls == [(str(tmp_adapter), str(tmp_suite))]
