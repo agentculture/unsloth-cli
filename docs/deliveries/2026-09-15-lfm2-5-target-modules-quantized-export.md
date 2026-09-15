@@ -103,17 +103,23 @@ Quoted verbatim from the `devague summary` skeleton:
 | export.json / exports.json record full provenance | high | evidence e14, e15 · `runs/lfm2-lora/exports.json` (local) |
 | `/finetune` run mode completes train → eval → export gguf | medium | `docs/tested.md` skill row (exit 0) — requires this checkout's `sloth` first on PATH (risk `r9`) |
 | a non-empty `--output` is never clobbered without `--force`; failed runs leave only `.partial` | high | tests `test_non_empty_output_without_force_rejected`, `test_killed_container_leaves_partial_only` · evidence e8, e10 |
-| user paths are canonicalised and allow-listed (Sonar S2083/S6549) | medium | commit `f73ee3d` · tests `tests/test_cmd_export.py::test_adapter_outside_allowed_roots_is_rejected` — Sonar re-scan pending at time of writing |
+| user paths are canonicalised and allow-listed (Sonar S2083/S6549) | high | commit `f73ee3d` · tests `tests/test_cmd_export.py::test_adapter_outside_allowed_roots_is_rejected` — Sonar re-scan pending at time of writing |
 | CI coverage ≥ 60 % and rubric gate green | high | PR #20 checks `lint`, `test` (pytest) green; SonarCloud gate pending re-scan |
 
 Lapse ledger: `l1` approved caps the accuracy claim at `low`; `l2` (t9 tests after code) and `l3` (t7 assumed the metadata path) are proposed and pending, cited above as context only.
 
 ## Remaining Work / Follow-up
 
-- PR #20 SonarCloud gate — re-scan of `f73ee3d` must clear S2083/S6549; if it does not, the owner accepts the two findings in the SonarCloud PR view (the repo's Sonar script sees main-branch issues only).
 - `r10` — make `sloth train --json` stdout JSON-only on real runs (route the container's banner and trainer progress to stderr).
 - `r9` — `/finetune` skill resolver prefers any `sloth` on PATH over the checkout it lives in; on this box PATH has an editable install of another worktree.
 - `r3`, `r4`, `r8` — QLoRA-trained adapters through the export formats, Qwen3 through awq/nvfp4/gguf, `eval --model` gguf selection when several `.gguf` files exist, and a Jetson-side load: all unmeasured.
 - `l2`, `l3` — adjudicate the two proposed lapses; evidence e1–e20 and deltas b1–b8 are proposed and need the owner's confirm.
 - `r2` — delete the `torch.accelerator.get_memory_info` shim when the NGC image reaches torch ≥ 2.11.
 - `r1`, `v5` — unsloth / unsloth_zoo still float in the container dep layer (2026.9.4 live vs 2026.6.9 in older docs).
+
+## Post-merge validation (main at `445a490`, PR #20 squash-merged)
+
+- full suite on `main`: 586 passed, 0 failed, 1 skipped (GPU smoke); `uv run teken cli doctor . --strict` green.
+- evidence re-filed at the merge commit: `e21`, `e22`, `e23`, `e24`, `e25`, `e26`, `e27`, `e28`, `e29`, `e30`, `e31`, `e32`, `e33` (pass) and `e34` (fail — the stdout stream-through, risk `r10`, unchanged).
+- PR #20 closed with SonarCloud gate OK (0 issues), 15 Qodo threads answered, 13 resolved, 2 left open on r10.
+- Delivery Claims updates: "user paths are canonicalised and allow-listed" → high (gate passed at `f73ee3d`+); "CI coverage ≥ 60 % and rubric gate green" → high (all checks green at merge).

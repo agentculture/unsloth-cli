@@ -2,7 +2,7 @@
   "plan_slug": "lfm2-5-target-modules-quantized-export",
   "schema_version": 2,
   "created": "2026-09-15T11:22:08Z",
-  "updated": "2026-09-15T14:00:57Z",
+  "updated": "2026-09-15T14:19:23Z",
   "deviations": [
     {
       "id": "d1",
@@ -439,6 +439,272 @@
       "status": "approved",
       "superseded": false,
       "seq": 24
+    },
+    {
+      "id": "e21",
+      "obligation_ref": "o1",
+      "test_ref": "tests/test_cmd_train.py::test_lfm2_without_target_modules_emits_single_preset_hint",
+      "behavior_text": "single stderr note, stdout JSON unchanged (dry-run)",
+      "contract_text": "the LFM2 hint is a single emit_diagnostic line on stderr",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "post-merge re-run of the full suite on main at the merge commit: 586 passed, 0 failed, 1 skipped; rubric gate green",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T14:18:41Z",
+        "commit": "445a490"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 25
+    },
+    {
+      "id": "e22",
+      "obligation_ref": "o2",
+      "test_ref": "tests/test_tune_config.py::test_target_modules_wrong_type_raises_cli_error_with_hint",
+      "behavior_text": "list / regex / preset accepted, anything else exit 1 + hint",
+      "contract_text": "accepts a list of names, a single regex string, or preset:<name>",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "post-merge re-run of the full suite on main at the merge commit: 586 passed, 0 failed, 1 skipped; rubric gate green",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T14:18:41Z",
+        "commit": "445a490"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 26
+    },
+    {
+      "id": "e23",
+      "obligation_ref": "o3",
+      "test_ref": "tests/test_tune_trainer.py::test_get_peft_model_receives_resolved_preset_target_modules",
+      "behavior_text": "resolved regex reaches get_peft_model and training_metadata.json",
+      "contract_text": "target_modules is stored exactly as resolved",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "post-merge re-run of the full suite on main at the merge commit: 586 passed, 0 failed, 1 skipped; rubric gate green",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T14:18:41Z",
+        "commit": "445a490"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 27
+    },
+    {
+      "id": "e24",
+      "obligation_ref": "o4",
+      "test_ref": "tests/test_cmd_export.py::test_module_never_imports_container_at_module_level",
+      "behavior_text": "safetensors lane container-free",
+      "contract_text": "never imports sloth.tune.container and never touches docker",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "post-merge re-run of the full suite on main at the merge commit: 586 passed, 0 failed, 1 skipped; rubric gate green",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T14:18:41Z",
+        "commit": "445a490"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 28
+    },
+    {
+      "id": "e25",
+      "obligation_ref": "o5",
+      "test_ref": "tests/test_cmd_export.py::test_invalid_quant_rejected_before_launch",
+      "behavior_text": "invalid values exit 1 before launch; dry-run launches nothing",
+      "contract_text": "validates on the host and exits 1 with a hint before container.launch",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "post-merge re-run of the full suite on main at the merge commit: 586 passed, 0 failed, 1 skipped; rubric gate green",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T14:18:41Z",
+        "commit": "445a490"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 29
+    },
+    {
+      "id": "e26",
+      "obligation_ref": "o6",
+      "test_ref": "tests/test_tune_container.py::TestExportLaunchKwargs::test_kwargs_shape_and_mount_target",
+      "behavior_text": "explicit HOME, host-owned home mount, pinned llama.cpp tag",
+      "contract_text": "mounts a host-owned llama.cpp cache, sets HOME explicitly, passes UNSLOTH_LLAMA_TAG",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "post-merge re-run of the full suite on main at the merge commit: 586 passed, 0 failed, 1 skipped; rubric gate green",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T14:18:41Z",
+        "commit": "445a490"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 30
+    },
+    {
+      "id": "e27",
+      "obligation_ref": "o7",
+      "test_ref": "tests/test_cmd_export.py::test_killed_container_leaves_partial_only",
+      "behavior_text": "failure leaves only .partial; success renames",
+      "contract_text": "on exit 0 the requested files exist directly under --output; on failure only <output>.partial may remain",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "post-merge re-run of the full suite on main at the merge commit: 586 passed, 0 failed, 1 skipped; rubric gate green",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T14:18:41Z",
+        "commit": "445a490"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 31
+    },
+    {
+      "id": "e28",
+      "obligation_ref": "o8",
+      "test_ref": "tests/test_cmd_export.py::test_non_empty_output_without_force_rejected",
+      "behavior_text": "non-empty --output exits 1 without --force; overlap with the adapter rejected (test_container_output_overlapping_adapter_is_rejected)",
+      "contract_text": "a non-empty --output without --force exits 1 with a hint and writes nothing",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "post-merge re-run of the full suite on main at the merge commit: 586 passed, 0 failed, 1 skipped; rubric gate green",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T14:18:41Z",
+        "commit": "445a490"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 32
+    },
+    {
+      "id": "e29",
+      "obligation_ref": "o9",
+      "test_ref": "tests/test_tune_exporter.py::test_export_json_records_every_contract_field",
+      "behavior_text": "export.json fields incl. resolved gguf quant; index appended under a lock",
+      "contract_text": "written next to the artifacts and appended to <adapter>/exports.json with the listed fields",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "post-merge re-run of the full suite on main at the merge commit: 586 passed, 0 failed, 1 skipped; rubric gate green",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T14:18:41Z",
+        "commit": "445a490"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 33
+    },
+    {
+      "id": "e30",
+      "obligation_ref": "o10",
+      "test_ref": "tests/test_cmd_eval.py::test_adapter_and_model_are_mutually_exclusive",
+      "behavior_text": "exclusivity error; --model result carries quant fields; continuation-only scoring",
+      "contract_text": "mutually exclusive with --adapter; result JSON has the same score fields plus model_dir, quant_method, quant_format",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "post-merge re-run of the full suite on main at the merge commit: 586 passed, 0 failed, 1 skipped; rubric gate green",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T14:18:41Z",
+        "commit": "445a490"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 34
+    },
+    {
+      "id": "e31",
+      "obligation_ref": "o11",
+      "test_ref": "tests/test_tune_exporter.py::test_awq_lfm2_mappings_are_per_layer_and_drop_v_to_out_proj",
+      "behavior_text": "basic pipeline, LFM2 mappings without v->out, guarded shim, --base override staged",
+      "contract_text": "llm-compressor invocation for awq",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "post-merge re-run of the full suite on main at the merge commit: 586 passed, 0 failed, 1 skipped; rubric gate green",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T14:18:41Z",
+        "commit": "445a490"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 35
+    },
+    {
+      "id": "e32",
+      "obligation_ref": "o12",
+      "test_ref": "tests/test_cmd_train.py::test_lfm2_rank_above_32_warns_about_hand_lane",
+      "behavior_text": "rank > 32 on LFM2 warns; preset never alters lora_r",
+      "contract_text": "preset:lfm2 does not change lora_r; rank > 32 diagnostic",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "post-merge re-run of the full suite on main at the merge commit: 586 passed, 0 failed, 1 skipped; rubric gate green",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T14:18:41Z",
+        "commit": "445a490"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 36
+    },
+    {
+      "id": "e33",
+      "obligation_ref": "o13",
+      "test_ref": "tests/test_finetune_skill_script.py::test_finetune_sh_forwards_export_format_and_quant",
+      "behavior_text": "skill forwards --export-format/--quant/--output; docs/tested.md rows reviewed against logs (manual, pre-merge e20)",
+      "contract_text": "rows only after real Spark runs, with the exact invocation",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "post-merge re-run of the full suite on main at the merge commit: 586 passed, 0 failed, 1 skipped; rubric gate green",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T14:18:41Z",
+        "commit": "445a490"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 37
+    },
+    {
+      "id": "e34",
+      "obligation_ref": "o1",
+      "test_ref": "observation: /finetune run-mode stdout on the merged code (unchanged since pre-merge e2)",
+      "behavior_text": "real-run stdout still carries the container banner and trainer progress around the JSON results",
+      "contract_text": "stdout carries only the plan/result payload",
+      "evidence_type": "observation",
+      "strength": "fidelity",
+      "strength_basis": "no code change touched container stdout streaming between e2 and the merge (risk r10 open)",
+      "outcome": "fail",
+      "run": {
+        "timestamp": "2026-09-15T14:18:41Z",
+        "commit": "445a490"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 38
     }
   ],
   "deltas": [
