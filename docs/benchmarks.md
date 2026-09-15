@@ -146,9 +146,14 @@ What these numbers do and do not say:
   most of the difference being generation time, since container start and
   model load are the same in both.
 
-The `eval.json` behind each row sits in the evaluated directory
-(`runs/lfm2-lora/eval.json`, `runs/lfm2-exports/<fmt>/eval.json`); `sloth
-summarize` and `sloth compare` render them.
+The four export rows (`merged-16bit` / `gguf` / `awq` / `nvfp4`) each have their
+own `runs/lfm2-exports/<fmt>/eval.json`. The two adapter rows (batch 8 and
+batch 1) both write to the same `runs/lfm2-lora/eval.json` — it is
+**latest-only**, and since batch 1 ran second, that file currently holds the
+batch-1 result, not batch 8. **The batch size itself is not recorded inside
+`eval.json`** — it lives only in this table and in the invocation that
+produced the run; do not infer it from the file. `sloth summarize` and `sloth
+compare` render whichever file is present.
 
 ## Run metadata (written next to the adapter)
 
