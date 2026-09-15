@@ -1,0 +1,627 @@
+"""Lazy in-container export seam — merged/GGUF via Unsloth, AWQ/NVFP4 via llm-compressor.
+
+Like :mod:`sloth.tune._trainer`, this module is allowed to touch the heavy ML
+stack (``unsloth``/``torch``/``transformers``/``peft``/``llmcompressor``) but
+**only inside** :func:`_load_backend` — never at module top level. Importing
+this module (or the ``sloth`` package) stays torch-free so the introspection
+verbs keep working on a machine with no GPU and no ML stack.
+
+Public entry point
+------------------
+:func:`run_export` takes the export *plan* dict produced by
+``sloth/cli/_commands/export.py`` and performs the in-container work:
+
+``plan`` keys
+    ``format`` (``merged-16bit`` | ``merged-4bit`` | ``gguf`` | ``awq`` |
+    ``nvfp4``), ``quant`` (``list[str]``, may be empty), ``base``, ``adapter``,
+    ``output`` (already the ``.partial`` directory — write directly into it),
+    ``calib``, ``calib_samples``, ``keep_intermediate``, ``dataset``.
+
+Returns ``{"format", "output", "files", "export_json", "calibration",
+"versions"}``.
+
+Live-measured facts encoded here (DGX Spark, NGC 25.11, 2026-09-15 — memory
+record ``unsloth-cli-quant-export-livetest-2026-09-15``)
+--------------------------------------------------------------------------
+* Unsloth writes GGUF into ``f"{dir}_gguf/"`` (a *sibling* suffix directory,
+  not the requested one) with names like ``LFM2.5-1.2B-Base.Q4_K_M.gguf`` plus
+  an ``F16``/``BF16`` intermediate. :func:`_collect_gguf` moves the requested
+  quants into the requested dir and drops the intermediate.
+* llm-compressor's **default sequential pipeline dies under ``torch.fx``** for
+  ``Lfm2`` (``create_causal_mask`` → ``'NoneType' object has no attribute
+  'get_mask_sizes'``). ``pipeline="basic"`` is therefore **mandatory**.
+* AWQ on LFM2.5-1.2B (GQA 32/8) with a ``v_proj -> out_proj`` mapping fails with
+  ``"size of tensor a (512) must match ... b (2048)"`` — so that pair is
+  **deliberately absent** from :func:`_lfm2_awq_mappings`.
+* compressed-tensors ``0.16.0`` calls ``torch.accelerator.get_memory_info``,
+  which only exists in ``torch >= 2.11``; NGC 25.11 ships torch 2.10. See
+  :func:`_apply_memory_info_shim`.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from sloth.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
+from sloth.cli._output import emit_diagnostic
+from sloth.tune._trainer import _detect_dataset_schema, _format_records, _is_gpu_oom
+from sloth.tune.datasets import validate_dataset
+
+# Formats understood by this seam.
+MERGED_FORMATS: dict[str, str] = {
+    "merged-16bit": "merged_16bit",
+    "merged-4bit": "merged_4bit",
+}
+COMPRESSED_FORMATS: frozenset[str] = frozenset({"awq", "nvfp4"})
+SUPPORTED_FORMATS: tuple[str, ...] = (
+    "merged-16bit",
+    "merged-4bit",
+    "gguf",
+    "awq",
+    "nvfp4",
+)
+
+# Default GGUF quantisation when the plan carries no explicit list.
+DEFAULT_GGUF_QUANT: tuple[str, ...] = ("q4_k_m",)
+
+# Quant tags Unsloth emits for the un-quantised intermediate it converts *from*.
+_INTERMEDIATE_TAGS: frozenset[str] = frozenset({"f16", "bf16", "f32"})
+
+# Below this many calibration rows the quantisation scales get noisy; warn once.
+MIN_CALIBRATION_SAMPLES = 64
+
+_NGC_HINT = (
+    "The export backend (unsloth + torch + transformers + llmcompressor) is only "
+    "available inside the NVIDIA NGC container: nvcr.io/nvidia/pytorch:25.11-py3. "
+    "Run `sloth export` on the host (it orchestrates the container for you) rather "
+    "than calling the in-container seam directly."
+)
+
+_OOM_HINT = (
+    "The GPU ran out of memory during export. On the DGX Spark's Unified Memory "
+    "Architecture, free host memory and flush the page cache (sudo sh -c 'sync; echo 3 > "
+    "/proc/sys/vm/drop_caches'), stop other GPU processes (a running vLLM server holds "
+    "tens of GB), then retry. Exporting a smaller quant or fewer calibration samples "
+    "(--calib-samples) also lowers the peak."
+)
+
+_PACKAGES = (
+    "unsloth",
+    "unsloth_zoo",
+    "transformers",
+    "peft",
+    "llmcompressor",
+    "compressed_tensors",
+)
+
+
+# ---------------------------------------------------------------------------
+# Heavy backend (the ONLY place torch/unsloth/llmcompressor are imported)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _Backend:
+    """Bundle of the lazily-imported ML callables used by the real export paths.
+
+    Field names are snake_case (not the PascalCase of the imported classes); each
+    holds the corresponding callable/module. ``oneshot``/``awq_modifier``/
+    ``quantization_modifier``/``awq_mapping``/``compressed_tensors`` are ``None``
+    unless the requested format needs llm-compressor.
+    """
+
+    torch: Any
+    fast_model: Any  # unsloth.FastModel (or FastLanguageModel on older unsloth)
+    auto_model_for_causal_lm: Any  # transformers.AutoModelForCausalLM
+    auto_tokenizer: Any  # transformers.AutoTokenizer
+    oneshot: Any = None  # llmcompressor.oneshot
+    awq_modifier: Any = None  # llmcompressor AWQModifier
+    quantization_modifier: Any = None  # llmcompressor QuantizationModifier
+    awq_mapping: Any = None  # llmcompressor AWQMapping
+    compressed_tensors: Any = None  # the compressed_tensors module (for the shim)
+
+
+def _load_backend(*, need_compressor: bool = False) -> _Backend:
+    """Import the heavy ML stack and return it as a :class:`_Backend`.
+
+    This is the single seam where the heavy stack enters the process — isolated
+    exactly like :func:`sloth.tune._trainer._load_backend` so tests can
+    monkeypatch *one* loader: raising ``ImportError`` here exercises the
+    ``CliError(code=2)`` NGC-hint path, and returning a fake exercises the real
+    flow GPU-free.
+
+    Raises:
+        ImportError: if any required component of the ML stack is unavailable.
+    """
+    # Unsloth MUST be imported *before* torch/transformers/peft so its runtime
+    # patches apply; imported after them it warns and skips its optimizations.
+    # Keep this order — do not let the import sorter reorder the block.
+    # isort: off
+    import unsloth  # noqa: PLC0415 — intentional lazy import; import FIRST
+    import torch  # noqa: PLC0415
+    from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: PLC0415
+
+    # isort: on
+    # Newer unsloth exposes the generic ``FastModel`` (the one that loads LFM2);
+    # older releases only have ``FastLanguageModel``.
+    fast_model = getattr(unsloth, "FastModel", None) or unsloth.FastLanguageModel
+
+    backend = _Backend(
+        torch=torch,
+        fast_model=fast_model,
+        auto_model_for_causal_lm=AutoModelForCausalLM,
+        auto_tokenizer=AutoTokenizer,
+    )
+    if need_compressor:
+        _attach_compressor(backend)
+    return backend
+
+
+def _attach_compressor(backend: _Backend) -> None:
+    """Import llm-compressor onto *backend* (lazy; only for awq/nvfp4)."""
+    import compressed_tensors  # noqa: PLC0415 — intentional lazy import
+    from llmcompressor import oneshot  # noqa: PLC0415
+    from llmcompressor.modifiers.quantization import QuantizationModifier  # noqa: PLC0415
+
+    try:
+        # llm-compressor 0.11 moved AWQ under modifiers.transform.awq.
+        from llmcompressor.modifiers.awq import AWQModifier  # noqa: PLC0415
+        from llmcompressor.modifiers.transform.awq.mappings import (  # noqa: PLC0415
+            AWQMapping,
+        )
+    except ImportError:  # pragma: no cover - depends on the installed version
+        # 0.10 keeps both in modifiers.awq.
+        from llmcompressor.modifiers.awq import AWQMapping, AWQModifier  # noqa: PLC0415
+
+    backend.oneshot = oneshot
+    backend.awq_modifier = AWQModifier
+    backend.quantization_modifier = QuantizationModifier
+    backend.awq_mapping = AWQMapping
+    backend.compressed_tensors = compressed_tensors
+
+
+# ---------------------------------------------------------------------------
+# The torch.accelerator.get_memory_info shim
+# ---------------------------------------------------------------------------
+
+
+def _apply_memory_info_shim(torch_mod: Any, compressed_tensors_mod: Any) -> bool:
+    """Back-fill ``torch.accelerator.get_memory_info`` for compressed-tensors 0.16.0.
+
+    compressed-tensors 0.16.0 (the version llm-compressor 0.11 requires) calls
+    ``torch.accelerator.get_memory_info``, which only landed in torch 2.11. NGC
+    25.11 ships torch 2.10, so the call raises ``AttributeError`` mid-run. The
+    shim maps it to ``torch.cuda.mem_get_info`` (same ``(free, total)`` shape).
+
+    Deliberately narrow: applied **only** when the attribute is missing **and**
+    ``compressed_tensors.__version__ == "0.16.0"``. Any other version — or a torch
+    that already has the attribute — is left untouched, so this disappears by
+    itself once the image moves to torch >= 2.11.
+
+    Returns:
+        True when the shim was installed, False when it was skipped.
+    """
+    accelerator = getattr(torch_mod, "accelerator", None)
+    if accelerator is None or hasattr(accelerator, "get_memory_info"):
+        return False
+    if getattr(compressed_tensors_mod, "__version__", None) != "0.16.0":
+        return False
+
+    def _get_memory_info(device: Any = None) -> Any:
+        return torch_mod.cuda.mem_get_info(device)
+
+    accelerator.get_memory_info = _get_memory_info
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Version / provenance capture (pure stdlib)
+# ---------------------------------------------------------------------------
+
+
+def _package_version(name: str) -> str | None:
+    """Return the installed version of *name*, or ``None`` when absent."""
+    from importlib.metadata import PackageNotFoundError, version  # noqa: PLC0415
+
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return None
+
+
+def _llama_cpp_tag() -> str | None:
+    """Return the llama.cpp build tag used for GGUF conversion, when known.
+
+    ``UNSLOTH_LLAMA_TAG`` (set when a prebuilt llama.cpp tarball is mounted into
+    the container) wins; otherwise the prebuilt id recorded in
+    ``$HOME/.unsloth/llama.cpp/UNSLOTH_PREBUILT_INFO.json`` is used.
+    """
+    tag = os.environ.get("UNSLOTH_LLAMA_TAG")
+    if tag:
+        return tag
+    info = Path(os.path.expanduser("~")) / ".unsloth" / "llama.cpp" / "UNSLOTH_PREBUILT_INFO.json"
+    try:
+        data = json.loads(info.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    for key in ("id", "tag", "build", "version"):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _versions() -> dict[str, str | None]:
+    """Capture the provenance of every component that shaped the artifacts."""
+    captured: dict[str, str | None] = {name: _package_version(name) for name in _PACKAGES}
+    captured["llama_cpp_tag"] = _llama_cpp_tag()
+    return captured
+
+
+# ---------------------------------------------------------------------------
+# Calibration (pure stdlib up to the tokenizer render)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _Calibration:
+    """A resolved calibration set: where it came from, and its validated records."""
+
+    source: str
+    schema: str
+    records: list[dict]
+
+    def as_record(self) -> dict[str, Any]:
+        return {"source": self.source, "count": len(self.records)}
+
+
+def _resolve_calibration(plan: dict[str, Any]) -> _Calibration:
+    """Load + cap the calibration records for a quantised export.
+
+    Default source is the run's own dataset (``plan["dataset"]``); ``--calib``
+    (``plan["calib"]``) overrides it and ``--calib-samples``
+    (``plan["calib_samples"]``) caps the record count. Validation happens here —
+    *before* any model load — so a broken calibration file costs no GPU time.
+    """
+    source = plan.get("calib") or plan.get("dataset")
+    if not source:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message="a quantised export (awq/nvfp4) needs calibration data, but none was given",
+            remediation=(
+                "Pass --calib <dataset.jsonl>, or export an adapter whose run metadata "
+                "records the training dataset so it can be reused for calibration."
+            ),
+        )
+    path = Path(source)
+    schema = _detect_dataset_schema(path)
+    records = validate_dataset(path, schema=schema)
+
+    cap = plan.get("calib_samples")
+    if cap is not None and cap > 0:
+        records = records[:cap]
+
+    if len(records) < MIN_CALIBRATION_SAMPLES:
+        # Exactly one diagnostic — results stay on stdout, this belongs on stderr.
+        emit_diagnostic(
+            f"warning: only {len(records)} calibration samples "
+            f"(fewer than {MIN_CALIBRATION_SAMPLES}); quantisation scales may be noisy. "
+            "Pass --calib with a larger dataset for a better-calibrated export."
+        )
+    return _Calibration(source=str(path), schema=schema, records=records)
+
+
+# ---------------------------------------------------------------------------
+# Merged export (Unsloth)
+# ---------------------------------------------------------------------------
+
+
+def _load_adapter(backend: _Backend, plan: dict[str, Any]) -> tuple[Any, Any]:
+    """Load the trained adapter (base + LoRA deltas) through Unsloth."""
+    return backend.fast_model.from_pretrained(
+        model_name=plan["adapter"],
+        load_in_4bit=False,
+        dtype=None,
+    )
+
+
+def _export_merged(backend: _Backend, plan: dict[str, Any], output: Path) -> None:
+    """Merge the adapter into the base weights and save 16-bit or 4-bit."""
+    save_method = MERGED_FORMATS[plan["format"]]
+    model, tokenizer = _load_adapter(backend, plan)
+    model.save_pretrained_merged(str(output), tokenizer, save_method=save_method)
+
+
+def _requested_gguf_quant(plan: dict[str, Any]) -> list[str]:
+    """Return the requested GGUF quantisation methods (documented default applies)."""
+    quant = list(plan.get("quant") or [])
+    return quant or list(DEFAULT_GGUF_QUANT)
+
+
+def _collect_gguf(output: Path, quant: list[str], *, keep_intermediate: bool) -> None:
+    """Move Unsloth's ``<output>_gguf/*.gguf`` files into *output* and drop the intermediate.
+
+    Unsloth does **not** write into the directory it is handed: it writes into a
+    sibling directory with a ``_gguf`` suffix (live-measured; e.g.
+    ``LFM2.5-1.2B-Base.Q4_K_M.gguf`` plus the ``.F16.gguf`` intermediate it
+    converted from). We normalise that back to the requested directory and delete
+    the intermediate unless ``keep_intermediate`` is set.
+    """
+    staged = Path(str(output) + "_gguf")
+    if not staged.is_dir():
+        return
+    wanted = {q.lower() for q in quant}
+    for path in sorted(staged.glob("*.gguf")):
+        tag = path.name.rsplit(".", 2)[-2].lower() if path.name.count(".") >= 2 else ""
+        is_intermediate = tag in _INTERMEDIATE_TAGS and tag not in wanted
+        if is_intermediate and not keep_intermediate:
+            path.unlink()
+            continue
+        shutil.move(str(path), str(output / path.name))
+    # Remove the staging directory when nothing is left behind in it.
+    if not any(staged.iterdir()):
+        staged.rmdir()
+
+
+def _export_gguf(backend: _Backend, plan: dict[str, Any], output: Path) -> None:
+    """Convert the adapter to GGUF, then normalise Unsloth's ``_gguf`` suffix dir."""
+    quant = _requested_gguf_quant(plan)
+    model, tokenizer = _load_adapter(backend, plan)
+    model.save_pretrained_gguf(str(output), tokenizer, quantization_method=quant)
+    _collect_gguf(output, quant, keep_intermediate=bool(plan.get("keep_intermediate")))
+
+
+# ---------------------------------------------------------------------------
+# Quantised export (llm-compressor)
+# ---------------------------------------------------------------------------
+
+
+def _lfm2_awq_mappings(layer_types: list[str], awq_mapping: Any) -> list[Any]:
+    """Build per-layer AWQ smoothing mappings for an LFM2 hybrid model.
+
+    LFM2 alternates ``full_attention`` and short-conv layers (``config.layer_types``
+    says which is which), and its norms/projections are named unlike a Llama block,
+    so llm-compressor's default mappings match nothing. Per live-tested layout:
+
+    * ``operator_norm`` → ``self_attn.{q,k,v}_proj`` on ``full_attention`` layers
+    * ``operator_norm`` → ``conv.in_proj`` on conv layers
+    * ``ffn_norm`` → ``feed_forward.{w1,w3}``
+    * ``feed_forward.w3`` → ``feed_forward.w2``
+
+    There is deliberately **no ``v_proj`` → ``out_proj`` pair**: LFM2.5-1.2B is GQA
+    32/8, so v_proj's output (512) does not match out_proj's input (2048) and AWQ
+    aborts with ``"size of tensor a (512) must match the size of tensor b (2048)"``.
+    """
+    mappings: list[Any] = []
+    for index, kind in enumerate(layer_types):
+        prefix = rf"re:.*layers\.{index}\."
+        if kind == "full_attention":
+            balance = [
+                prefix + r"self_attn\.q_proj$",
+                prefix + r"self_attn\.k_proj$",
+                prefix + r"self_attn\.v_proj$",
+            ]
+        else:
+            balance = [prefix + r"conv\.in_proj$"]
+        mappings.append(awq_mapping(prefix + r"operator_norm$", balance))
+        mappings.append(
+            awq_mapping(
+                prefix + r"ffn_norm$",
+                [prefix + r"feed_forward\.w1$", prefix + r"feed_forward\.w3$"],
+            )
+        )
+        mappings.append(awq_mapping(prefix + r"feed_forward\.w3$", [prefix + r"feed_forward\.w2$"]))
+    return mappings
+
+
+def _build_recipe(backend: _Backend, fmt: str, model: Any) -> list[Any]:
+    """Build the llm-compressor recipe for *fmt* against the loaded merged *model*."""
+    if fmt == "nvfp4":
+        return [
+            backend.quantization_modifier(scheme="NVFP4", targets=["Linear"], ignore=["lm_head"])
+        ]
+
+    config = getattr(model, "config", None)
+    model_type = getattr(config, "model_type", None)
+    layer_types = getattr(config, "layer_types", None)
+    awq_kwargs: dict[str, Any] = {"duo_scaling": "both"}
+    if model_type == "lfm2" and layer_types:
+        # Only LFM2 needs hand-built mappings; every other architecture gets
+        # llm-compressor's own defaults.
+        awq_kwargs["mappings"] = _lfm2_awq_mappings(list(layer_types), backend.awq_mapping)
+    return [
+        backend.awq_modifier(**awq_kwargs),
+        backend.quantization_modifier(scheme="W4A16_ASYM", targets=["Linear"], ignore=["lm_head"]),
+    ]
+
+
+def _export_compressed(
+    backend: _Backend,
+    plan: dict[str, Any],
+    output: Path,
+    calibration: _Calibration,
+) -> None:
+    """Merge to 16-bit, then one-shot quantise to AWQ W4A16_ASYM or NVFP4."""
+    # Step 1 — a 16-bit merged checkpoint is the input llm-compressor quantises.
+    merged_dir = output / "_merged-16bit"
+    model, tokenizer = _load_adapter(backend, plan)
+    model.save_pretrained_merged(str(merged_dir), tokenizer, save_method="merged_16bit")
+
+    # Step 2 — reload the merged checkpoint through plain transformers (Unsloth's
+    # patched model is not what llm-compressor expects to trace/quantise).
+    model = backend.auto_model_for_causal_lm.from_pretrained(  # nosec B615
+        str(merged_dir), dtype=backend.torch.bfloat16, local_files_only=True
+    )
+    tokenizer = backend.auto_tokenizer.from_pretrained(  # nosec B615
+        str(merged_dir), local_files_only=True
+    )
+
+    _apply_memory_info_shim(backend.torch, backend.compressed_tensors)
+
+    rows = _format_records(calibration.records, calibration.schema, tokenizer)
+    backend.oneshot(
+        model=model,
+        dataset=rows,
+        recipe=_build_recipe(backend, plan["format"], model),
+        # MANDATORY for LFM2: the default sequential pipeline traces the model with
+        # torch.fx and dies in create_causal_mask ("'NoneType' object has no
+        # attribute 'get_mask_sizes'") on the hybrid cache.
+        pipeline="basic",
+        num_calibration_samples=len(rows),
+    )
+    model.save_pretrained(str(output), save_compressed=True)
+    tokenizer.save_pretrained(str(output))
+
+    if not plan.get("keep_intermediate"):
+        shutil.rmtree(merged_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Result recording (pure stdlib)
+# ---------------------------------------------------------------------------
+
+
+def _collect_files(output: Path) -> dict[str, int]:
+    """Return ``{relative name: size in bytes}`` for every file under *output*."""
+    files: dict[str, int] = {}
+    for path in sorted(output.rglob("*")):
+        if path.is_file():
+            files[str(path.relative_to(output))] = path.stat().st_size
+    return files
+
+
+def _append_index(adapter: Path, record: dict[str, Any]) -> None:
+    """Append *record* to ``<adapter>/exports.json`` (a JSON list; created if absent)."""
+    index_path = adapter / "exports.json"
+    entries: list[Any] = []
+    if index_path.is_file():
+        try:
+            loaded = json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            loaded = None
+        if isinstance(loaded, list):
+            entries = loaded
+    entries.append(record)
+    index_path.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+
+
+def _write_export_json(
+    plan: dict[str, Any],
+    output: Path,
+    calibration: _Calibration | None,
+    timestamp: str | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    """Write ``<output>/export.json`` and mirror the record into the adapter's index."""
+    record = {
+        "format": plan["format"],
+        "quant": list(plan.get("quant") or []),
+        "base": plan.get("base"),
+        "adapter": plan.get("adapter"),
+        "files": _collect_files(output),
+        "calibration": calibration.as_record() if calibration is not None else None,
+        "versions": _versions(),
+        "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
+    }
+    export_json = output / "export.json"
+    export_json.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    _append_index(Path(plan["adapter"]), record)
+    return export_json, record
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+
+def run_export(plan: dict[str, Any]) -> dict[str, Any]:
+    """Run the in-container export described by *plan* and record what was produced.
+
+    Parameters
+    ----------
+    plan:
+        See the module docstring for the full key list. ``plan["output"]`` is
+        already the ``.partial`` directory — artifacts are written directly into
+        it; the calling verb performs the atomic rename.
+
+    Returns
+    -------
+    dict
+        ``{"format", "output", "files", "export_json", "calibration", "versions"}``.
+
+    Raises
+    ------
+    CliError(code=1)
+        For an unknown format, or a quantised export with no calibration data.
+    CliError(code=2)
+        When the ML stack is unavailable (NGC hint) or the GPU runs out of memory
+        (memory hint).
+    """
+    fmt = plan.get("format")
+    if fmt not in SUPPORTED_FORMATS:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"unknown export format {fmt!r}",
+            remediation=f"Use one of: {', '.join(SUPPORTED_FORMATS)}.",
+        )
+
+    output = Path(plan["output"])
+    output.mkdir(parents=True, exist_ok=True)
+
+    # Calibration is validated BEFORE the backend import — a broken calibration
+    # file must not cost a model load.
+    calibration = _resolve_calibration(plan) if fmt in COMPRESSED_FORMATS else None
+
+    try:
+        backend = _load_backend(need_compressor=fmt in COMPRESSED_FORMATS)
+    except ImportError as exc:
+        raise CliError(
+            code=EXIT_ENV_ERROR,
+            message=f"The export backend is not installed: {exc}",
+            remediation=_NGC_HINT,
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        # Unsloth's GPU probe can raise a CUDA OOM at import time — an environment
+        # error (exit 2) with a memory remediation, not a code-1 bug.
+        if _is_gpu_oom(exc):
+            raise CliError(
+                code=EXIT_ENV_ERROR,
+                message=f"GPU out of memory while initializing the export backend: {exc}",
+                remediation=_OOM_HINT,
+            ) from exc
+        raise
+
+    try:
+        if fmt in MERGED_FORMATS:
+            _export_merged(backend, plan, output)
+        elif fmt == "gguf":
+            _export_gguf(backend, plan, output)
+        else:
+            _export_compressed(backend, plan, output, calibration)
+    except CliError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if _is_gpu_oom(exc):
+            raise CliError(
+                code=EXIT_ENV_ERROR,
+                message=f"GPU out of memory during export: {exc}",
+                remediation=_OOM_HINT,
+            ) from exc
+        raise
+
+    export_json, record = _write_export_json(plan, output, calibration)
+    return {
+        "format": fmt,
+        "output": str(output),
+        "files": record["files"],
+        "export_json": str(export_json),
+        "calibration": record["calibration"],
+        "versions": record["versions"],
+    }

@@ -57,3 +57,19 @@ def test_whoami_runs() -> None:
 
     rc = main(["whoami"])
     assert rc in (0, None), f"Expected exit code 0 or None, got {rc}"
+
+
+def test_exporter_imports_without_torch() -> None:
+    """Assert that importing sloth.tune._exporter does not import torch.
+
+    The export seam keeps unsloth/torch/llmcompressor inside ``_load_backend``,
+    so the module itself stays installable (and importable) on a machine with no
+    ML stack — same discipline as sloth.tune._trainer.
+    """
+    assert "torch" not in sys.modules, "torch is already in sys.modules"
+
+    import sloth.tune._exporter  # noqa: F401
+
+    assert "torch" not in sys.modules, "torch was imported when importing sloth.tune._exporter"
+    assert "unsloth" not in sys.modules, "unsloth was imported when importing sloth.tune._exporter"
+    assert "llmcompressor" not in sys.modules, "llmcompressor was imported by sloth.tune._exporter"
