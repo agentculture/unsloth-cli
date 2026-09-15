@@ -42,6 +42,7 @@ from sloth.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 from sloth.tune.config import RunConfig
 from sloth.tune.datasets import detect_schema, validate_dataset
 from sloth.tune.metadata import write_metadata
+from sloth.tune.presets import resolve_target_modules
 from sloth.tune.scope import check_scope
 
 _INSTALL_HINT = (
@@ -101,6 +102,7 @@ def _resolved_hyperparameters(config: RunConfig) -> dict[str, Any]:
         "max_steps": config.max_steps,
         "seed": config.seed,
         "load_in_4bit": config.load_in_4bit,
+        "target_modules": resolve_target_modules(config.target_modules),
     }
 
 
@@ -267,13 +269,16 @@ def _run_real(config: RunConfig, plan: dict[str, Any], backend: _Backend) -> dic
             load_in_4bit=load_in_4bit,
             dtype=None,
         )
-        model = backend.fast_language_model.get_peft_model(
-            model,
-            r=config.lora_r,
-            lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
-            random_state=config.seed,
-        )
+        peft_kwargs: dict[str, Any] = {
+            "r": config.lora_r,
+            "lora_alpha": config.lora_alpha,
+            "lora_dropout": config.lora_dropout,
+            "random_state": config.seed,
+        }
+        resolved_target_modules = plan["hyperparameters"]["target_modules"]
+        if resolved_target_modules is not None:
+            peft_kwargs["target_modules"] = resolved_target_modules
+        model = backend.fast_language_model.get_peft_model(model, **peft_kwargs)
 
         # Render each record into a single ``text`` column so SFTTrainer does not
         # depend on trl/unsloth conversational auto-detection (which otherwise
