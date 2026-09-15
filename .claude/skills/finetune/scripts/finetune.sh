@@ -65,6 +65,8 @@ run flags:
   --export-format <fmt>  Format for the export step: safetensors, merged-16bit,
                           merged-4bit, gguf, awq, nvfp4 (default: safetensors).
                           Forwarded to `sloth export --format <fmt>`.
+  --export-output <dir>  Destination for a container-format export (default:
+                          <adapter>-<format> next to the adapter; safetensors stays in place).
   --quant <list>         Comma-separated ggml quantizations for --export-format gguf
                           (e.g. q4_k_m,q8_0). Forwarded to `sloth export --quant <list>`.
 
@@ -99,7 +101,7 @@ EOF
 # ── orchestrated loop ──────────────────────────────────────────────────────────
 cmd_run() {
     local config="" suite="" dry_run=false json_flag=false
-    local export_format="safetensors" quant=""
+    local export_format="safetensors" quant="" export_output=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -124,6 +126,13 @@ cmd_run() {
                     exit 1
                 fi
                 export_format="$2"; shift 2 ;;
+            --export-output)
+                if [ -z "${2:-}" ]; then
+                    printf 'error: --export-output requires an argument.\n' >&2
+                    printf 'hint: finetune.sh run ... --export-format gguf --export-output <dir>\n' >&2
+                    exit 1
+                fi
+                export_output="$2"; shift 2 ;;
             --quant)
                 if [ $# -lt 2 ]; then
                     printf 'error: --quant requires an argument.\n' >&2
@@ -208,6 +217,17 @@ cmd_run() {
     local export_arg=()
     if [ -n "$quant" ]; then
         export_arg=(--quant "$quant")
+    fi
+    # Container formats write a NEW model directory and require --output (sloth
+    # export refuses to guess). Default: <adapter>-<format> next to the adapter,
+    # overridable with --export-output. safetensors keeps its in-place default.
+    if [ "$export_format" != "safetensors" ]; then
+        if [ -z "$export_output" ]; then
+            export_output="${adapter_dir%/}-${export_format}"
+        fi
+        export_arg+=(--output "$export_output")
+    elif [ -n "$export_output" ]; then
+        export_arg+=(--output "$export_output")
     fi
     printf 'step 4/4  export → %s\n' "$export_format" >&2
     "${SLOTH[@]}" export --adapter "$adapter_dir" --format "$export_format" \

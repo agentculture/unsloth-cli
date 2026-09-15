@@ -135,6 +135,9 @@ def test_finetune_sh_forwards_export_format_and_quant(
     assert export_argv[export_argv.index("--format") + 1] == "gguf"
     assert "--quant" in export_argv
     assert export_argv[export_argv.index("--quant") + 1] == "q4_k_m,q8_0"
+    # Container formats need --output: the script derives <adapter>-<format> by default.
+    assert "--output" in export_argv
+    assert export_argv[export_argv.index("--output") + 1].endswith("-gguf")
 
 
 def test_finetune_sh_forwards_export_format_without_quant(
