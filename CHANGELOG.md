@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] - 2026-09-15
+
+### Added
+
+- Per-format eval scores for LFM2.5-1.2B (adapter, merged-16bit, gguf Q4_K_M, awq,
+  nvfp4) on the 46-item `examples/eval/` suite, batched-vs-serial timing, and the
+  first Jetson-side rows: `awq` and `nvfp4` exports load and generate with vLLM
+  0.29 on a Thor (JetPack R38.2.2). Deployment table updated; closes #22.
+
 ## [0.8.0] - 2026-09-15
 
 ### Added

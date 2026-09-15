@@ -9,7 +9,7 @@ Companion pages: [`benchmarks.md`](benchmarks.md) (the numbers),
 [`dgx-spark.md`](dgx-spark.md) (how/why), [`fine-tuning.md`](fine-tuning.md) (the
 feature reference).
 
-## Common environment (every run below)
+## Common environment (the Spark runs; every run below unless a row names another device)
 
 | Component | Value |
 |-----------|-------|
@@ -25,6 +25,9 @@ feature reference).
 | Train hyperparameters | `batch_size=1`, `grad_accum=4`, `max_seq_len=1024`, `lora_r=8`, `lora_alpha=16`, `max_steps=10`, `seed=3407` |
 | Train dataset | `examples/chat-smoke.jsonl` (10 lines, **chat** schema) |
 | Eval suite | `examples/eval-suite.jsonl` (4 items, **task** schema) |
+
+Rows below inherit this Spark environment except where a row's own columns name
+a different device — e.g. the Thor serving row in the follow-ups #22 section.
 
 ## ✅ Tested — passed
 
@@ -108,6 +111,10 @@ Every `export --json` row above: **`wc -l out.json` = 1**, `json.loads` ok; the
 container's banner, uv layer install and Unsloth/llm-compressor progress all on
 stderr (62–186 lines). No new row names a model larger than Qwen3-1.7B / LFM2.5-1.2B.
 
+| `eval --suite examples/eval/` (dir) | adapter baseline, **batch 8 vs batch 1** timing | LFM2.5-1.2B-Base + `runs/lfm2-lora` | `uv run sloth eval --adapter runs/lfm2-lora --suite examples/eval/ --batch-size 8 --json` and the same with `--batch-size 1` | ✅ 46 items in 3 files; **220 s (batch 8) vs 524 s (batch 1)**; exact_match 0/46 both; token-F1 0.038 vs 0.060 — batched decoding is not bit-identical (plan risk r8); per-file + aggregate scores and `runs/lfm2-lora/eval.json` written |
+| `eval --model` per export format | merged-16bit / gguf Q4_K_M / awq / nvfp4 on the 46-item suite | LFM2.5-1.2B-Base exports (2026-09-15 batch) | `uv run sloth eval --model runs/lfm2-exports/<fmt> --suite examples/eval/ --batch-size 8 --json` | ✅ four runs (276 s / 130 s / 283 s / 387 s), every one 1 stdout line; exact_match **0/46 on every format** (smoke adapter — not an accuracy claim; h15 treats an all-zero set as a failed condition until a trained adapter exists); token-F1 0.036 / 0.092 / 0.060 / 0.040; full table in `docs/benchmarks.md` |
+| serve (vLLM) on **Thor** | `awq` and `nvfp4` LFM2.5 exports loaded off-box | NVIDIA Thor, JetPack R38.2.2 (L4T 6.8.12-tegra, driver 580.00), `vllm/vllm-openai:v0.29.0-aarch64` | `docker run --rm --gpus all -v ~/lfm2-exports:/exports --entrypoint /usr/bin/python3 vllm/vllm-openai:v0.29.0-aarch64 /exports/thor_load.py /exports/<fmt> <fmt>` (`LLM(gpu_memory_utilization=0.12, max_model_len=512, enforce_eager=True)`, one greedy 24-token completion) | ✅ both load with `quantization=compressed-tensors` auto-detected (`pack-quantized` / `nvfp4-pack-quantized`) and generate coherent text; 134 s / 124 s incl. engine init, with lobes' vLLM workers resident on the Thor. The Thor is an operator-local host (`ssh thor`), not referenced by shipped code |
+
 **Before-state of this batch (why the `export` rows needed a fix first):** the first
 chain of exports all exited 1 inside the container with
 `--adapter path is outside the allowed roots: /home/spark/git/unsloth-cli/runs/…` —
@@ -150,10 +157,14 @@ identical, but they have **not** been run on hardware.
 
 ### Platform
 
-- Only **GB10 (Blackwell, aarch64)** + **NGC 25.11 / torch 2.10**. No other GPU,
-  arch, driver, or container image was tested. `--gpus all` worked via **CDI**
-  (Docker default runtime `runc`); a host requiring the `nvidia` runtime was not
-  tested.
+- Training and eval ran only on **GB10 (Blackwell, aarch64)** + **NGC 25.11 /
+  torch 2.10**. `--gpus all` worked via **CDI** (Docker default runtime `runc`);
+  a host requiring the `nvidia` runtime was not tested.
+- The only *other* device tested is **NVIDIA Thor** (JetPack R38.2.2, L4T
+  6.8.12-tegra, driver 580.00, `vllm/vllm-openai:v0.29.0-aarch64`), and only for
+  **serving** the LFM2.5 `awq`/`nvfp4` exports (follow-ups #22) — not for
+  training or eval. **Orin Nano is still untested** — tracked in
+  [#23](https://github.com/agentculture/unsloth-cli/issues/23).
 
 ## How to extend this matrix
 

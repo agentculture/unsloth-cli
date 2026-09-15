@@ -103,6 +103,58 @@ are the numbers the [deployment targets](fine-tuning.md#deployment-targets)
 table's `gguf`/`awq`/`nvfp4` rows produce in practice — see that table for
 which platform each target format maps to.
 
+### `sloth eval` — per-format scores on `examples/eval/` (LFM2.5-1.2B, follow-ups #22)
+
+> **Status:** measured 2026-09-15 on the same DGX Spark, plan
+> `lfm2-5-delivery-follow-ups-22` task t10. Suite: the starter directory
+> [`examples/eval/`](../examples/eval/) — **46 task-schema items** in three files
+> (`agentculture-terms` 16, `cli-contract` 14, `task-format` 16). Adapter:
+> `runs/lfm2-lora` (10-step smoke LoRA, `preset:lfm2`); the four export dirs are
+> that adapter's `merged-16bit` / `gguf q4_k_m` / `awq` / `nvfp4` outputs from
+> the 2026-09-15 batch. All rows `--batch-size 8` unless stated (`max_new_tokens`
+> 100, greedy). Wall time includes the container start and dep-layer check.
+
+| Target | exact_match | token-F1 (aggregate) | F1 by file: terms / cli / task | Wall |
+|--------|-------------|----------------------|--------------------------------|------|
+| adapter (`--adapter`, bf16 base + LoRA) | 0 / 46 | **0.038** | 0.031 / 0.041 / 0.043 | 220 s |
+| adapter, `--batch-size 1` | 0 / 46 | 0.060 | 0.036 / 0.068 / 0.078 | 524 s |
+| `merged-16bit` | 0 / 46 | 0.036 | 0.033 / 0.031 / 0.044 | 276 s |
+| `gguf` Q4_K_M (llama.cpp) | 0 / 46 | 0.092 | 0.037 / 0.114 / 0.127 | 130 s |
+| `awq` W4A16 (compressed-tensors) | 0 / 46 | 0.060 | 0.017 / 0.085 / 0.080 | 283 s |
+| `nvfp4` (compressed-tensors) | 0 / 46 | 0.040 | 0.032 / 0.034 / 0.052 | 387 s |
+
+What these numbers do and do not say:
+
+- **Exact-match is 0/46 on every target, so exact-match cannot express
+  quantization loss for this adapter** — the 10-step smoke LoRA never learned
+  the suite's answers (its predictions echo the `Input:` template or wander). The
+  spec's honesty condition h15 treats an all-zero row set as a *failed* condition,
+  not a pass: the suite is fine, the adapter is the smoke one. A production
+  adapter (hundreds of steps on a real corpus) is what makes this table a
+  quantization-loss measurement.
+- **Token-F1 does move**, and it moves in the wrong direction to be a
+  quality signal at this scale: the Q4_K_M and AWQ rows score *higher* than the
+  bf16 merge because their noisier generations happen to overlap more
+  whitespace tokens with the references. Treat F1 differences of a few
+  hundredths as noise here.
+- **Batching changes the generations.** The same adapter at batch 8 vs batch 1
+  gives F1 0.038 vs 0.060 (both 0/46). Left-padded batched decoding is not
+  bit-identical to serial decoding; the batch size is therefore part of every
+  row above, and a serial-vs-batched equivalence check on a model with
+  non-zero scores is an open plan risk (r8).
+- **Batching pays for itself:** 220 s vs 524 s for the same 46 items (2.4x),
+  most of the difference being generation time, since container start and
+  model load are the same in both.
+
+The four export rows (`merged-16bit` / `gguf` / `awq` / `nvfp4`) each have their
+own `runs/lfm2-exports/<fmt>/eval.json`. The two adapter rows (batch 8 and
+batch 1) both write to the same `runs/lfm2-lora/eval.json` — it is
+**latest-only**, and since batch 1 ran second, that file currently holds the
+batch-1 result, not batch 8. **The batch size itself is not recorded inside
+`eval.json`** — it lives only in this table and in the invocation that
+produced the run; do not infer it from the file. `sloth summarize` and `sloth
+compare` render whichever file is present.
+
 ## Run metadata (written next to the adapter)
 
 `sloth train` writes `training_metadata.json` alongside the adapter, e.g. for the
@@ -144,4 +196,7 @@ Qwen3 9B), raise `max_steps`, and run on a box with free unified memory.
   didn't have. The orchestration and trainer code are identical; only the model
   size and step count change.
 - Throughput at larger `max_seq_len` / `batch_size`.
-- Multi-hundred-step convergence and eval accuracy on a real corpus.
+- Multi-hundred-step convergence and eval accuracy on a real corpus — the
+  per-format table above is measured on a 10-step smoke adapter and scores 0/46
+  exact-match everywhere; it becomes a quantization-loss number only with a
+  trained adapter.

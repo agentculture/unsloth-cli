@@ -163,13 +163,15 @@ Ready-to-run configs: [`examples/qlora-smoke.toml`](../examples/qlora-smoke.toml
 ## Deployment targets
 
 Target formats per deployment platform. Coverage is honest — see
-[`tested.md`](tested.md): the only formats live-tested on hardware so far are
-QLoRA bnb-4bit and bf16 LoRA on Qwen3-1.7B on GB10/Spark (2026-06-26).
+[`tested.md`](tested.md): the formats live-tested on hardware so far are QLoRA
+bnb-4bit and bf16 LoRA on Qwen3-1.7B on GB10/Spark (2026-06-26), plus LFM2.5-1.2B
+`awq`/`nvfp4` **serving** (not training) on Thor (JetPack R38.2.2,
+follow-ups #22, 2026-09-15).
 
 | Platform | Target format(s) | Live-tested |
 |----------|------------------|-------------|
-| Orin | `gguf`, `awq W4A16` | not yet — an explicit gap in [`tested.md`](tested.md) |
-| Thor | `nvfp4` | not yet — an explicit gap in [`tested.md`](tested.md) |
+| Orin | `gguf`, `awq W4A16` | not yet — tracked in [#23](https://github.com/agentculture/unsloth-cli/issues/23) (needs lobes down on the Spark) |
+| Thor | `nvfp4`, `awq W4A16` | **2026-09-15**: LFM2.5-1.2B `nvfp4` and `awq` exports load and generate with `vllm/vllm-openai:v0.29.0-aarch64` on JetPack R38.2.2 (follow-ups #22, [`tested.md`](tested.md)) |
 | Spark | `nvfp4`; `bf16 + LoRA via lobes hand` | `bf16` LoRA on Qwen3-1.7B (2026-06-26, [`tested.md`](tested.md)) |
 
 Every target format above is produced by `sloth export --format <fmt>` (see
