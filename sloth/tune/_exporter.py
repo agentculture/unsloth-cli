@@ -1047,7 +1047,13 @@ def run_eval_model(
     ----------
     model_dir:
         Directory holding a merged (bf16/4-bit), AWQ, NVFP4 or GGUF export — or a
-        single ``.gguf`` file. ``eval.json`` is written into that directory.
+        single ``.gguf`` file (the supported direct-file form). For the directory
+        form, ``eval.json`` is written into that same directory. For the direct-file
+        form, a file cannot hold a child ``eval.json``, so it is written into the
+        file's *parent* directory instead — the returned ``model_dir`` reports that
+        parent in both forms, which keeps it consistent with what ``sloth
+        summarize``/``compare`` look for (the directory containing ``eval.json``,
+        never a bare file path).
     suite_path:
         A single task-schema JSONL suite — the historical positional argument,
         still honoured for direct/legacy callers.
@@ -1071,7 +1077,9 @@ def run_eval_model(
         ``exact_match``, ``exact_match_pct``, ``f1``, ``results`` plus per-file
         ``files`` entries — with ``model_dir``, ``quant_method`` and
         ``quant_format`` added (from ``config.json``'s ``quantization_config``;
-        ``None`` for a plain bf16 merged dir or a GGUF).
+        ``None`` for a plain bf16 merged dir or a GGUF). ``model_dir`` is always a
+        directory: for a direct ``.gguf`` file target it is that file's parent, not
+        the file itself, matching where ``eval.json`` was written.
 
     Raises
     ------

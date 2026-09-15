@@ -911,3 +911,46 @@ class TestRunEvalModel:
         assert [Path(s).name for s in seen] == ["Model-Q8_0.gguf"]
         assert summary["exact_match"] == 1
         assert summary["f1"] == 1.0
+
+    def test_direct_gguf_file_writes_eval_json_next_to_the_file(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """``--model <file>.gguf`` (the supported direct-file form) must still persist
+        ``eval.json`` — next to the file, i.e. inside its *parent* directory, since a
+        file itself cannot hold a child ``eval.json``. ``model_dir`` in the returned
+        summary reports that same parent, matching what ``sloth summarize`` looks for.
+        """
+        directory = tmp_path / "gguf-file-out"
+        directory.mkdir()
+        gguf_file = directory / "Model-Q4_K_M.gguf"
+        gguf_file.write_bytes(b"GGUF")
+        suite = _eval_suite(tmp_path / "s.jsonl", [("reverse", "abc", "cba")])
+        monkeypatch.setattr(
+            _exporter, "_run_llama_completion", lambda gguf, prompt, max_tokens: "cba"
+        )
+
+        summary = _exporter.run_eval_model(str(gguf_file), suite_paths=[suite])
+
+        assert summary["model_dir"] == str(directory)
+        assert (directory / "eval.json").exists()
+        written = json.loads((directory / "eval.json").read_text(encoding="utf-8"))
+        assert written["target"] == "model"
+        assert written["total"] == 1
+
+    def test_directory_form_still_writes_eval_json_inside_the_directory(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Companion to the direct-file test above: the historical directory form's
+        ``model_dir``/``eval.json`` placement is unchanged.
+        """
+        directory = _model_dir(tmp_path, "gguf-dir-out", quantized=False)
+        (directory / "Model-Q4_K_M.gguf").write_bytes(b"GGUF")
+        suite = _eval_suite(tmp_path / "s.jsonl", [("reverse", "abc", "cba")])
+        monkeypatch.setattr(
+            _exporter, "_run_llama_completion", lambda gguf, prompt, max_tokens: "cba"
+        )
+
+        summary = _exporter.run_eval_model(str(directory), suite_paths=[suite])
+
+        assert summary["model_dir"] == str(directory)
+        assert (directory / "eval.json").exists()
