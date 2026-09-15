@@ -2,7 +2,7 @@
   "plan_slug": "lfm2-5-delivery-follow-ups-22",
   "schema_version": 2,
   "created": "2026-09-15T16:51:55Z",
-  "updated": "2026-09-15T17:08:21Z",
+  "updated": "2026-09-15T18:34:41Z",
   "deviations": [
     {
       "id": "d1",
@@ -31,6 +31,19 @@
       "status": "approved",
       "classification": "needs-follow-up",
       "seq": 2
+    },
+    {
+      "id": "d3",
+      "what": "qodo #2 on PR #25: t1's fail-closed CliError embedded the last 20 container lines in the message, which renders as ~22 lines and breaks the repo's two-line error:/hint: text contract (rubric). Fix: single-line message stating how many lines were captured and that they are on stderr (the tee already put them there); honesty condition h36's literal 'message contains the 40th line' is replaced by 'stderr contains the 40th line and the message is one line'.",
+      "task_ref": "t1",
+      "reason": "the rubric's two-line error contract outranks the literal h36 wording; the diagnostic content is preserved on stderr",
+      "affects": [
+        "h36"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "classification": "acceptable",
+      "seq": 3
     }
   ],
   "evidence": [],
