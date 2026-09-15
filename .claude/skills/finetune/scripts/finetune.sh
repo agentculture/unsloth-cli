@@ -2,23 +2,24 @@
 # finetune.sh — drive the validate → train → eval → export loop (/finetune skill).
 #
 # Portable wrapper around unsloth-cli's fine-tuning verbs. It resolves the
-# `sloth` CLI (installed console script first, then `uv run sloth` from the
-# repo checkout), orchestrates the loop, and propagates every exit code and
+# `sloth` CLI (`SLOTH_BIN` override first, then `uv run --project <dir> sloth`
+# from a walked-up unsloth-cli checkout, then the installed console script on
+# `PATH`), orchestrates the loop, and propagates every exit code and
 # `error:`/`hint:` line verbatim.
 #
 # Usage:
-#   finetune.sh run --config <run.toml> --suite <suite.jsonl> [--dry-run] [--json]
+#   finetune.sh run --config <run.toml> --suite <suite.jsonl | dir> [--dry-run] [--json]
 #                    [--export-format FMT] [--quant LIST]
 #   finetune.sh <verb> [args...]   # thin pass-through to `sloth <verb>`
 #   finetune.sh help
 
 set -euo pipefail
 
-# ── resolve the sloth CLI (installed tool first, then dev checkout) ───────────
+# ── resolve the sloth CLI (SLOTH_BIN override → dev checkout → PATH) ──────────
 SLOTH=()
 resolve_sloth() {
-    if command -v sloth >/dev/null 2>&1; then
-        SLOTH=(sloth)
+    if [ -n "${SLOTH_BIN:-}" ]; then
+        SLOTH=("$SLOTH_BIN")
         return 0
     fi
     # Dev fallback: inside an unsloth-cli checkout, run via uv.
@@ -35,6 +36,10 @@ resolve_sloth() {
         fi
         dir=$(dirname "$dir")
     done
+    if command -v sloth >/dev/null 2>&1; then
+        SLOTH=(sloth)
+        return 0
+    fi
     printf 'error: sloth CLI not found.\n' >&2
     printf 'hint: install it with: uv tool install unsloth-cli; the console script is sloth.\n' >&2
     return 1
@@ -46,7 +51,7 @@ usage() {
 finetune.sh — drive the validate → train → eval → export loop for unsloth-cli.
 
 Usage:
-  finetune.sh run --config <run.toml> --suite <suite.jsonl> [--dry-run] [--json]
+  finetune.sh run --config <run.toml> --suite <suite.jsonl | dir> [--dry-run] [--json]
                    [--export-format <fmt>] [--quant <list>]
   finetune.sh <verb> [args...]
   finetune.sh help
@@ -59,7 +64,7 @@ Commands:
 
 run flags:
   --config <run.toml>    TOML describing model, dataset, output, method. (required)
-  --suite <suite.jsonl>  Task-schema JSONL eval suite. (required)
+  --suite <suite.jsonl | dir>  Task-schema JSONL eval suite. (required)
   --dry-run              Validate + resolve the plan only; no GPU, no torch import.
   --json                 Forward --json to every sloth call (machine-readable output).
   --export-format <fmt>  Format for the export step: safetensors, merged-16bit,
@@ -108,21 +113,21 @@ cmd_run() {
             --config)
                 if [ $# -lt 2 ]; then
                     printf 'error: --config requires an argument.\n' >&2
-                    printf 'hint: finetune.sh run --config <run.toml> --suite <suite.jsonl> [--dry-run] [--json]\n' >&2
+                    printf 'hint: finetune.sh run --config <run.toml> --suite <suite.jsonl | dir> [--dry-run] [--json]\n' >&2
                     exit 1
                 fi
                 config="$2"; shift 2 ;;
             --suite)
                 if [ $# -lt 2 ]; then
                     printf 'error: --suite requires an argument.\n' >&2
-                    printf 'hint: finetune.sh run --config <run.toml> --suite <suite.jsonl> [--dry-run] [--json]\n' >&2
+                    printf 'hint: finetune.sh run --config <run.toml> --suite <suite.jsonl | dir> [--dry-run] [--json]\n' >&2
                     exit 1
                 fi
                 suite="$2"; shift 2 ;;
             --export-format)
                 if [ $# -lt 2 ]; then
                     printf 'error: --export-format requires an argument.\n' >&2
-                    printf 'hint: finetune.sh run --config <run.toml> --suite <suite.jsonl> --export-format <fmt>\n' >&2
+                    printf 'hint: finetune.sh run --config <run.toml> --suite <suite.jsonl | dir> --export-format <fmt>\n' >&2
                     exit 1
                 fi
                 export_format="$2"; shift 2 ;;
@@ -136,7 +141,7 @@ cmd_run() {
             --quant)
                 if [ $# -lt 2 ]; then
                     printf 'error: --quant requires an argument.\n' >&2
-                    printf 'hint: finetune.sh run --config <run.toml> --suite <suite.jsonl> --export-format gguf --quant <list>\n' >&2
+                    printf 'hint: finetune.sh run --config <run.toml> --suite <suite.jsonl | dir> --export-format gguf --quant <list>\n' >&2
                     exit 1
                 fi
                 quant="$2"; shift 2 ;;
@@ -155,12 +160,12 @@ cmd_run() {
 
     if [ -z "$config" ]; then
         printf 'error: --config is required.\n' >&2
-        printf 'hint: finetune.sh run --config <run.toml> --suite <suite.jsonl> [--dry-run] [--json]\n' >&2
+        printf 'hint: finetune.sh run --config <run.toml> --suite <suite.jsonl | dir> [--dry-run] [--json]\n' >&2
         exit 1
     fi
     if [ -z "$suite" ]; then
         printf 'error: --suite is required.\n' >&2
-        printf 'hint: finetune.sh run --config <run.toml> --suite <suite.jsonl> [--dry-run] [--json]\n' >&2
+        printf 'hint: finetune.sh run --config <run.toml> --suite <suite.jsonl | dir> [--dry-run] [--json]\n' >&2
         exit 1
     fi
 
