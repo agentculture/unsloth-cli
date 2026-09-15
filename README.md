@@ -83,7 +83,11 @@ adapter-only — it does not attempt the job silently.
 |------|--------------|
 | `sloth train` | Validate JSONL dataset → run LoRA/QLoRA adapter job → write run metadata |
 | `sloth eval` | Run an adapter against a small local eval suite (no network) |
-| `sloth export` | Convert an adapter to safetensors (servable by lobes, runnable by colleague) |
+| `sloth export` | Export an adapter — `safetensors`, `merged-16bit`, `merged-4bit`, `gguf`, `awq`, `nvfp4` (servable by lobes, runnable by colleague, or deployable per target — see [deployment targets](docs/fine-tuning.md#deployment-targets)) |
+
+`sloth export --format safetensors` (the default) is pure stdlib, no container.
+Every other format (`merged-16bit`, `merged-4bit`, `gguf`, `awq`, `nvfp4`) runs
+inside the same NGC container as `train`/`eval`.
 
 The `/finetune` skill drives the full loop non-interactively:
 validate dataset → `sloth train` → `sloth eval` → `sloth export`.

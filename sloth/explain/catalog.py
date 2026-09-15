@@ -276,35 +276,88 @@ emitted.
 _EXPORT = """\
 # unsloth-cli export
 
-Export a trained adapter to the canonical PEFT/safetensors layout that `lobes`
-can serve and `colleague` can run:
+Export a trained adapter to a servable model layout. Six formats, two lanes:
 
-    <output>/
-      adapter_config.json
-      adapter_model.safetensors
+- `safetensors` (default) — pure stdlib, **no container**. Copies/normalises the
+  adapter into the canonical PEFT layout that `lobes` can serve and `colleague`
+  can run:
 
-This is a pure stdlib file-system operation — no torch or ML runtime is loaded.
+      <output>/
+        adapter_config.json
+        adapter_model.safetensors
+        tokenizer.json / tokenizer_config.json / special_tokens_map.json /
+        vocab.json / merges.txt / tokenizer.model   # copied when present
+
+  Nothing is loaded or converted — unsloth/PEFT already write these files in
+  safetensors format during training, so this lane only reorganises and
+  validates file-system artefacts. No torch import, no container launch.
+
+- `merged-16bit`, `merged-4bit`, `gguf`, `awq`, `nvfp4` — **host→container**.
+  These genuinely need the ML stack (base-model load, merge, ggml conversion,
+  llm-compressor one-shot quantization), so the host side validates everything
+  cheaply and hands off to the NGC container (same pattern as `sloth train` /
+  `sloth eval`). Safety rails: **no-clobber** (a non-empty `--output` is
+  refused unless `--force`), **atomic output** (the container writes to
+  `<output>.partial` and the host renames it to `<output>` only after a clean
+  exit, so a killed/OOM run never leaves a half-written model directory), and
+  a **fail-closed disk check** (the estimated artifact size is compared
+  against free space under `--output` before any GPU spend; `--dry-run`
+  reports both numbers instead of failing).
+
 When `--output` is omitted (or resolves to the adapter directory itself), the
-adapter is normalised in place. Only the `safetensors` format is supported today.
+adapter is normalised in place.
 
 ## Usage
 
     unsloth-cli export --adapter adapters/qwen3-4b-qlora
     unsloth-cli export --adapter adapters/qwen3-4b-qlora --output exported/qwen3-4b
-    unsloth-cli export --adapter adapters/qwen3-4b-qlora --json
+    unsloth-cli export --adapter adapters/qwen3-4b-qlora --format gguf \\
+        --quant q4_k_m --output exported/qwen3-4b-gguf
+    unsloth-cli export --adapter adapters/qwen3-4b-qlora --format awq \\
+        --calib data/calib.jsonl --output exported/qwen3-4b-awq
+    unsloth-cli export --adapter adapters/qwen3-4b-qlora --format nvfp4 \\
+        --output exported/qwen3-4b-nvfp4
+    unsloth-cli export --adapter adapters/qwen3-4b-qlora --dry-run --json
 
 ## Key flags
 
 - `--adapter DIR` (required) — adapter directory to export.
-- `--format FMT` — output format (default: `safetensors`).
+- `--format FMT` — one of `safetensors`, `merged-16bit`, `merged-4bit`, `gguf`,
+  `awq`, `nvfp4` (default: `safetensors`).
 - `--output DIR` — output directory (default: normalise in place inside `--adapter`).
+- `--quant LIST` — comma-separated ggml quantizations for `--format gguf`
+  (e.g. `q4_k_m,q8_0`); ignored (with a diagnostic) for other formats.
+- `--calib PATH` — JSONL calibration data for `--format awq`/`nvfp4` (default:
+  the run's training dataset); ignored (with a diagnostic) for other formats.
+- `--calib-samples N` — cap the number of calibration samples used for `awq`/`nvfp4`.
+- `--base ID` — base model id (default: read from the adapter's
+  `adapter_config.json` `base_model_name_or_path`); required for the
+  container formats when it cannot be resolved.
+- `--force` — overwrite a non-empty `--output` directory (container lane only).
+- `--dry-run` — resolve and print the export plan (format, base, disk estimate,
+  and the exact docker command for container formats) without exporting or
+  launching anything.
+- `--keep-intermediate` — keep intermediate artifacts (e.g. the F16 GGUF)
+  instead of deleting them.
 - `--json` — emit the export result (output dir, format, files) as structured JSON.
+
+## Container vs. no-container
+
+- **No container:** `--format safetensors` only. Pure stdlib, instant, no GPU.
+- **Container (NGC, same image as `train`/`eval`):** `merged-16bit`,
+  `merged-4bit`, `gguf`, `awq`, `nvfp4`. Host validates cheaply, then launches
+  `nvcr.io/nvidia/pytorch:25.11-py3` with identity bind-mounts for the parents
+  of the adapter/output/calibration paths, forwarding the same args plus a
+  hidden `--in-container` recursion guard.
 
 ## Exit codes
 
 - `0` success
-- `1` user-input error (missing adapter dir, unsupported format)
-- `2` environment / setup error
+- `1` user-input error (missing/incomplete adapter dir, unsupported `--format`,
+  bad `--quant`, missing calibration file, non-empty `--output` without
+  `--force`)
+- `2` environment / setup error (container exits non-zero, insufficient disk
+  space under `--output`)
 """
 
 

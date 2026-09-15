@@ -8,6 +8,7 @@
 #
 # Usage:
 #   finetune.sh run --config <run.toml> --suite <suite.jsonl> [--dry-run] [--json]
+#                    [--export-format FMT] [--quant LIST]
 #   finetune.sh <verb> [args...]   # thin pass-through to `sloth <verb>`
 #   finetune.sh help
 
@@ -46,6 +47,7 @@ finetune.sh — drive the validate → train → eval → export loop for unslot
 
 Usage:
   finetune.sh run --config <run.toml> --suite <suite.jsonl> [--dry-run] [--json]
+                   [--export-format <fmt>] [--quant <list>]
   finetune.sh <verb> [args...]
   finetune.sh help
 
@@ -60,12 +62,17 @@ run flags:
   --suite <suite.jsonl>  Task-schema JSONL eval suite. (required)
   --dry-run              Validate + resolve the plan only; no GPU, no torch import.
   --json                 Forward --json to every sloth call (machine-readable output).
+  --export-format <fmt>  Format for the export step: safetensors, merged-16bit,
+                          merged-4bit, gguf, awq, nvfp4 (default: safetensors).
+                          Forwarded to `sloth export --format <fmt>`.
+  --quant <list>         Comma-separated ggml quantizations for --export-format gguf
+                          (e.g. q4_k_m,q8_0). Forwarded to `sloth export --quant <list>`.
 
 Loop steps (run without --dry-run):
-  step 1/4  sloth train --config <c> --dry-run   validate + plan (GPU-free, always)
-  step 2/4  sloth train --config <c>             real training (GPU required)
-  step 3/4  sloth eval  --adapter <out> --suite  eval the adapter
-  step 4/4  sloth export --adapter <out>         export to safetensors
+  step 1/4  sloth train --config <c> --dry-run          validate + plan (GPU-free, always)
+  step 2/4  sloth train --config <c>                    real training (GPU required)
+  step 3/4  sloth eval  --adapter <out> --suite          eval the adapter
+  step 4/4  sloth export --adapter <out> --format <fmt>  export (safetensors: host; else container)
 
 With --dry-run: only step 1 runs; exits 0 on success, surfacing the resolved plan.
 The loop stops on the first non-zero exit code, forwarding the CLI's error:/hint:.
@@ -81,6 +88,9 @@ Examples:
   # Full end-to-end run with JSON output:
   finetune.sh run --config run.toml --suite eval.jsonl --json
 
+  # Full run exporting a gguf instead of safetensors:
+  finetune.sh run --config run.toml --suite eval.jsonl --export-format gguf --quant q4_k_m
+
   # Drive eval alone (pass-through):
   finetune.sh eval --adapter adapters/my-lora --suite eval.jsonl --json
 EOF
@@ -89,6 +99,7 @@ EOF
 # ── orchestrated loop ──────────────────────────────────────────────────────────
 cmd_run() {
     local config="" suite="" dry_run=false json_flag=false
+    local export_format="safetensors" quant=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -106,6 +117,20 @@ cmd_run() {
                     exit 1
                 fi
                 suite="$2"; shift 2 ;;
+            --export-format)
+                if [ $# -lt 2 ]; then
+                    printf 'error: --export-format requires an argument.\n' >&2
+                    printf 'hint: finetune.sh run --config <run.toml> --suite <suite.jsonl> --export-format <fmt>\n' >&2
+                    exit 1
+                fi
+                export_format="$2"; shift 2 ;;
+            --quant)
+                if [ $# -lt 2 ]; then
+                    printf 'error: --quant requires an argument.\n' >&2
+                    printf 'hint: finetune.sh run --config <run.toml> --suite <suite.jsonl> --export-format gguf --quant <list>\n' >&2
+                    exit 1
+                fi
+                quant="$2"; shift 2 ;;
             --dry-run)
                 dry_run=true; shift ;;
             --json)
@@ -177,9 +202,16 @@ cmd_run() {
     printf 'step 3/4  eval\n' >&2
     "${SLOTH[@]}" eval --adapter "$adapter_dir" --suite "$suite" "${json_arg[@]}" || exit $?
 
-    # Step 4: Export to safetensors.
-    printf 'step 4/4  export → safetensors\n' >&2
-    "${SLOTH[@]}" export --adapter "$adapter_dir" --format safetensors "${json_arg[@]}" || exit $?
+    # Step 4: Export. --export-format defaults to safetensors (host, no GPU);
+    # any other format runs inside the NGC container. --quant is forwarded
+    # only when given — sloth export applies it to --format gguf only.
+    local export_arg=()
+    if [ -n "$quant" ]; then
+        export_arg=(--quant "$quant")
+    fi
+    printf 'step 4/4  export → %s\n' "$export_format" >&2
+    "${SLOTH[@]}" export --adapter "$adapter_dir" --format "$export_format" \
+        "${export_arg[@]}" "${json_arg[@]}" || exit $?
 
     printf 'done: adapter at %s\n' "$adapter_dir" >&2
 }

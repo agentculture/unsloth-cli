@@ -47,10 +47,38 @@ exact-match. Fully local — no network. Returns
 
 ### `sloth export --adapter DIR --output OUT`
 
-Pure stdlib, no GPU/container. Validates the adapter has the canonical PEFT files
-and emits a standard `safetensors` layout (adapter weights + tokenizer) that
-[lobes](https://github.com/agentculture/lobes-cli) can serve and
-[colleague](https://github.com/agentculture/colleague) can run as a backend.
+Exports a trained adapter to one of **six formats** (`--format FMT`, default
+`safetensors`). Only `safetensors` is host-only pure stdlib; every other format
+launches the NGC container (the same image `train`/`eval` use):
+
+| Format | Lane | What it produces |
+|--------|------|-------------------|
+| `safetensors` (default) | host, pure stdlib, no GPU | Canonical PEFT adapter layout (`adapter_config.json`, `adapter_model.safetensors`, tokenizer files) — servable by [lobes](https://github.com/agentculture/lobes-cli), runnable by [colleague](https://github.com/agentculture/colleague). |
+| `merged-16bit` | container | Base model + adapter merged into a single bf16 checkpoint. |
+| `merged-4bit` | container | Base model + adapter merged into a 4-bit checkpoint. |
+| `gguf` | container | ggml-quantized GGUF via `--quant` (comma-separated, e.g. `q4_k_m,q8_0`; the full allowlist is in `sloth explain export`). |
+| `awq` | container | W4A16 llm-compressor one-shot quantization; takes `--calib`/`--calib-samples` (default calibration: the run's training dataset). |
+| `nvfp4` | container | NVFP4 llm-compressor one-shot quantization; same `--calib`/`--calib-samples` as `awq`. |
+
+Container-lane safety rails: **no-clobber** (a non-empty `--output` needs
+`--force`), **atomic output** (writes to `<output>.partial`, renamed to
+`<output>` only on a clean exit — a killed/OOM run never leaves a
+half-written model directory), and a **fail-closed disk check** (estimated
+artifact size vs. free space under `--output`, checked before any GPU spend;
+`--dry-run` reports both numbers instead of failing). See measured export
+sizes in [`benchmarks.md`](benchmarks.md).
+
+```bash
+sloth export --adapter runs/qlora-smoke --output runs/qlora-smoke-export                       # safetensors (default), no GPU
+sloth export --adapter runs/qlora-smoke --format gguf --quant q4_k_m --output runs/export-gguf  # container
+sloth export --adapter runs/qlora-smoke --format awq --output runs/export-awq                   # container
+sloth export --adapter runs/qlora-smoke --format nvfp4 --output runs/export-nvfp4                # container
+sloth export --adapter runs/qlora-smoke --format gguf --dry-run --json                           # plan only, no GPU
+```
+
+Exit codes: `0` success; `1` user-input error (missing/incomplete adapter,
+unsupported `--format`, bad `--quant`, non-empty `--output` without `--force`);
+`2` environment error (container exits non-zero, insufficient disk space).
 
 ## Dataset schemas
 
@@ -131,6 +159,12 @@ QLoRA bnb-4bit and bf16 LoRA on Qwen3-1.7B on GB10/Spark (2026-06-26).
 | Orin | `gguf`, `awq W4A16` | not yet — an explicit gap in [`tested.md`](tested.md) |
 | Thor | `nvfp4` | not yet — an explicit gap in [`tested.md`](tested.md) |
 | Spark | `nvfp4`; `bf16 + LoRA via lobes hand` | `bf16` LoRA on Qwen3-1.7B (2026-06-26, [`tested.md`](tested.md)) |
+
+Every target format above is produced by `sloth export --format <fmt>` (see
+[`sloth export --adapter DIR --output OUT`](#sloth-export---adapter-dir---output-out)
+above for the full format table and flags); `merged-16bit` is the `bf16` row's
+`--format`. Measured export sizes for these formats are in
+[`benchmarks.md`](benchmarks.md).
 
 ## The `/finetune` skill
 
