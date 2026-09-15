@@ -1,0 +1,39 @@
+{
+  "plan_slug": "lfm2-5-target-modules-quantized-export",
+  "schema_version": 2,
+  "created": "2026-09-15T11:22:08Z",
+  "updated": "2026-09-15T11:22:08Z",
+  "deviations": [
+    {
+      "id": "d1",
+      "what": "t3's scope extended to sloth/tune/metadata.py + tests/test_tune_metadata.py so training_metadata.json records the dataset path (dataset.path) alongside sha256/line_count",
+      "task_ref": "t3",
+      "reason": "t7 found the metadata writer never stores the dataset path, so requirement c31's default calibration source (the run's training dataset) could not be resolved by the exporter; no plan task owned metadata.py",
+      "affects": [
+        "t3",
+        "t9",
+        "t7"
+      ],
+      "origin": "llm",
+      "status": "approved",
+      "classification": "acceptable",
+      "seq": 1
+    },
+    {
+      "id": "d2",
+      "what": "t12 reassigned from colleague (lobes cortex) to a claude sonnet subagent at the user's request after t5 needed a manual --continue nudge to execute",
+      "task_ref": "t12",
+      "reason": "user decision 2026-09-15: move t12 to sonnet",
+      "affects": [
+        "t12"
+      ],
+      "origin": "user",
+      "status": "approved",
+      "classification": "acceptable",
+      "seq": 2
+    }
+  ],
+  "evidence": [],
+  "deltas": [],
+  "supersessions": []
+}

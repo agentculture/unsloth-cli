@@ -5,7 +5,7 @@
   "schema_version": 5,
   "status": "exported",
   "created": "2026-09-15T10:02:14Z",
-  "updated": "2026-09-15T10:10:37Z",
+  "updated": "2026-09-15T10:28:15Z",
   "targets": [
     {
       "id": "c1",
@@ -694,6 +694,14 @@
       "text": "Disk estimate uses a parameter-count heuristic; a wrong count under-estimates and the fail-closed check passes when it should not \u2014 t13 compares estimated_bytes to measured sizes and tightens the constants",
       "kind": "unknown_nonblocking",
       "task_id": "t7",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r7",
+      "text": "t9 encoded four call-signature inferences that no probe measured: llmcompressor.oneshot(dataset=<list of dicts>) vs a datasets.Dataset (the probe used Dataset.from_list); AWQMapping positional (smooth_layer, balance_layers); FastModel.from_pretrained(model_name=<adapter dir>) as the base+adapter loader for merging; and the exact 're:' regex flavour of the per-layer LFM2 mapping strings. t13's first live run must confirm or correct each; a correction is a /deviate record, not a silent edit",
+      "kind": "unknown_nonblocking",
+      "task_id": "t13",
       "resolved": false,
       "resolution": ""
     }

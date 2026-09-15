@@ -26,7 +26,7 @@ Edit the Owner/Model columns before approving gate 2 — the default Model is a 
 | `t10` | claude subagent | sonnet |
 | `t4` | claude subagent | opus |
 | `t11` | claude subagent | opus |
-| `t12` | colleague | lobes cortex (Qwen3.8-27B-NVFP4) |
+| `t12` | claude subagent | sonnet |
 | `t6` | fork of the main session | fable |
 | `t13` | fork of the main session | fable |
 
