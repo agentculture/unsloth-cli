@@ -9,7 +9,7 @@ Companion pages: [`benchmarks.md`](benchmarks.md) (the numbers),
 [`dgx-spark.md`](dgx-spark.md) (how/why), [`fine-tuning.md`](fine-tuning.md) (the
 feature reference).
 
-## Common environment (every run below)
+## Common environment (the Spark runs; every run below unless a row names another device)
 
 | Component | Value |
 |-----------|-------|
@@ -25,6 +25,9 @@ feature reference).
 | Train hyperparameters | `batch_size=1`, `grad_accum=4`, `max_seq_len=1024`, `lora_r=8`, `lora_alpha=16`, `max_steps=10`, `seed=3407` |
 | Train dataset | `examples/chat-smoke.jsonl` (10 lines, **chat** schema) |
 | Eval suite | `examples/eval-suite.jsonl` (4 items, **task** schema) |
+
+Rows below inherit this Spark environment except where a row's own columns name
+a different device — e.g. the Thor serving row in the follow-ups #22 section.
 
 ## ✅ Tested — passed
 
@@ -154,10 +157,14 @@ identical, but they have **not** been run on hardware.
 
 ### Platform
 
-- Only **GB10 (Blackwell, aarch64)** + **NGC 25.11 / torch 2.10**. No other GPU,
-  arch, driver, or container image was tested. `--gpus all` worked via **CDI**
-  (Docker default runtime `runc`); a host requiring the `nvidia` runtime was not
-  tested.
+- Training and eval ran only on **GB10 (Blackwell, aarch64)** + **NGC 25.11 /
+  torch 2.10**. `--gpus all` worked via **CDI** (Docker default runtime `runc`);
+  a host requiring the `nvidia` runtime was not tested.
+- The only *other* device tested is **NVIDIA Thor** (JetPack R38.2.2, L4T
+  6.8.12-tegra, driver 580.00, `vllm/vllm-openai:v0.29.0-aarch64`), and only for
+  **serving** the LFM2.5 `awq`/`nvfp4` exports (follow-ups #22) — not for
+  training or eval. **Orin Nano is still untested** — tracked in
+  [#23](https://github.com/agentculture/unsloth-cli/issues/23).
 
 ## How to extend this matrix
 

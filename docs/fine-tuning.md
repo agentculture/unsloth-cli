@@ -163,8 +163,10 @@ Ready-to-run configs: [`examples/qlora-smoke.toml`](../examples/qlora-smoke.toml
 ## Deployment targets
 
 Target formats per deployment platform. Coverage is honest — see
-[`tested.md`](tested.md): the only formats live-tested on hardware so far are
-QLoRA bnb-4bit and bf16 LoRA on Qwen3-1.7B on GB10/Spark (2026-06-26).
+[`tested.md`](tested.md): the formats live-tested on hardware so far are QLoRA
+bnb-4bit and bf16 LoRA on Qwen3-1.7B on GB10/Spark (2026-06-26), plus LFM2.5-1.2B
+`awq`/`nvfp4` **serving** (not training) on Thor (JetPack R38.2.2,
+follow-ups #22, 2026-09-15).
 
 | Platform | Target format(s) | Live-tested |
 |----------|------------------|-------------|
