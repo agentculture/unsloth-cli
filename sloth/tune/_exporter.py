@@ -82,6 +82,9 @@ _INTERMEDIATE_TAGS: frozenset[str] = frozenset({"f16", "bf16", "f32"})
 #: live-measured). 512 matches the probe run that validated AWQ/NVFP4 on LFM2.5.
 CALIB_MAX_SEQ_LENGTH: int = 512
 
+#: PEFT adapter config filename (read for the base id, rewritten for a --base override).
+ADAPTER_CONFIG_NAME: str = "adapter_config.json"
+
 # Below this many calibration rows the quantisation scales get noisy; warn once.
 MIN_CALIBRATION_SAMPLES = 64
 
@@ -353,7 +356,7 @@ def _adapter_for_base(plan: dict[str, Any], output: Path) -> str:
     """
     adapter = Path(plan["adapter"])
     base = plan.get("base")
-    config_path = adapter / "adapter_config.json"
+    config_path = adapter / ADAPTER_CONFIG_NAME
     try:
         config = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -365,13 +368,20 @@ def _adapter_for_base(plan: dict[str, Any], output: Path) -> str:
         shutil.rmtree(staged)
     staged.mkdir(parents=True)
     for entry in adapter.iterdir():
-        if entry.name == "adapter_config.json" or entry.name.startswith("_"):
+        if entry.name == ADAPTER_CONFIG_NAME or entry.name.startswith("_"):
             continue
         if entry.is_file():
             os.symlink(entry.resolve(), staged / entry.name)
     config["base_model_name_or_path"] = base
-    (staged / "adapter_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+    (staged / ADAPTER_CONFIG_NAME).write_text(json.dumps(config, indent=2), encoding="utf-8")
     return str(staged)
+
+
+def _drop_override_staging(output: Path, *, keep_intermediate: bool) -> None:
+    """Remove the ``--base`` override staging dir after an export (unless kept)."""
+    staged = output / "_adapter-override"
+    if staged.exists() and not keep_intermediate:
+        shutil.rmtree(staged, ignore_errors=True)
 
 
 def _load_adapter(
@@ -736,9 +746,7 @@ def run_export(plan: dict[str, Any]) -> dict[str, Any]:
             ) from exc
         raise
 
-    staged_override = output / "_adapter-override"
-    if staged_override.exists() and not plan.get("keep_intermediate"):
-        shutil.rmtree(staged_override, ignore_errors=True)
+    _drop_override_staging(output, keep_intermediate=bool(plan.get("keep_intermediate")))
     export_json, record = _write_export_json(plan, output, calibration)
     final_output = plan.get("final_output") or str(output)
     return {
@@ -998,7 +1006,12 @@ def _continuation(sequence: Any, inputs: Any) -> Any:
     """Slice the generated continuation off a ``generate()`` output row."""
     ids = inputs["input_ids"] if isinstance(inputs, dict) else getattr(inputs, "input_ids", None)
     shape = getattr(ids, "shape", None)
-    prompt_len = int(shape[-1]) if shape is not None else (len(ids) if ids is not None else 0)
+    if shape is not None:
+        prompt_len = int(shape[-1])
+    elif ids is not None:
+        prompt_len = len(ids)
+    else:
+        prompt_len = 0
     try:
         return sequence[prompt_len:]
     except TypeError:
