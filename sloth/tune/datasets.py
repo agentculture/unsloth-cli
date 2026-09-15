@@ -283,3 +283,93 @@ def validate_dataset(
         )
 
     return records
+
+
+# ---------------------------------------------------------------------------
+# Suite validation (file-or-directory) — shared by ``sloth eval`` and
+# ``sloth validate --suite``
+# ---------------------------------------------------------------------------
+
+
+def resolve_suite_paths(path: str | os.PathLike) -> list[Path]:
+    """Expand *path* into a sorted list of ``.jsonl`` file paths.
+
+    *path* may be a single file (returned as a one-element list) or a
+    directory, whose ``*.jsonl`` children are returned sorted (for a
+    deterministic, reproducible file order).
+
+    Raises
+    ------
+    CliError(code=1)
+        When *path* does not exist, or is a directory holding no ``.jsonl``
+        files.
+    """
+    suite_path = Path(path)
+    if suite_path.is_dir():
+        files = sorted(suite_path.glob("*.jsonl"))
+        if not files:
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=f"no *.jsonl files found in suite directory: {suite_path}",
+                remediation=(
+                    "Add at least one .jsonl file to the directory, or pass "
+                    "--suite <file.jsonl> directly."
+                ),
+            )
+        return files
+    if suite_path.is_file():
+        return [suite_path]
+    raise CliError(
+        code=EXIT_USER_ERROR,
+        message=f"suite path not found: {suite_path}",
+        remediation=(
+            "Pass an existing .jsonl file, or a directory containing .jsonl "
+            "files, with --suite <path>."
+        ),
+    )
+
+
+def validate_suite(path: str | os.PathLike, schema: str = "task") -> dict[str, object]:
+    """Validate every ``.jsonl`` file under *path* (a single file or a directory).
+
+    Reuses :func:`validate_dataset` per resolved file — the exact same rules
+    ``sloth train``/``sloth eval`` apply — so a failure names both the
+    offending file and the line within it. Used by both ``sloth eval``
+    (pre-launch host validation) and ``sloth validate --suite``.
+
+    Parameters
+    ----------
+    path:
+        A single ``.jsonl`` file, or a directory of them.
+    schema:
+        ``"chat"`` or ``"task"`` (default ``"task"`` — the eval-suite schema).
+
+    Returns
+    -------
+    dict
+        ``{"files": [{"path": str, "line_count": int}, ...], "total_records": int}``,
+        one entry per resolved file in sorted order.
+
+    Raises
+    ------
+    CliError(code=1)
+        On the first file/line that fails validation, or when *path* resolves
+        to no files at all.
+    """
+    files = resolve_suite_paths(path)
+    reported: list[dict[str, object]] = []
+    total = 0
+    for file_path in files:
+        try:
+            records = validate_dataset(file_path, schema)
+        except CliError as exc:
+            # Re-raise with the file name prepended so a directory suite's
+            # failure names both the offending file and the line within it.
+            raise CliError(
+                code=exc.code,
+                message=f"{file_path}: {exc.message}",
+                remediation=exc.remediation,
+            ) from exc
+        reported.append({"path": str(file_path), "line_count": len(records)})
+        total += len(records)
+    return {"files": reported, "total_records": total}
