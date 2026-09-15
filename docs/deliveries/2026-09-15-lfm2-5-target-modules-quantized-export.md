@@ -106,7 +106,7 @@ Quoted verbatim from the `devague summary` skeleton:
 | user paths are canonicalised and allow-listed (Sonar S2083/S6549) | high | commit `f73ee3d` · tests `tests/test_cmd_export.py::test_adapter_outside_allowed_roots_is_rejected` — Sonar re-scan pending at time of writing |
 | CI coverage ≥ 60 % and rubric gate green | high | PR #20 checks `lint`, `test` (pytest) green; SonarCloud gate pending re-scan |
 
-Lapse ledger: `l1` approved caps the accuracy claim at `low`; `l2` (t9 tests after code) and `l3` (t7 assumed the metadata path) are proposed and pending, cited above as context only.
+Lapse ledger: `l1` approved caps the accuracy claim at `low` (superseded 2026-09-15 by the per-format table in `docs/benchmarks.md`, follow-ups #22 — which measures 0/46 exact-match on every format for the smoke adapter, so the cap stands until a trained adapter is scored); `l2` (t9 tests after code) and `l3` (t7 assumed the metadata path) are proposed and pending, cited above as context only.
 
 ## Remaining Work / Follow-up
 

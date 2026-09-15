@@ -2,7 +2,7 @@
   "plan_slug": "lfm2-5-delivery-follow-ups-22",
   "schema_version": 2,
   "created": "2026-09-15T16:51:55Z",
-  "updated": "2026-09-15T17:08:21Z",
+  "updated": "2026-09-15T17:19:02Z",
   "deviations": [
     {
       "id": "d1",
@@ -31,6 +31,19 @@
       "status": "approved",
       "classification": "needs-follow-up",
       "seq": 2
+    },
+    {
+      "id": "d3",
+      "what": "t9's docs/tested.md rows were committed on the same integration branch as the PR-A code (feat/follow-ups-22-a) instead of being held for PR B; PR A therefore ships with its own live evidence, and PR B carries t10 (benchmarks, Thor) + t11 (closeout) only.",
+      "task_ref": "t11",
+      "reason": "the live rows are the proof that PR A's stdout/export changes work; splitting them off would ship PR A unverified",
+      "affects": [
+        "c4"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "classification": "acceptable",
+      "seq": 3
     }
   ],
   "evidence": [],

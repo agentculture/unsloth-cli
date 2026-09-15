@@ -5,7 +5,7 @@
   "schema_version": 5,
   "status": "exported",
   "created": "2026-09-15T10:02:14Z",
-  "updated": "2026-09-15T12:51:14Z",
+  "updated": "2026-09-15T17:37:11Z",
   "targets": [
     {
       "id": "c1",
@@ -654,32 +654,32 @@
       "text": "unsloth / unsloth_zoo / bitsandbytes are installed unpinned (--no-deps) in the container; the live probes ran on 2026.9.4 while docs cite 2026.6.9 \u2014 decide whether t8 pins them (recommended: pin to the version validated in t6/t13)",
       "kind": "unknown_nonblocking",
       "task_id": "t8",
-      "resolved": false,
-      "resolution": ""
+      "resolved": true,
+      "resolution": "Pinned in PR #25 (follow-ups #22, t8): unsloth==2026.9.4 unsloth_zoo==2026.9.3 bitsandbytes==0.50.2, measured in-container; bump path in docs/dgx-spark.md."
     },
     {
       "id": "r2",
       "text": "The torch.accelerator.get_memory_info shim exists only because NGC 25.11 ships torch 2.10; when the image moves to torch>=2.11 the shim test (t9) must flip to 'skipped' and the shim be deleted",
       "kind": "follow_up",
       "task_id": "t9",
-      "resolved": false,
-      "resolution": ""
+      "resolved": true,
+      "resolution": "Deliberately kept (follow-ups frame non-goal c20): the shim stays until NGC ships torch >= 2.11; tracked as frame park v4, not scheduled."
     },
     {
       "id": "r3",
       "text": "QLoRA-trained (4-bit) adapters were not merged in the probes; Unsloth's dequantize-then-merge path is unmeasured until t13 runs a qlora example",
       "kind": "unknown_nonblocking",
       "task_id": "t13",
-      "resolved": false,
-      "resolution": ""
+      "resolved": true,
+      "resolution": "Measured 2026-09-15 (follow-ups t9, docs/tested.md): runs/qlora-smoke (bnb-4bit base) \u2192 merged-16bit gave a 3.44 GB bf16 model with no quantization_config; Unsloth dequantises implicitly."
     },
     {
       "id": "r4",
       "text": "Qwen3 through awq/nvfp4/gguf is unmeasured (all probes were LFM2.5); llm-compressor default mappings should fit Qwen3 but the GQA v->o pair may need the same skip",
       "kind": "unknown_nonblocking",
       "task_id": "t13",
-      "resolved": false,
-      "resolution": ""
+      "resolved": true,
+      "resolution": "Measured 2026-09-15 (follow-ups t9): Qwen3-1.7B \u2192 awq/nvfp4/gguf all pass; awq with llm-compressor's inferred defaults, 28 GQA v\u2192o mappings auto-skipped, no custom mapping needed."
     },
     {
       "id": "r5",
@@ -710,24 +710,24 @@
       "text": "t11 inferences unverified until t13: llama-completion may or may not echo the prompt (a startswith strip guards it); eval --model picks the first *.gguf alphabetically when a dir holds several (a kept F16 intermediate would win over Q4_K_M) \u2014 t13 must evaluate a clean gguf dir or add a selector",
       "kind": "unknown_nonblocking",
       "task_id": "t13",
-      "resolved": false,
-      "resolution": ""
+      "resolved": true,
+      "resolution": "Shipped in PR #25 (follow-ups t4/t5): multi-GGUF dirs fail closed with a hint, and eval --quant <name> selects one case-insensitively; continuation-only scoring live-verified (t9 eval row)."
     },
     {
       "id": "r9",
       "text": "the /finetune skill's resolve_sloth prefers any 'sloth' on PATH over the checkout it lives in; on this box PATH has an editable install of a different worktree (unsloth-cli-worktrees/spec-291, metadata 0.5.0), so the first run-mode validation exercised that branch's code and its export rejected --quant. Decide whether the skill should prefer 'uv run --project <its own repo>' when invoked from inside a checkout",
       "kind": "follow_up",
       "task_id": "t13",
-      "resolved": false,
-      "resolution": ""
+      "resolved": true,
+      "resolution": "Shipped in PR #25 (follow-ups t3): resolver order SLOTH_BIN \u2192 own checkout via uv run --project \u2192 PATH, one test per branch."
     },
     {
       "id": "r10",
       "text": "in-container trl/transformers training progress dicts ({'loss': ...}) are printed to stdout and pass through the shipped host path, so 'sloth train --json' stdout is not pure JSON (pre-existing; observed in the skill run-mode log). Route trainer logging to stderr or suppress it",
       "kind": "follow_up",
       "task_id": "t13",
-      "resolved": false,
-      "resolution": ""
+      "resolved": true,
+      "resolution": "Shipped in PR #25 (follow-ups t1/t2): container.launch tees to stderr and returns the JSON result; live train/eval/export --json each give exactly 1 stdout line (docs/tested.md follow-ups section)."
     }
   ],
   "obligations": []
