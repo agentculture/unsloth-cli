@@ -1045,7 +1045,8 @@ def test_export_launch_kwargs_env_and_mounts_passed_through(
     assert cmd_export(args) == 0
 
     _, kwargs = fake.calls[0]
-    assert kwargs["env"] == [("UNSLOTH_LLAMA_TAG", "b10909"), ("HOME", "/root")]
+    assert kwargs["env"][:2] == [("UNSLOTH_LLAMA_TAG", "b10909"), ("HOME", "/root")]
+    assert kwargs["env"][2][0] == export_mod.ALLOWED_ROOTS_ENV  # d2 allow-list appended last
     mounts = kwargs["extra_mounts"]
     assert (str(cache), str(cache)) in mounts
     targets = [target for _host, target in mounts]
@@ -1067,7 +1068,8 @@ def test_missing_export_launch_kwargs_is_tolerated(
     # gguf: a non-calibrated format, so no --calib / training dataset is required.
     args = _make_args(adapter=str(adapter), format="gguf", output=str(tmp_path / "o"))
     assert cmd_export(args) == 0
-    assert "env" not in fake.calls[0][1]
+    env = dict(fake.calls[0][1]["env"])
+    assert set(env) == {export_mod.ALLOWED_ROOTS_ENV}  # only the d2 allow-list, no export home
 
 
 # ---------------------------------------------------------------------------
@@ -1322,3 +1324,55 @@ def test_params_from_config_tolerates_malformed_optional_fields() -> None:
 def test_compressed_estimate_covers_the_merged_intermediate() -> None:
     assert export_mod.BYTES_PER_PARAM["awq"] > export_mod.BYTES_PER_PARAM["merged-16bit"]
     assert export_mod.BYTES_PER_PARAM["nvfp4"] > export_mod.BYTES_PER_PARAM["merged-16bit"]
+
+
+# ---------------------------------------------------------------------------
+# Deviation d2 (follow-ups #22): the in-container run must pass the path sanitizer
+# ---------------------------------------------------------------------------
+
+
+def test_container_kwargs_forward_allowed_roots_env(tmp_path: Path) -> None:
+    """The identity-mounted parents are forwarded as SLOTH_ALLOWED_ROOTS."""
+    from sloth.tune import container as container_mod
+
+    adapter = tmp_path / "runs" / "lora"
+    output = tmp_path / "exports" / "merged"
+    calib = tmp_path / "data" / "calib.jsonl"
+    kwargs = export_mod._container_kwargs(container_mod, adapter, output, calib)
+    env = dict(kwargs["env"])
+    roots = env[export_mod.ALLOWED_ROOTS_ENV].split(os.pathsep)
+    assert set(roots) == {str(adapter.parent), str(output.parent), str(calib.parent)}
+    # The export home + llama.cpp tag from export_launch_kwargs survive the merge.
+    assert "HOME" in env
+
+
+def test_sanitize_path_accepts_forwarded_root_outside_cwd_and_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Simulate the in-container view: cwd=/workspace-like, HOME elsewhere, tmp elsewhere.
+
+    Without the forwarded allow-list the host adapter path is rejected; with it the
+    same path passes — the exact failure the live t9 run hit.
+    """
+    workspace = tmp_path / "workspace"
+    home = tmp_path / "home"
+    other_tmp = tmp_path / "othertmp"
+    hub = tmp_path / "hub"
+    host_runs = tmp_path / "host" / "runs"
+    for d in (workspace, home, other_tmp, hub, host_runs / "lora"):
+        d.mkdir(parents=True)
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(export_mod.tempfile, "gettempdir", lambda: str(other_tmp))
+    monkeypatch.setattr(export_mod, "_hf_hub_root", lambda: hub)
+    monkeypatch.delenv(export_mod.ALLOWED_ROOTS_ENV, raising=False)
+
+    with pytest.raises(CliError) as excinfo:
+        export_mod._sanitize_path(str(host_runs / "lora"), "--adapter")
+    assert "outside the allowed roots" in excinfo.value.message
+
+    monkeypatch.setenv(export_mod.ALLOWED_ROOTS_ENV, str(host_runs))
+    assert (
+        export_mod._sanitize_path(str(host_runs / "lora"), "--adapter")
+        == (host_runs / "lora").resolve()
+    )

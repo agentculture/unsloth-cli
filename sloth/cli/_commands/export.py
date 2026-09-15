@@ -683,6 +683,13 @@ def _container_kwargs(
     for key, value in supplied.items():
         if key != "extra_mounts":
             kwargs[key] = value
+    # The in-container ``sloth export --in-container`` re-runs :func:`_sanitize_path`
+    # on the same absolute host paths, but there cwd is the workspace mount and
+    # ``HOME`` is the export home, so none of the default roots contain them. Forward
+    # the identity-mounted parents as the allow-list (deviation d2, follow-ups #22).
+    env = list(kwargs.get("env") or [])
+    env.append((ALLOWED_ROOTS_ENV, os.pathsep.join(str(p) for p in sorted(parents))))
+    kwargs["env"] = env
     return kwargs
 
 
