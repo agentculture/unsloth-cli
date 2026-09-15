@@ -215,8 +215,7 @@ def _launch_container(
     *,
     quant: str | None,
     batch_size: int,
-    json_mode: bool,
-) -> None:
+) -> dict[str, Any]:
     """Re-run this eval inside the NGC container with ``--in-container``.
 
     Every resolved suite file is forwarded as its own ``--suite <abs path>`` flag
@@ -224,6 +223,10 @@ def _launch_container(
     :func:`_resolve_and_validate_suite` before this is called), matching the
     in-container argv contract: ``eval --in-container --json --suite <p> [--suite
     <p> ...] [--quant q] [--batch-size n]`` plus ``--adapter``/``--model``.
+    ``--json`` is always forwarded to the container (unconditionally, regardless
+    of the host's own ``--json`` flag) so the container always prints a
+    structured result line for :func:`~sloth.tune.container.launch` to parse and
+    return; the caller re-renders that dict for the host's own ``--json`` flag.
 
     Identity mounts (``host == container``) for the target's and every suite file's
     parent dirs make the host-absolute paths in *sloth_args* resolve unchanged
@@ -232,6 +235,10 @@ def _launch_container(
     contributes (the llama.cpp cache mount plus the ``HOME`` / ``UNSLOTH_LLAMA_TAG``
     env), because a GGUF directory is scored with ``llama-completion`` from that
     cache — exactly how ``export.py`` sets up its own run.
+
+    Returns the dict :func:`~sloth.tune.container.launch` returns (the parsed
+    JSON result line the container printed); raises :class:`CliError` on any
+    container failure.
     """
     target_abs = target.path.resolve()
     suite_abs = [p.resolve() for p in suite_paths]
@@ -241,8 +248,7 @@ def _launch_container(
     if quant:
         sloth_args += ["--quant", str(quant)]
     sloth_args += ["--batch-size", str(batch_size)]
-    if json_mode:
-        sloth_args.append("--json")
+    sloth_args.append("--json")
     sloth_args.append("--in-container")
 
     own_mounts = [
@@ -261,7 +267,7 @@ def _launch_container(
     for key, value in supplied.items():
         if key != "extra_mounts":
             kwargs[key] = value
-    container.launch(sloth_args, **kwargs)
+    return container.launch(sloth_args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -399,13 +405,23 @@ def cmd_eval(args: argparse.Namespace) -> int | None:
 
     # --- HOST PATH: route GPU/ML work through the NGC container --------------
     if not in_container:
-        _launch_container(
+        # launch() raises CliError on any container/docker failure and otherwise
+        # returns the parsed JSON result the container printed (the same summary
+        # dict the in-container branch below builds). Emit it through the HOST's
+        # own output contract so a host caller sees the same shape the
+        # in-container path would have printed.
+        summary = _launch_container(
             target,
             [p.resolve() for p in suite_paths],
             quant=quant,
             batch_size=batch_size,
-            json_mode=json_mode,
         )
+        if json_mode:
+            emit_result(summary, json_mode=True)
+        else:
+            emit_result(
+                _render_text(target, _render_suite_label(suite_paths), summary), json_mode=False
+            )
         return
 
     # --- IN-CONTAINER PATH: delegate to the ML seam -------------------------
