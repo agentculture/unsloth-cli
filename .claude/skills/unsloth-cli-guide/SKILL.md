@@ -86,9 +86,19 @@ The loop, and what each verb does:
 ```bash
 sloth train --config run.toml --dry-run   # GPU-free: validate + print the plan and docker command
 sloth train --config run.toml             # real LoRA/QLoRA job in the NGC container → adapter + metadata
-sloth eval  --adapter DIR --suite suite.jsonl   # run the adapter against a local task-schema suite
+sloth eval  --adapter DIR --suite suite.jsonl        # run the adapter against one task-schema suite file
+sloth eval  --adapter DIR --suite examples/eval/     # or a whole directory of them (every *.jsonl scored)
 sloth export --adapter DIR --output OUT   # standard PEFT/safetensors layout (servable/runnable)
 ```
+
+`--suite` accepts a single `.jsonl` file *or* a directory (expanded to its
+sorted `*.jsonl` children) and is repeatable; every resolved file is
+task-schema-validated **before any container launch**, so a malformed suite
+costs no docker/GPU spend and fails fast naming the file and line. `--quant
+<name>` picks a GGUF file when `--model` holds several (e.g. `q4_k_m` vs
+`q8_0`), and `--batch-size <n>` (default `8`) sizes the generation batch. A
+real (non-`--in-container`) run writes its scored result as `eval.json` into
+the evaluated directory alongside the summary printed to stdout.
 
 The **`/finetune`** skill runs all four steps as one loop and stops on the first
 non-zero exit. Use this guide to *understand* the verbs; use `/finetune` to *run*

@@ -580,7 +580,7 @@ def test_register_adds_eval_subparser() -> None:
     register(sub)
     args = parser.parse_args(["eval", "--adapter", "/some/dir", "--suite", "/some/file.jsonl"])
     assert args.adapter == "/some/dir"
-    assert args.suite == "/some/file.jsonl"
+    assert args.suite == ["/some/file.jsonl"]  # --suite is repeatable (action="append")
     assert args.json is False
     assert callable(args.func)
 
@@ -973,3 +973,311 @@ def test_run_eval_model_without_ml_stack(
         exporter_mod.run_eval_model(str(tmp_model), str(tmp_suite))
     assert exc_info.value.code == 2
     assert "NGC" in exc_info.value.remediation or "container" in exc_info.value.remediation
+
+
+# ---------------------------------------------------------------------------
+# t4 — --suite accepts a directory, validated before any container launch
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def tmp_suite_dir_valid(tmp_path: Path) -> Path:
+    """A suite directory with two valid task-schema *.jsonl files."""
+    d = tmp_path / "suite_dir"
+    d.mkdir()
+    (d / "a.jsonl").write_text(
+        '{"task": "reverse", "input": "abc", "expected_output": "cba"}\n',
+        encoding="utf-8",
+    )
+    (d / "b.jsonl").write_text(
+        '{"task": "upper", "input": "hello", "expected_output": "HELLO"}\n',
+        encoding="utf-8",
+    )
+    return d
+
+
+@pytest.fixture()
+def tmp_suite_dir_malformed(tmp_path: Path) -> Path:
+    """A suite directory whose second file has a malformed line 2."""
+    d = tmp_path / "suite_dir_bad"
+    d.mkdir()
+    (d / "a.jsonl").write_text(
+        '{"task": "reverse", "input": "abc", "expected_output": "cba"}\n',
+        encoding="utf-8",
+    )
+    (d / "z_bad.jsonl").write_text(
+        '{"task": "ok", "input": "x", "expected_output": "y"}\n' "not valid json\n",
+        encoding="utf-8",
+    )
+    return d
+
+
+def test_directory_suite_validated_before_launch_on_malformed_file(
+    tmp_adapter: Path,
+    tmp_suite_dir_malformed: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed file inside a --suite directory exits 1 naming file + line,
+    and the container launcher is never called (fails fast, before any launch)."""
+
+    def _must_not_launch(*args: Any, **kwargs: Any) -> int:
+        raise AssertionError("container.launch called despite a malformed suite file")
+
+    monkeypatch.setattr(eval_mod.container, "launch", _must_not_launch)
+
+    args = _make_args(
+        adapter=str(tmp_adapter), suite=[str(tmp_suite_dir_malformed)], in_container=False
+    )
+    with pytest.raises(CliError) as exc_info:
+        cmd_eval(args)
+
+    err = exc_info.value
+    assert err.code == 1
+    assert "z_bad.jsonl" in err.message
+    assert "line 2" in err.message
+
+
+def test_directory_suite_all_valid_expands_and_launches(
+    tmp_adapter: Path,
+    tmp_suite_dir_valid: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A directory of valid *.jsonl files expands to one --suite flag per file,
+    sorted, and launches the container."""
+    captured: dict[str, Any] = {}
+
+    def _capture_launch(sloth_args: list[str], **kwargs: Any) -> int:
+        captured["sloth_args"] = list(sloth_args)
+        return 0
+
+    monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
+
+    args = _make_args(
+        adapter=str(tmp_adapter), suite=[str(tmp_suite_dir_valid)], in_container=False
+    )
+    rc = cmd_eval(args)
+    assert rc in (None, 0)
+
+    forwarded = captured["sloth_args"]
+    suite_flags_idx = [i for i, tok in enumerate(forwarded) if tok == "--suite"]
+    assert len(suite_flags_idx) == 2, f"expected 2 --suite flags, forwarded={forwarded}"
+    suite_values = [forwarded[i + 1] for i in suite_flags_idx]
+    assert suite_values == sorted(suite_values), "directory files must be forwarded sorted"
+    assert str((tmp_suite_dir_valid / "a.jsonl").resolve()) in suite_values
+    assert str((tmp_suite_dir_valid / "b.jsonl").resolve()) in suite_values
+
+
+def test_single_jsonl_suite_still_works_unchanged(
+    tmp_adapter: Path,
+    tmp_suite: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single .jsonl --suite path still works exactly as before (one --suite flag)."""
+    captured: dict[str, Any] = {}
+
+    def _capture_launch(sloth_args: list[str], **kwargs: Any) -> int:
+        captured["sloth_args"] = list(sloth_args)
+        return 0
+
+    monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
+
+    args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), in_container=False)
+    rc = cmd_eval(args)
+    assert rc in (None, 0)
+
+    forwarded = captured["sloth_args"]
+    assert forwarded.count("--suite") == 1
+    idx = forwarded.index("--suite")
+    assert forwarded[idx + 1] == str(tmp_suite.resolve())
+
+
+def test_missing_suite_directory_raises_before_launch(
+    tmp_adapter: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A --suite path that does not exist at all raises CliError(code=1); no launch."""
+
+    def _must_not_launch(*args: Any, **kwargs: Any) -> int:
+        raise AssertionError("container.launch called for a missing suite path")
+
+    monkeypatch.setattr(eval_mod.container, "launch", _must_not_launch)
+    args = _make_args(
+        adapter=str(tmp_adapter), suite=[str(tmp_path / "does_not_exist")], in_container=False
+    )
+    with pytest.raises(CliError) as exc_info:
+        cmd_eval(args)
+    assert exc_info.value.code == 1
+
+
+def test_empty_suite_directory_raises_before_launch(
+    tmp_adapter: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A --suite directory holding no *.jsonl files raises CliError(code=1); no launch."""
+    empty_dir = tmp_path / "empty_suite"
+    empty_dir.mkdir()
+
+    def _must_not_launch(*args: Any, **kwargs: Any) -> int:
+        raise AssertionError("container.launch called for an empty suite directory")
+
+    monkeypatch.setattr(eval_mod.container, "launch", _must_not_launch)
+    args = _make_args(adapter=str(tmp_adapter), suite=[str(empty_dir)], in_container=False)
+    with pytest.raises(CliError) as exc_info:
+        cmd_eval(args)
+    assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# t4 — --quant / --batch-size flags
+# ---------------------------------------------------------------------------
+
+
+def test_register_quant_and_batch_size_flags() -> None:
+    """--quant and --batch-size parse; --batch-size defaults to 8."""
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command")
+    register(sub)
+    args = parser.parse_args(["eval", "--adapter", "/a", "--suite", "/b.jsonl"])
+    assert args.quant is None
+    assert args.batch_size == 8
+
+    args2 = parser.parse_args(
+        [
+            "eval",
+            "--adapter",
+            "/a",
+            "--suite",
+            "/b.jsonl",
+            "--quant",
+            "q4_k_m",
+            "--batch-size",
+            "16",
+        ]
+    )
+    assert args2.quant == "q4_k_m"
+    assert args2.batch_size == 16
+
+
+def test_host_forwards_quant_and_batch_size_to_container(
+    tmp_adapter: Path,
+    tmp_suite: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--quant and --batch-size are forwarded into the in-container argv."""
+    captured: dict[str, Any] = {}
+
+    def _capture_launch(sloth_args: list[str], **kwargs: Any) -> int:
+        captured["sloth_args"] = list(sloth_args)
+        return 0
+
+    monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
+
+    args = _make_args(
+        adapter=str(tmp_adapter),
+        suite=str(tmp_suite),
+        quant="q4_k_m",
+        batch_size=16,
+        in_container=False,
+    )
+    rc = cmd_eval(args)
+    assert rc in (None, 0)
+
+    forwarded = captured["sloth_args"]
+    assert "--quant" in forwarded
+    assert forwarded[forwarded.index("--quant") + 1] == "q4_k_m"
+    assert "--batch-size" in forwarded
+    assert forwarded[forwarded.index("--batch-size") + 1] == "16"
+
+
+def test_host_forwards_default_batch_size_when_not_set(
+    tmp_adapter: Path,
+    tmp_suite: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--batch-size still reaches the container argv with its default (8) and
+    --quant is omitted entirely when not passed."""
+    captured: dict[str, Any] = {}
+
+    def _capture_launch(sloth_args: list[str], **kwargs: Any) -> int:
+        captured["sloth_args"] = list(sloth_args)
+        return 0
+
+    monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
+
+    args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), in_container=False)
+    cmd_eval(args)
+
+    forwarded = captured["sloth_args"]
+    assert "--quant" not in forwarded
+    assert "--batch-size" in forwarded
+    assert forwarded[forwarded.index("--batch-size") + 1] == "8"
+
+
+def test_in_container_forwards_quant_and_batch_size_when_seam_accepts_them(
+    tmp_adapter: Path,
+    tmp_suite: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When run_eval's signature accepts suite_paths/quant/batch_size, cmd_eval
+    passes them through (the richer signature t5, a sibling task, is adding)."""
+    calls: list[dict[str, Any]] = []
+
+    def _fake_rich_run_eval(
+        adapter_path: str,
+        *,
+        suite_paths: list[Path],
+        quant: str | None = None,
+        batch_size: int = 8,
+    ) -> dict[str, Any]:
+        calls.append(
+            {
+                "adapter_path": adapter_path,
+                "suite_paths": list(suite_paths),
+                "quant": quant,
+                "batch_size": batch_size,
+            }
+        )
+        return _fake_run_eval_perfect(adapter_path, str(suite_paths[0]))
+
+    monkeypatch.setattr(eval_mod, "run_eval", _fake_rich_run_eval)
+
+    args = _make_args(
+        adapter=str(tmp_adapter),
+        suite=str(tmp_suite),
+        quant="q4_k_m",
+        batch_size=4,
+        in_container=True,
+    )
+    rc = cmd_eval(args)
+    assert rc in (None, 0)
+    assert len(calls) == 1
+    assert calls[0]["adapter_path"] == str(tmp_adapter)
+    assert calls[0]["suite_paths"] == [tmp_suite]
+    assert calls[0]["quant"] == "q4_k_m"
+    assert calls[0]["batch_size"] == 4
+
+
+def test_in_container_falls_back_to_current_run_eval_signature(
+    tmp_adapter: Path,
+    tmp_suite: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When run_eval keeps its CURRENT two-positional-arg signature (no
+    suite_paths param), cmd_eval falls back to calling it that way — the
+    original in-container contract keeps working unmodified."""
+    calls: list[tuple[str, str]] = []
+
+    def _current_signature_run_eval(adapter_path: str, suite_path: str) -> dict[str, Any]:
+        calls.append((adapter_path, suite_path))
+        return _fake_run_eval_perfect(adapter_path, suite_path)
+
+    monkeypatch.setattr(eval_mod, "run_eval", _current_signature_run_eval)
+
+    args = _make_args(
+        adapter=str(tmp_adapter),
+        suite=str(tmp_suite),
+        quant="q4_k_m",
+        batch_size=4,
+        in_container=True,
+    )
+    rc = cmd_eval(args)
+    assert rc in (None, 0)
+    assert calls == [(str(tmp_adapter), str(tmp_suite))]
