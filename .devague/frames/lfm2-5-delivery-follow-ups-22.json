@@ -4,7 +4,7 @@
   "schema_version": 6,
   "status": "exported",
   "created": "2026-09-15T14:40:38Z",
-  "updated": "2026-09-15T15:51:18Z",
+  "updated": "2026-09-15T16:43:41Z",
   "claims": [
     {
       "id": "c1",
@@ -996,9 +996,9 @@
       "text": "The bitsandbytes version installed on the 2026-09-15 run is not recorded anywhere (docs/tested.md:23 and docs/benchmarks.md:22 record 0.49.2 for the June batch only); the pin PR must read it from the container before writing it",
       "kind": "unknown_nonblocking",
       "claim_id": "c18",
-      "resolved": false,
-      "resolution": "",
-      "resolution_claim_id": null
+      "resolved": true,
+      "resolution": "Measured 2026-09-15 by t8 inside nvcr.io/nvidia/pytorch:25.11-py3 with the CLI's own install line: bitsandbytes 0.50.2, unsloth 2026.9.4, unsloth-zoo 2026.9.3; pinned in DEP_LAYER_NODEPS_PACKAGES.",
+      "resolution_claim_id": "c18"
     },
     {
       "id": "v4",
@@ -1392,6 +1392,39 @@
       ],
       "origin": "llm",
       "status": "approved"
+    },
+    {
+      "id": "l2",
+      "code": "assumption-for-measurement",
+      "what": "t7: the starter suite's expected outputs were shortened to one sentence by judgment and never scored by sloth eval, so 'short enough for exact-match to have a chance' is an assumption until t10 runs the suite",
+      "skipped_check": "an exact-match run of examples/eval/ against any adapter",
+      "refs": [
+        "t7 task agent report"
+      ],
+      "origin": "llm",
+      "status": "proposed"
+    },
+    {
+      "id": "l3",
+      "code": "provenance-missing",
+      "what": "t7: examples/eval/task-format.jsonl items are authored content built from documented CLI vocabulary, not derived from any existing repo row; their provenance is the author's construction",
+      "skipped_check": "",
+      "refs": [
+        "t7 task agent report, examples/eval/task-format.jsonl"
+      ],
+      "origin": "llm",
+      "status": "proposed"
+    },
+    {
+      "id": "l4",
+      "code": "assumption-for-measurement",
+      "what": "t1: line-by-line streaming from docker is proven only against a fake process; bufsize=1 + text=True yielding real line-buffered reads from docker is an assumption until t9's live stdout row",
+      "skipped_check": "a real docker run through the new Popen tee",
+      "refs": [
+        "t1 task agent report, sloth/tune/container.py _stream"
+      ],
+      "origin": "llm",
+      "status": "proposed"
     }
   ],
   "obligations": []

@@ -1,0 +1,24 @@
+{
+  "plan_slug": "lfm2-5-delivery-follow-ups-22",
+  "schema_version": 2,
+  "created": "2026-09-15T16:51:55Z",
+  "updated": "2026-09-15T16:51:55Z",
+  "deviations": [
+    {
+      "id": "d1",
+      "what": "t5 slices each prediction at the shared padded prompt width (derived per row from attention_mask: pad_len + real_len), not at the row's own token count as the t5 instruction said; under left padding the instruction's literal reading would have kept pads + prompt in every short row and failed the acceptance criterion 'each prediction excludes its own prompt'. Also deleted _exporter._continuation/_eval_prompt/_score_predictions (named as owned symbols) because their logic moved into _trainer/metrics and nothing else referenced them.",
+      "task_ref": "t5",
+      "reason": "plan instruction contained a wrong offset rule; acceptance criteria are the contract and are met (3 load-bearing tests)",
+      "affects": [
+        "c36"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "classification": "acceptable",
+      "seq": 1
+    }
+  ],
+  "evidence": [],
+  "deltas": [],
+  "supersessions": []
+}
