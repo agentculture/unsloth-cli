@@ -76,6 +76,12 @@ DEFAULT_GGUF_QUANT: tuple[str, ...] = ("q4_k_m",)
 # Quant tags Unsloth emits for the un-quantised intermediate it converts *from*.
 _INTERMEDIATE_TAGS: frozenset[str] = frozenset({"f16", "bf16", "f32"})
 
+#: Calibration sequence length handed to llm-compressor. Passed explicitly because
+#: oneshot otherwise falls back to the tokenizer's ``model_max_length``, and LFM2's
+#: is a huge sentinel that overflows ("OverflowError: int too big to convert",
+#: live-measured). 512 matches the probe run that validated AWQ/NVFP4 on LFM2.5.
+CALIB_MAX_SEQ_LENGTH: int = 512
+
 # Below this many calibration rows the quantisation scales get noisy; warn once.
 MIN_CALIBRATION_SAMPLES = 64
 
@@ -512,6 +518,7 @@ def _export_compressed(
         # torch.fx and dies in create_causal_mask ("'NoneType' object has no
         # attribute 'get_mask_sizes'") on the hybrid cache.
         pipeline="basic",
+        max_seq_length=CALIB_MAX_SEQ_LENGTH,
         num_calibration_samples=len(rows),
     )
     model.save_pretrained(str(output), save_compressed=True)

@@ -372,6 +372,7 @@ def test_awq_merges_first_then_oneshots_with_basic_pipeline(tmp_path, install_ba
     assert not (Path(plan["output"]) / "_merged-16bit").exists()
 
     call = events["oneshot"][0]
+    assert call["max_seq_length"] == 512
     # MANDATORY: the default sequential pipeline dies under torch.fx for LFM2.
     assert call["pipeline"] == "basic"
     assert call["num_calibration_samples"] == 80
