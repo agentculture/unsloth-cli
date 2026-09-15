@@ -4,7 +4,7 @@
   "schema_version": 6,
   "status": "exported",
   "created": "2026-09-15T14:40:38Z",
-  "updated": "2026-09-15T19:32:31Z",
+  "updated": "2026-09-15T19:40:59Z",
   "claims": [
     {
       "id": "c1",
@@ -978,18 +978,18 @@
       "text": "Whether Unsloth's from_pretrained + save_pretrained_merged dequantises a 4-bit-trained adapter correctly when the base is loaded in 16-bit (load_in_4bit=False) is unmeasured; the qlora-smoke \u2192 merged-16bit probe answers it before any exporter code changes (risk r3)",
       "kind": "unknown_nonblocking",
       "claim_id": "c10",
-      "resolved": false,
-      "resolution": "",
-      "resolution_claim_id": null
+      "resolved": true,
+      "resolution": "Measured 2026-09-15 (t9): a bnb-4bit-trained adapter merges to a 3.44 GB bf16 model with no quantization_config; Unsloth dequantises implicitly, no exporter change.",
+      "resolution_claim_id": "c10"
     },
     {
       "id": "v2",
       "text": "Whether Qwen3's GQA needs the v_proj\u2192o_proj AWQ pair dropped the way LFM2 did (sloth/tune/_exporter.py:476-511) is unmeasured; llm-compressor defaults are the first attempt, a custom mapping only if the run fails (risk r4)",
       "kind": "unknown_nonblocking",
       "claim_id": "c12",
-      "resolved": false,
-      "resolution": "",
-      "resolution_claim_id": null
+      "resolved": true,
+      "resolution": "Measured 2026-09-15 (t9): Qwen3-1.7B awq passes with llm-compressor's inferred defaults; the 28 GQA v_proj\u2192o_proj mappings are auto-skipped, no custom mapping needed.",
+      "resolution_claim_id": "c12"
     },
     {
       "id": "v3",
@@ -1402,7 +1402,7 @@
         "t7 task agent report"
       ],
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "l3",
@@ -1413,7 +1413,7 @@
         "t7 task agent report, examples/eval/task-format.jsonl"
       ],
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "l4",
@@ -1424,7 +1424,7 @@
         "t1 task agent report, sloth/tune/container.py _stream"
       ],
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     }
   ],
   "obligations": [
@@ -1435,7 +1435,7 @@
       "behavior": "only the in-container JSON result reaches host stdout; everything else is teed to stderr",
       "source_text": "sloth train/eval/export --json emit only the in-container result on host stdout on a real run \u2014 container.launch routes the container's whole stdout to the host's stderr and captures the result via a JSON-aware path; today sloth/tune/container.py:475-481 _stream() is a bare subprocess.run with inherited stdio and train.py:448 / eval.py:200 / export.py:901 consume only the exit code",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o2",
@@ -1444,7 +1444,7 @@
       "behavior": "each verb's --json stdout parses as exactly one JSON document on a real run",
       "source_text": "On a real sloth train --json, sloth eval --json and sloth export --json run on the Spark, stdout parses as exactly 1 JSON document each (0 non-JSON lines), measured by piping stdout through python -c 'import sys,json; json.loads(sys.stdin.read())' and recorded in docs/tested.md",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o3",
@@ -1453,7 +1453,7 @@
       "behavior": "no verb handler spawns or parses the container itself",
       "source_text": "The stdout fix lands in container.py's launch path once, for all three verbs, not per verb: train.py:448, eval.py:200 and export.py:901 all call container.launch() and ignore its stdout today, so a capture path added in launch() covers them without touching handler logic",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o4",
@@ -1462,7 +1462,7 @@
       "behavior": "exit 0 with no JSON object line raises CliError(code=2) as a single-line message",
       "source_text": "If the container exits 0 but no line of its captured stdout parses as JSON (or, in text mode, no result marker is found), container.launch raises CliError(code=2) whose message carries the last 20 captured lines \u2014 a missing result is never reported as success",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o5",
@@ -1471,7 +1471,7 @@
       "behavior": "container output streams to stderr as it arrives; exit-code mapping unchanged",
       "source_text": "The capture path streams the container's stdout line by line to the host's stderr as it arrives (subprocess.Popen + iteration, not run() with capture_output), so operators keep live progress; the existing exit-code mapping (1 \u2192 user, 2/137/other \u2192 environment, 127 \u2192 docker missing) and the OSError branch at container.py:475-481 are preserved unchanged",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o6",
@@ -1480,7 +1480,7 @@
       "behavior": "JSON results are one physical line",
       "source_text": "emit_result (sloth/cli/_output.py:17-22) writes JSON with json.dump and no indent \u2014 one line per result \u2014 and that stays true, because the host capture identifies the in-container result as a single JSON line; any future pretty-printing must go through the same capture contract",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o7",
@@ -1489,7 +1489,7 @@
       "behavior": "the unconditional stdout/stderr promise is true on a real run",
       "source_text": "README.md:41-43 and :95 promise 'results go to stdout, errors/diagnostics to stderr (never mixed)' for every verb unconditionally; until item 1 ships, docs/tested.md:73 is the only place that says train/eval/export --json is not stdout-only on a real run \u2014 the README promise becomes true (or is caveated) in the same change",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o8",
@@ -1498,7 +1498,7 @@
       "behavior": "SLOTH_BIN -> own checkout via uv run --project -> PATH, with one test per branch",
       "source_text": "tests/test_finetune_skill_script.py:62-89 stubs a fake 'sloth' on PATH and every test asserts on the argv that stub records; flipping to checkout-first would bypass the stub (the tests run from inside the real checkout), so the test fixture must gain a way to pin resolution (an env override such as SLOTH_BIN honoured before both branches) rather than the tests being deleted",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o9",
@@ -1507,7 +1507,7 @@
       "behavior": "exec'd as a command word, never eval'd; empty value ignored",
       "source_text": "SLOTH_BIN is exec'd as a command word (SLOTH=($SLOTH_BIN)), never eval'd or sourced, and an unset or empty value is ignored; the skill trusts it exactly as much as PATH",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o10",
@@ -1516,7 +1516,7 @@
       "behavior": "documented order matches the code order",
       "source_text": ".claude/skills/finetune/SKILL.md:28-29 and :178-179 document 'installed sloth on PATH, else uv run sloth from a checkout' \u2014 the docs change in the same PR as the resolver so the stated order matches the shipped order",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o11",
@@ -1525,7 +1525,7 @@
       "behavior": "directory suites validated host-side before launch; validate --suite; catalog + guide updated",
       "source_text": "Suite validation happens before GPU spend, matching the dataset rule: sloth eval validates every *.jsonl in a --suite directory host-side (schema task, non-empty) before launching the container, and sloth validate gains --suite <file|dir> reusing the same function; the /finetune skill's --suite help, .claude/skills/finetune/SKILL.md, the explain catalog's eval entry (--suite dir, --quant, --batch-size) and .claude/skills/unsloth-cli-guide/SKILL.md are updated in the same PR, and uv run teken cli doctor . --strict stays green",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o12",
@@ -1534,7 +1534,7 @@
       "behavior": "per-file + aggregate entries with total/exact_match/exact_match_pct/f1; eval.json written; summarize/compare render it",
       "source_text": "sloth eval --suite accepts either one JSONL file or a directory; for a directory every *.jsonl is scored and the result carries per-file and aggregate {total, exact_match, exact_match_pct, f1} plus the per-item results; a token-level F1 is computed in pure stdlib (whitespace tokens, normalized) next to exact-match for both --adapter and --model",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o13",
@@ -1543,7 +1543,7 @@
       "behavior": "batch_size batches with left padding; pad fallback; each prediction excludes its own prompt",
       "source_text": "run_eval and run_eval_model generate in batches (padding-side left, batch size from config or a --batch-size flag defaulting to 8) so a wide suite does not scale one prompt per forward pass; continuation-only slicing stays correct per row under padding",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o14",
@@ -1552,7 +1552,7 @@
       "behavior": "--quant picks one GGUF in a multi-quant dir case-insensitively; missing quant exits 1 listing present names",
       "source_text": "sloth eval gains a --quant <name> selector so --model <dir> holding several GGUFs picks the matching file instead of exiting 1; today sloth/tune/_exporter.py:850-865 _find_gguf raises 'holds several GGUF files' with the hint to pass --model <dir>/<name>.gguf",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o15",
@@ -1561,7 +1561,7 @@
       "behavior": "fake tokenizer decodes its real token slice; no prediction starts with the prompt",
       "source_text": "The continuation-only unit tests are tightened alongside the live check: the fake tokenizer's decode() honours its tokens argument so the prompt_len slice is asserted, not just the result shape",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o16",
@@ -1570,7 +1570,7 @@
       "behavior": "DEP_LAYER_NODEPS_PACKAGES pinned to the live-measured versions",
       "source_text": "sloth/tune/container.py:107-111 DEP_LAYER_NODEPS_PACKAGES pins unsloth, unsloth_zoo and bitsandbytes to the versions docs/tested.md:51-52 measured live on 2026-09-15 (unsloth 2026.9.4, unsloth_zoo 2026.9.3; bitsandbytes at whatever that run installed), tests/test_tune_container.py:762-778 asserts the pins reach the install line, and docs/dgx-spark.md:52-63 gains a 'bump path' paragraph next to the version matrix",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o17",
@@ -1579,7 +1579,7 @@
       "behavior": "DEP_LAYER_PACKAGES byte-identical before and after",
       "source_text": "The transformers==4.57.1 / peft==0.18.0 / trl==0.24.0 / torchao-0.14 deadlock documented in CLAUDE.md:253-255 and docs/dgx-spark.md:66-72 is untouched \u2014 pinning unsloth is additive to that matrix, never a float of peft or torchao",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o18",
@@ -1588,7 +1588,7 @@
       "behavior": "3 == pins asserted by tests; dgx-spark.md has a bump heading",
       "source_text": "sloth/tune/container.py DEP_LAYER_NODEPS_PACKAGES has 3 '==' pins and tests/test_tune_container.py asserts each reaches the install line; docs/dgx-spark.md has a section whose heading contains 'bump'",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o19",
@@ -1597,7 +1597,7 @@
       "behavior": "no venv-invalidation logic added",
       "source_text": "Pinning unsloth/unsloth_zoo/bitsandbytes adds no venv-invalidation or fingerprint logic: container.py:251-261 already recreates the venv and reruns uv pip install unconditionally, so a pin change or a revert takes effect on the next run with no cleanup step",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o20",
@@ -1606,7 +1606,7 @@
       "behavior": "qlora-smoke -> merged-16bit recorded pass/fail",
       "source_text": "QLoRA-trained adapters are measured through the export formats on the Spark: examples/qlora-smoke.toml \u2192 sloth export --format merged-16bit first (the cheapest probe of Unsloth's dequantise-then-merge path), then gguf/awq/nvfp4 only if merged-16bit holds; results become docs/tested.md rows and resolve risk r3",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o21",
@@ -1615,7 +1615,7 @@
       "behavior": "one row each with pass/fail; awq notes whether a custom mapping was needed",
       "source_text": "Qwen3 is measured through awq, nvfp4 and gguf on the Spark \u2014 one run each on unsloth/Qwen3-1.7B from the existing lora-smoke/qlora-smoke adapters \u2014 and the outcomes become docs/tested.md rows, resolving risk r4",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o22",
@@ -1624,7 +1624,7 @@
       "behavior": "no new row names a model larger than Qwen3-1.7B / LFM2.5-1.2B",
       "source_text": "No new model family is added to the tested set beyond Qwen3-1.7B and LFM2.5-1.2B-Base; docs/tested.md:90-95 records Qwen3 4B/9B as not tested for memory reasons on the shared Spark, and that stays true in this batch",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o23",
@@ -1633,7 +1633,7 @@
       "behavior": "live eval --adapter score and one --base export recorded",
       "source_text": "Two #20-review fixes get one live run each on the Spark and a docs/tested.md row: sloth eval --adapter runs/lfm2-lora --suite examples/eval-suite.jsonl (does continuation-only scoring move the smoke score off 0/4?) and one sloth export --base <id> (does the staged _adapter-override copy load?)",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o24",
@@ -1642,7 +1642,7 @@
       "behavior": "docs/tested.md records the stdout line count of the loop after the fix",
       "source_text": "Unit tests cannot prove stdout purity: tests/test_tune_container.py:538-630 monkeypatch _stream to a canned exit code and .github/workflows/tests.yml has no GPU/docker job (non-goal c12 of the shipped spec) \u2014 the honest gate for h14 is a manual Spark run of the /finetune loop counting non-JSON stdout lines, recorded in docs/tested.md",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o25",
@@ -1651,7 +1651,7 @@
       "behavior": "at least one Orin/Thor Live-tested cell names a date and device, backed by a tested.md row",
       "source_text": "At least one exported artifact is loaded on a Jetson device and recorded as a Live-tested cell in the docs/fine-tuning.md:157-161 deployment table and a docs/tested.md row: awq/nvfp4 on the Thor via vLLM in this batch; gguf on the Orin Nano via llama.cpp/Ollama in a separate session (issue #23)",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o26",
@@ -1660,7 +1660,7 @@
       "behavior": "per-format scores on >= 40 items in docs/benchmarks.md with at least one non-zero row",
       "source_text": "Quantization loss becomes a number: sloth eval --model is run on merged-16bit, gguf, awq and nvfp4 outputs of the same adapter against the examples/eval/ starter suite (>= 40 task-schema items across three domain files, scored per file and in aggregate on exact-match and token-level F1), and the side-by-side scores land in docs/benchmarks.md; today examples/eval-suite.jsonl is 4 items with exact-match only",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o27",
@@ -1669,7 +1669,7 @@
       "behavior": ">= 6 new tested rows and a per-format score table on >= 20 items",
       "source_text": "docs/tested.md gains >= 6 new rows: qlora-smoke \u2192 merged-16bit, Qwen3-1.7B \u2192 awq, nvfp4, gguf, one Jetson-side load, one live eval --adapter on runs/lfm2-lora; and docs/benchmarks.md carries an exact-match (or replacement metric) score per export format on a suite of >= 20 items",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o28",
@@ -1678,7 +1678,7 @@
       "behavior": "README stdout contract true; benchmarks carries a per-format score; l1 annotated",
       "source_text": "The CLI's whole value to an agent is a parseable stdout; while train/eval/export --json leak container output, every downstream skill has to grep for JSON, and while quantization loss is unmeasured, no adapter can honestly be handed to lobes or a Jetson as 'good enough'",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o29",
@@ -1687,7 +1687,7 @@
       "behavior": "no shipped code/tests/skills reference ssh thor",
       "source_text": "The Thor host ('ssh thor') is an operator-local test target: no shipped code, test, skill, or doc instruction depends on it; docs/tested.md rows record what was run there, and the serve image used on Thor is written into the row",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o30",
@@ -1696,7 +1696,7 @@
       "behavior": "the quoted numbers each grep in the cited files",
       "source_text": "After #21, sloth train/eval/export --json stdout carried 3 JSON lines among 125 non-JSON lines on a real run (docs/tested.md:73); the /finetune skill ran another worktree's sloth from PATH (risk r9); every quantized export was judged by one coherent completion and a 0/4 smoke suite (lapse l1); QLoRA adapters, Qwen3, and any Jetson load were unmeasured (docs/tested.md:75-77); unsloth floated between 2026.6.9 and 2026.9.4 (risk r1)",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o31",
@@ -1705,7 +1705,7 @@
       "behavior": "gh issue view 22 shows a nine-line closing comment; the issue is closed",
       "source_text": "A real /finetune run on the Spark yields exactly three JSON lines on stdout and everything else on stderr; the skill runs the checkout it lives in; docs/tested.md has rows for a QLoRA adapter and for Qwen3-1.7B through merged-16bit/gguf/awq/nvfp4, one Jetson-side load, a side-by-side eval score per format, and pinned unsloth versions with a bump path; issue #22 closes with every item either done or explicitly deferred",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o32",
@@ -1714,7 +1714,7 @@
       "behavior": "the exported spec names agents parsing stdout first",
       "source_text": "Agents and operators who drive sloth train/eval/export and the /finetune skill non-interactively and parse stdout as JSON; secondarily lobes/colleague as consumers of exported adapters, and the Jetson deployment targets named in docs/fine-tuning.md",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o33",
@@ -1723,7 +1723,7 @@
       "behavior": "r5, r6, r7 remain unresolved on the LFM2.5 plan",
       "source_text": "Risks r5 (concurrent gguf exports racing on the llama.cpp cache), r6 (disk-estimate heuristic) and r7 (four unverified call-signature inferences) are not in issue #22 and stay open on the shipped plan; this frame covers exactly the nine issue items",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "o34",
@@ -1732,7 +1732,7 @@
       "behavior": "issue #22 closes with every item mapped",
       "source_text": "unsloth-cli closes the nine follow-ups left open by the LFM2.5 target_modules + quantized export delivery (issue #22): JSON-only stdout on real train/eval/export runs, a /finetune resolver that runs the checkout it lives in, QLoRA and Qwen3 measured through every export format, a Jetson-side load, a real quantization-loss number, pinned unsloth versions with a documented bump path, and the torch shim scheduled for deletion",
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     }
   ]
 }

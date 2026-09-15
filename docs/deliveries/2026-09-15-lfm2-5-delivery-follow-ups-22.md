@@ -51,9 +51,9 @@ Quoted verbatim from the `devague summary` skeleton:
 ## Mid-work Decisions
 
 - `d2` (approved) — sloth export's path sanitizer (added in #20's review batch after its live rows) also ran in-container, where cwd is `/workspace`, so every real export on `main` exited 1 with "path is outside the allowed roots". Fix, outside every plan task: `_container_kwargs` forwards `SLOTH_ALLOWED_ROOTS` (the identity-mounted parents, plus a local `--base` after review) into the container env. — blocking: t9's export rows (c10, c12, c21) could not run until real exports worked again.
-- `d1` (pending approval) — t5 slices each prediction at the shared padded prompt width (derived per row from the attention mask), not at the row's own token count as the plan instruction said; the literal instruction would have failed the acceptance criterion. Deletes `_exporter._continuation` / `_eval_prompt` / `_score_predictions` (logic moved to `_trainer` / `metrics`).
-- `d3` (pending approval) — t9's tested.md rows rode with PR A instead of PR B, so PR A shipped with its own live evidence.
-- `d4` (pending approval) — the fail-closed error became a single-line message (the captured lines are already on stderr), because the two-line `error:`/`hint:` contract outranks the literal h36 wording.
+- `d1` (approved) — t5 slices each prediction at the shared padded prompt width (derived per row from the attention mask), not at the row's own token count as the plan instruction said; the literal instruction would have failed the acceptance criterion. Deletes `_exporter._continuation` / `_eval_prompt` / `_score_predictions` (logic moved to `_trainer` / `metrics`).
+- `d3` (approved) — t9's tested.md rows rode with PR A instead of PR B, so PR A shipped with its own live evidence.
+- `d4` (approved) — the fail-closed error became a single-line message (the captured lines are already on stderr), because the two-line `error:`/`hint:` contract outranks the literal h36 wording.
 - Not covered by any record: the first train attempt died with CUDA OOM at backend init while lobes' vLLM held ~90 of 121 GB; reclaimed by touching every page of a 20 GiB anonymous mmap (no sudo). The Qwen3 awq/nvfp4 exports needed `--calib examples/chat-smoke.jsonl` because the June adapter's metadata predates the dataset-path field. The `version-bump` skill's `bump.py` hung twice on this box; the 0.8.1 bump was applied by hand. Review fixes (9 qodo + 10 Sonar on #25, 2 qodo on #26) were built by six subagents in worktrees and merged before either PR merged.
 
 ## Drift From Plan
@@ -61,9 +61,9 @@ Quoted verbatim from the `devague summary` skeleton:
 | Plan item | Reason for divergence | Classification |
 |-----------|------------------------|-----------------|
 | `t9` (`d2`) | blocking: t9's export rows (c10, c12, c21) cannot run until real exports work again | `needs-follow-up` |
-| `t5` (`d1`, pending) | plan instruction contained a wrong offset rule; acceptance criteria are the contract and are met (3 load-bearing tests) | `acceptable` |
-| `t11` (`d3`, pending) | the live rows are the proof that PR A's stdout/export changes work; splitting them off would ship PR A unverified | `acceptable` |
-| `t1` (`d4`, pending) | the rubric's two-line error contract outranks the literal h36 wording; the diagnostic content is preserved on stderr | `acceptable` |
+| `t5` (`d1`) | plan instruction contained a wrong offset rule; acceptance criteria are the contract and are met (3 load-bearing tests) | `acceptable` |
+| `t11` (`d3`) | the live rows are the proof that PR A's stdout/export changes work; splitting them off would ship PR A unverified | `acceptable` |
+| `t1` (`d4`) | the rubric's two-line error contract outranks the literal h36 wording; the diagnostic content is preserved on stderr | `acceptable` |
 | `t10` | the per-format table exists but every row scores 0/46 exact-match for the 10-step smoke adapter, so honesty condition h15 ("at least one row is not 0") is a **failed** condition; the table becomes a quantization-loss number only with a trained adapter. Token-F1 differs between batch 8 and batch 1 (0.038 vs 0.060) — batched decoding is not bit-identical (plan risk r8). | `needs-follow-up` |
 | `t4` | after review, `sloth validate --suite` forces the task schema and rejects an explicit non-task `--schema`; `--batch-size < 1` exits 1 — tighter than the confirmed criteria, no behaviour the plan promised was removed | `acceptable` |
 | `t11` | issue #22 was closed by hand after the merge because PR B targeted PR A's branch, so its `Closes #22` did not fire; the closing comment names both merged PRs | `acceptable` |
@@ -74,7 +74,7 @@ Quoted verbatim from the `devague summary` skeleton:
 - lint: `black --check`, `isort --check-only`, `flake8`, `bandit -c pyproject.toml -r sloth` — clean; `uv run teken cli doctor . --strict` — healthy 26/26
 - CI on #25 after the review fixes: test, lint, version-check, SonarCloud (quality gate passed, 0 open issues), GitGuardian — all green
 - live: `docs/tested.md` §"follow-ups #22" (12 rows with commands, wall times, `wc -l` counts); `docs/benchmarks.md` §"per-format scores on `examples/eval/`"
-- validation ledger (`/validate-delivery`, proposed): 34 obligations `o1`–`o34`, 36 evidence records `e1`–`e36` (33 pass, 3 fail: `e28` h15, `e31` h45, `e32` h31), deltas `b1`–`b3`
+- validation ledger (`/validate-delivery`, all confirmed by the owner 2026-09-15): 34 obligations `o1`–`o34`, 36 evidence records `e1`–`e36` (33 pass, 3 fail: `e28` h15, `e31` h45, `e32` h31), deltas `b1`–`b5` (`b4` padded-width slice ← `d1`, `b5` single-line error ← `d4`)
 - commits: `a89c16b..a072b88` (one squash on `main`, 22 integration commits behind it)
 - PRs / issues: #24 (spec), #25 (PR A), #26 (PR B), #22 (closed), #23 (Orin Nano, open)
 
@@ -84,13 +84,13 @@ Quoted verbatim from the `devague summary` skeleton:
 |-------|------------|----------|
 | `sloth train/eval/export --json` are stdout-pure on real runs (exactly one JSON line each) | high | `docs/tested.md` follow-ups rows (train 1/219, eval 1/191, exports 1 each) · `tests/test_tune_container.py::TestStreamCapture`, `::TestLaunchResultCapture` · `e1`, `e2`, `e3` |
 | a container that prints no JSON result fails closed with exit 2 and a single-line message | high | `tests/test_tune_container.py::TestLaunchResultCapture::test_exit_0_without_json_fails_closed_with_single_line_message` · `e5` |
-| real-docker line-by-line streaming (as opposed to the fake process) works | medium | observed live (every run's stderr carried the banner and trainer progress) but only the fake-process test asserts ordering — lapse `l4` (pending) caps this |
+| real-docker line-by-line streaming (as opposed to the fake process) works | medium | observed live (every run's stderr carried the banner and trainer progress) but only the fake-process test asserts ordering — approved lapse `l4` caps this |
 | the `/finetune` skill resolves `SLOTH_BIN` → own checkout → PATH | high | `tests/test_finetune_skill_script.py` (8 tests) · `e10`, `e11` |
 | `sloth eval --suite <dir>` validates before launch; `--quant`, `--batch-size ≥ 1`; `sloth validate --suite` (task schema) | high | `tests/test_cmd_eval.py`, `tests/test_cmd_validate.py` · rubric gate 26/26 · `e13` |
 | per-file + aggregate scores with token-F1; `eval.json` in the evaluated dir; `summarize`/`compare` render it | high | `tests/test_tune_trainer.py`, `tests/test_tune_exporter.py`, `tests/test_tune_summary.py`, `tests/test_cmd_compare.py` · `e14` |
 | batched generation excludes each row's own prompt under left padding; 2.4x wall-clock on 46 items | high | `tests/test_tune_trainer.py` (3 load-bearing tests, `d1`) · `docs/benchmarks.md` (220 s vs 524 s) · `e15`, `e16` |
 | batched and serial decoding produce identical outputs | unverified | they do not at this scale (F1 0.038 vs 0.060, exact 0/46 both) — delta `b2`, plan risk r8; not claimed |
-| the starter suite makes exact-match a usable quantization-loss metric | low | 0/46 on every format for the smoke adapter — h15 filed as **fail** (`e28`); `l2` (pending) says the suite was never scored before shipping; a trained adapter is the missing input |
+| the starter suite makes exact-match a usable quantization-loss metric | low | 0/46 on every format for the smoke adapter — h15 filed as **fail** (`e28`); approved lapse `l2` says the suite was never scored before shipping; a trained adapter is the missing input |
 | QLoRA (bnb-4bit base) adapters merge to bf16 with no exporter change | high | `docs/tested.md` row (3.44 GB, no `quantization_config`) · `e20` |
 | Qwen3-1.7B exports to awq / nvfp4 / gguf with llm-compressor defaults | high | `docs/tested.md` rows (28 GQA mappings auto-skipped) · `e21` |
 | `export --base <id>` loads the staged adapter copy; continuation-only scoring holds on hardware | high | `docs/tested.md` rows · `e23` |
@@ -107,14 +107,15 @@ Lapse ledger evidence:
 | Lapse | Code | What |
 |-------|------|------|
 | `l1` | `provenance-missing` | Swept the exported spec by section headings and relied on frame state for the claim-by-claim read, instead of reading docs/specs/2026-09-15-lfm2-5-delivery-follow-ups-22.md claim by claim as the method asks |
+| `l2` | `assumption-for-measurement` | t7: the starter suite's expected outputs were shortened by judgment and never scored by `sloth eval` before shipping — caps the suite-as-metric claim at `low` |
+| `l3` | `provenance-missing` | t7: `examples/eval/task-format.jsonl` items are authored content built from documented CLI vocabulary, not derived from any repo row |
+| `l4` | `assumption-for-measurement` | t1: docker line-by-line streaming is proven only against a fake process — caps the streaming claim at `medium` |
 
-pending approval (not yet evidence): `l2` (t7 suite never scored before shipping),
-`l3` (task-format items are authored content), `l4` (docker streaming proven
-only against a fake process).
+All four lapses approved by the owner 2026-09-15.
 
 ## Remaining Work / Follow-up
 
-- **Owner adjudication** — confirm or reject deviations `d1`, `d3`, `d4`; lapses `l2`–`l4`; obligations `o1`–`o34`, evidence `e1`–`e36`, deltas `b1`–`b3`; frame parks `v1` (QLoRA dequant, now measured) and `v2` (Qwen3 GQA, now measured). Two deltas (the padded-width slice from `d1`, the single-line error from `d4`) file only after those deviations are approved.
+- **Owner adjudication** — done 2026-09-15: deviations `d1`, `d3`, `d4` approved; lapses `l2`–`l4` approved; obligations, evidence and deltas `b1`–`b5` confirmed; frame parks `v1` and `v2` resolved with the measured outcomes.
 - **A trained adapter for the benchmarks table** — the per-format scores are 0/46 exact-match on the smoke adapter (h15 fail); train a multi-hundred-step adapter on a real corpus and re-run `sloth eval --model` per format so the table measures quantization loss. Owner: next fine-tuning run.
 - **Batched vs serial equivalence** (plan risk r8) — check on a model with non-zero scores whether left-padded batched decoding should match serial; record the batch size in `eval.json` (delta `b2`).
 - **Orin Nano gguf load** — #23 (needs lobes down on the Spark).
