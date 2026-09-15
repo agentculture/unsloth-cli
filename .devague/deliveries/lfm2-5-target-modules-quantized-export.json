@@ -2,7 +2,7 @@
   "plan_slug": "lfm2-5-target-modules-quantized-export",
   "schema_version": 2,
   "created": "2026-09-15T11:22:08Z",
-  "updated": "2026-09-15T14:19:23Z",
+  "updated": "2026-09-15T14:31:15Z",
   "deviations": [
     {
       "id": "d1",
@@ -705,6 +705,120 @@
       "status": "proposed",
       "superseded": false,
       "seq": 38
+    },
+    {
+      "id": "e35",
+      "obligation_ref": "o9",
+      "test_ref": "tests/test_tune_exporter.py::test_export_json_records_every_contract_field",
+      "behavior_text": "export.json carries exactly the contract fields (format, output, quant, base, adapter, files, calibration, versions, timestamp)",
+      "contract_text": "written next to the artifacts with the listed fields",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "post-merge suite on main at the merge commit (586 passed)",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T14:18:41Z",
+        "commit": "445a490"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 39
+    },
+    {
+      "id": "e36",
+      "obligation_ref": "o9",
+      "test_ref": "tests/test_tune_exporter.py::test_append_index_takes_a_lock_file",
+      "behavior_text": "records are appended in order to <adapter>/exports.json and a .exports.json.lock file is taken for the read-modify-write",
+      "contract_text": "appended to <adapter>/exports.json",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "post-merge suite on main at the merge commit (586 passed)",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T14:18:41Z",
+        "commit": "445a490"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 40
+    },
+    {
+      "id": "e37",
+      "obligation_ref": "o10",
+      "test_ref": "tests/test_cmd_eval.py::test_adapter_and_model_are_mutually_exclusive",
+      "behavior_text": "passing both --adapter and --model exits 1 with a hint (neither: test_neither_adapter_nor_model_is_an_error)",
+      "contract_text": "mutually exclusive with --adapter (exit 1 + hint if both or neither)",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "post-merge suite on main at the merge commit (586 passed)",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T14:18:41Z",
+        "commit": "445a490"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 41
+    },
+    {
+      "id": "e38",
+      "obligation_ref": "o10",
+      "test_ref": "tests/test_cmd_eval.py::test_in_container_model_calls_run_eval_model, tests/test_cmd_eval.py::test_run_eval_model_transformers_path",
+      "behavior_text": "the --model result carries model_dir, quant_method and quant_format alongside the adapter-eval score fields, and the transformers path scores the generated continuation (fake generate returns prompt+continuation; 50% exact match)",
+      "contract_text": "result JSON has the same score fields as adapter eval plus model_dir, quant_method, quant_format",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "post-merge suite on main at the merge commit (586 passed)",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T14:18:41Z",
+        "commit": "445a490"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 42
+    },
+    {
+      "id": "e39",
+      "obligation_ref": "o13",
+      "test_ref": "tests/test_finetune_skill_script.py::test_finetune_sh_forwards_export_format_and_quant",
+      "behavior_text": "finetune.sh run forwards --format, --quant and a derived --output to sloth export",
+      "contract_text": "the /finetune skill forwards the export flags",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "post-merge suite on main at the merge commit (586 passed)",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T14:18:41Z",
+        "commit": "445a490"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 43
+    },
+    {
+      "id": "e40",
+      "obligation_ref": "o13",
+      "test_ref": "manual: docs/tested.md 2026-09-15 section reviewed against the run logs (t6_*, t13_* in the session scratchpad); same review as pre-merge e20",
+      "behavior_text": "every 2026-09-15 row carries its exact invocation and a measured result; unmeasured combinations are listed as gaps",
+      "contract_text": "rows only after real Spark runs, with the exact invocation; untested combinations stay under Not tested",
+      "evidence_type": "manual",
+      "strength": "fidelity",
+      "strength_basis": "author review; not machine-checked",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T14:18:41Z",
+        "commit": "445a490"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 44
     }
   ],
   "deltas": [
