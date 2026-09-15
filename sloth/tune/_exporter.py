@@ -43,6 +43,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess  # nosec B404 - scoring a GGUF means invoking llama-completion
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -625,3 +626,316 @@ def run_export(plan: dict[str, Any]) -> dict[str, Any]:
         "calibration": record["calibration"],
         "versions": record["versions"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Evaluating a merged / quantized model directory (``sloth eval --model DIR``)
+# ---------------------------------------------------------------------------
+
+#: Name of the llama.cpp binary used to score a GGUF. It is ``llama-completion``,
+#: **not** ``llama-cli``: ``-no-cnv`` (single-turn, no conversation wrapper) is only
+#: valid on ``llama-completion``. It lives in the llama.cpp cache that
+#: :func:`sloth.tune.container.export_launch_kwargs` bind-mounts at
+#: ``<HOME>/.unsloth/llama.cpp`` — the same directory must also be on
+#: ``LD_LIBRARY_PATH`` for the shared libs next to the binary.
+LLAMA_COMPLETION_BIN: str = "llama-completion"
+
+#: Default number of tokens generated per eval item (matches ``run_eval``).
+EVAL_MAX_NEW_TOKENS: int = 100
+
+_EVAL_NGC_HINT = (
+    "The eval backend (torch + transformers, plus compressed-tensors for an "
+    "awq/nvfp4 directory) is only available inside the NVIDIA NGC container: "
+    "nvcr.io/nvidia/pytorch:25.11-py3. Run `sloth eval --model <dir>` on the host "
+    "(it orchestrates the container for you) rather than calling the in-container "
+    "seam directly."
+)
+
+_LLAMA_HINT = (
+    "GGUF scoring runs llama.cpp's `llama-completion` from the cache mounted at "
+    "$HOME/.unsloth/llama.cpp. Run `sloth export --format gguf …` once (it populates "
+    "that cache), or set SLOTH_LLAMA_CPP_CACHE to a directory holding a llama.cpp "
+    "build, then retry."
+)
+
+
+@dataclass
+class _EvalBackend:
+    """The lazily-imported ML callables used to score a merged/quantized directory."""
+
+    torch: Any
+    auto_model_for_causal_lm: Any  # transformers.AutoModelForCausalLM
+    auto_tokenizer: Any  # transformers.AutoTokenizer
+
+
+def _load_eval_backend() -> _EvalBackend:
+    """Import torch + transformers and return them as an :class:`_EvalBackend`.
+
+    The single heavy-import seam for ``sloth eval --model`` — mirroring
+    :func:`_load_backend`, so a test monkeypatches *one* function: raising
+    ``ImportError`` exercises the ``CliError(code=2)`` NGC path and returning a fake
+    exercises the real flow GPU-free.
+
+    No unsloth import here: a merged/AWQ/NVFP4 checkpoint is a plain transformers
+    model (compressed-tensors quantisation is auto-detected from ``config.json``).
+
+    Raises:
+        ImportError: if torch or transformers is unavailable.
+    """
+    import torch  # noqa: PLC0415 — intentional lazy import
+    from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: PLC0415
+
+    return _EvalBackend(
+        torch=torch,
+        auto_model_for_causal_lm=AutoModelForCausalLM,
+        auto_tokenizer=AutoTokenizer,
+    )
+
+
+def _quant_info(model_dir: Path) -> tuple[str | None, str | None]:
+    """Return ``(quant_method, quant_format)`` read from ``<model_dir>/config.json``.
+
+    compressed-tensors outputs record their quantisation under
+    ``config.json["quantization_config"]`` as ``{"quant_method": "compressed-tensors",
+    "format": "pack-quantized"}`` (AWQ W4A16) or ``"nvfp4-pack-quantized"`` (NVFP4).
+    A plain bf16 merged checkpoint has no such key, and a GGUF directory has no
+    ``config.json`` at all — both yield ``(None, None)``.
+    """
+    config_file = model_dir / "config.json"
+    try:
+        config = json.loads(config_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    if not isinstance(config, dict):
+        return None, None
+    quant = config.get("quantization_config")
+    if not isinstance(quant, dict):
+        return None, None
+    method = quant.get("quant_method")
+    fmt = quant.get("format")
+    return (method if isinstance(method, str) else None, fmt if isinstance(fmt, str) else None)
+
+
+def _find_gguf(model_dir: Path) -> Path | None:
+    """Return the first ``*.gguf`` file directly inside *model_dir*, or ``None``."""
+    candidates = sorted(model_dir.glob("*.gguf"))
+    return candidates[0] if candidates else None
+
+
+def _eval_prompt(record: dict[str, Any]) -> str:
+    """Render one task-schema record into the prompt shape used by ``run_eval``."""
+    return f"Task: {record['task']}\nInput: {record['input']}\nOutput:"
+
+
+def _score_predictions(records: list[dict[str, Any]], predictions: list[str]) -> dict[str, Any]:
+    """Score *predictions* against *records* exactly as ``run_eval`` scores an adapter.
+
+    Deliberately a **duplicate** of the comparison run_eval performs inline
+    (``prediction.strip() == expected.strip()``, same per-record keys, same
+    ``exact_match_pct`` rounding): extracting it from ``_trainer.run_eval`` would mean
+    editing that function, and this seam must not change its behaviour.
+    """
+    results: list[dict[str, Any]] = []
+    for index, (record, prediction) in enumerate(zip(records, predictions)):
+        expected = record["expected_output"]
+        results.append(
+            {
+                "index": index,
+                "task": record["task"],
+                "input": record["input"],
+                "expected_output": expected,
+                "prediction": prediction,
+                "exact_match": prediction.strip() == expected.strip(),
+            }
+        )
+    total = len(results)
+    exact = sum(1 for r in results if r["exact_match"])
+    return {
+        "total": total,
+        "exact_match": exact,
+        "exact_match_pct": round(exact / total * 100, 2) if total else 0.0,
+        "results": results,
+    }
+
+
+def _llama_cpp_dir() -> Path:
+    """Return the in-container llama.cpp cache directory (``$HOME/.unsloth/llama.cpp``)."""
+    return Path(os.path.expanduser("~")) / ".unsloth" / "llama.cpp"
+
+
+def _run_llama_completion(gguf: Path, prompt: str, max_tokens: int) -> str:
+    """Score one prompt with ``llama-completion`` and return its stdout.
+
+    Invoked once per suite item as
+    ``llama-completion -m <gguf> -p <prompt> -n <max_tokens> --temp 0 -no-cnv``
+    with ``LD_LIBRARY_PATH`` pointing at the llama.cpp cache (the shared libraries
+    sit next to the binary). ``--temp 0`` makes the run deterministic and ``-no-cnv``
+    keeps it single-turn.
+    """
+    cache = _llama_cpp_dir()
+    binary = cache / LLAMA_COMPLETION_BIN
+    if not binary.is_file():
+        raise CliError(
+            code=EXIT_ENV_ERROR,
+            message=f"llama.cpp binary not found: {binary}",
+            remediation=_LLAMA_HINT,
+        )
+    env = dict(os.environ)
+    existing = env.get("LD_LIBRARY_PATH")
+    env["LD_LIBRARY_PATH"] = f"{cache}:{existing}" if existing else str(cache)
+    proc = subprocess.run(  # nosec B603 - fixed argv, no shell
+        [
+            str(binary),
+            "-m",
+            str(gguf),
+            "-p",
+            prompt,
+            "-n",
+            str(max_tokens),
+            "--temp",
+            "0",
+            "-no-cnv",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    if proc.returncode != 0:
+        raise CliError(
+            code=EXIT_ENV_ERROR,
+            message=(
+                f"{LLAMA_COMPLETION_BIN} exited with status {proc.returncode} "
+                f"while scoring {gguf.name}: {proc.stderr.strip()[:400]}"
+            ),
+            remediation=_LLAMA_HINT,
+        )
+    output = proc.stdout
+    # Defensive: some llama.cpp builds echo the prompt ahead of the completion.
+    if output.startswith(prompt):
+        output = output[len(prompt) :]
+    return output
+
+
+def _predict_gguf(gguf: Path, records: list[dict[str, Any]], max_tokens: int) -> list[str]:
+    """Return one completion per record, scored through llama.cpp."""
+    return [_run_llama_completion(gguf, _eval_prompt(record), max_tokens) for record in records]
+
+
+def _predict_transformers(
+    backend: _EvalBackend,
+    model_dir: Path,
+    records: list[dict[str, Any]],
+    max_tokens: int,
+) -> list[str]:
+    """Return one completion per record from a transformers-loadable directory.
+
+    ``AutoModelForCausalLM.from_pretrained(dir, dtype=torch.bfloat16)`` auto-detects a
+    compressed-tensors checkpoint (AWQ ``pack-quantized`` / NVFP4
+    ``nvfp4-pack-quantized``) from ``config.json``; a bf16 merged dir loads plainly.
+    ``local_files_only=True`` keeps the run offline.
+    """
+    tokenizer = backend.auto_tokenizer.from_pretrained(  # nosec B615
+        str(model_dir), local_files_only=True
+    )
+    model = backend.auto_model_for_causal_lm.from_pretrained(  # nosec B615
+        str(model_dir), dtype=backend.torch.bfloat16, local_files_only=True
+    )
+    model.eval()
+    # Tokenized inputs must share the model's device, else generate() raises
+    # "Expected all tensors to be on the same device" (same constraint as run_eval).
+    device = next(model.parameters()).device
+    predictions: list[str] = []
+    for record in records:
+        inputs = tokenizer(_eval_prompt(record), return_tensors="pt").to(device)
+        with backend.torch.no_grad():
+            outputs = model.generate(**inputs, max_new_tokens=max_tokens)
+        predictions.append(tokenizer.decode(outputs[0], skip_special_tokens=True))
+    return predictions
+
+
+def run_eval_model(
+    model_dir: str,
+    suite_path: str,
+    *,
+    max_new_tokens: int = EVAL_MAX_NEW_TOKENS,
+) -> dict[str, Any]:
+    """Evaluate a merged / quantized model **directory** against a task-schema suite.
+
+    The ``--model`` counterpart of :func:`sloth.tune._trainer.run_eval` (which scores a
+    LoRA *adapter*). Two backends, chosen by what the directory holds:
+
+    * a ``*.gguf`` file → scored with llama.cpp's ``llama-completion`` from the cache
+      mounted at ``$HOME/.unsloth/llama.cpp`` (see :func:`_run_llama_completion`);
+    * otherwise → loaded with transformers, which auto-detects a compressed-tensors
+      AWQ/NVFP4 checkpoint from ``config.json`` (see :func:`_predict_transformers`).
+
+    Parameters
+    ----------
+    model_dir:
+        Directory holding a merged (bf16/4-bit), AWQ, NVFP4 or GGUF export.
+    suite_path:
+        Path to a task-schema JSONL eval suite.
+    max_new_tokens:
+        Generation budget per item.
+
+    Returns
+    -------
+    dict
+        The same score fields as adapter eval — ``total``, ``exact_match``,
+        ``exact_match_pct``, ``results`` — plus ``model_dir``, ``quant_method`` and
+        ``quant_format`` (from ``config.json``'s ``quantization_config``; ``None``
+        for a plain bf16 merged dir or a GGUF).
+
+    Raises
+    ------
+    CliError(code=1)
+        When *model_dir* is not a directory (or the suite fails task-schema validation).
+    CliError(code=2)
+        When the ML stack is unavailable, llama.cpp is missing, or the GPU OOMs.
+    """
+    directory = Path(model_dir)
+    if not directory.is_dir():
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"model directory not found: {directory}",
+            remediation=(
+                "Pass an existing merged/quantized model directory with --model <path>. "
+                "Run `sloth export` to produce one."
+            ),
+        )
+
+    # Validate the suite BEFORE any model load — a broken suite must cost no GPU time.
+    records = validate_dataset(Path(suite_path), schema="task")
+    quant_method, quant_format = _quant_info(directory)
+
+    gguf = _find_gguf(directory)
+    try:
+        if gguf is not None:
+            predictions = _predict_gguf(gguf, records, max_new_tokens)
+        else:
+            try:
+                backend = _load_eval_backend()
+            except ImportError as exc:
+                raise CliError(
+                    code=EXIT_ENV_ERROR,
+                    message=f"The eval backend is not installed: {exc}",
+                    remediation=_EVAL_NGC_HINT,
+                ) from exc
+            predictions = _predict_transformers(backend, directory, records, max_new_tokens)
+    except CliError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if _is_gpu_oom(exc):
+            raise CliError(
+                code=EXIT_ENV_ERROR,
+                message=f"GPU out of memory during eval: {exc}",
+                remediation=_OOM_HINT,
+            ) from exc
+        raise
+
+    summary = _score_predictions(records, predictions)
+    summary["model_dir"] = str(directory)
+    summary["quant_method"] = quant_method
+    summary["quant_format"] = quant_format
+    return summary

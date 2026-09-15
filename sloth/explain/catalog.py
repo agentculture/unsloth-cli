@@ -244,10 +244,11 @@ adapts only q/k/v on the 6 attention layers.
 _EVAL = """\
 # unsloth-cli eval
 
-Run a trained LoRA/QLoRA adapter against a local task-schema eval suite and
-report exact-match scoring. All inference is local and offline
-(`local_files_only=True`); the heavy ML stack is imported lazily inside the
-inference backend, so importing the verb stays torch-free.
+Score a trained LoRA/QLoRA adapter — or a merged / quantized model directory —
+against a local task-schema eval suite, reporting exact-match scoring. All
+inference is local and offline (`local_files_only=True`); the heavy ML stack is
+imported lazily inside the inference backend, so importing the verb stays
+torch-free.
 
 The suite is a JSONL file whose records conform to the **task** schema
 (`{"task", "input", "expected_output"}`), validated before inference. Each
@@ -255,22 +256,41 @@ record's prediction is compared to its `expected_output` for an exact match, and
 a summary (`total`, `exact_match`, `exact_match_pct`) plus per-record results is
 emitted.
 
+## Two targets: `--adapter` or `--model`
+
+Exactly one is required — passing both, or neither, exits `1` with a `hint:`.
+
+- `--adapter DIR` scores a LoRA adapter by loading its base model and wrapping it
+  with the adapter weights.
+- `--model DIR` scores a directory produced by `unsloth-cli export`: a merged
+  (bf16/4-bit) checkpoint, an AWQ or NVFP4 compressed-tensors checkpoint (both
+  auto-detected by transformers from `config.json`), or a GGUF — which is scored
+  with llama.cpp's `llama-completion` from the mounted llama.cpp cache.
+
+A `--model` run reports the same score fields plus `model_dir`, `quant_method`
+and `quant_format` (read from `config.json`'s `quantization_config`; both `null`
+for a plain bf16 merged directory or a GGUF).
+
 ## Usage
 
     unsloth-cli eval --adapter adapters/qwen3-4b-qlora --suite data/eval.jsonl
-    unsloth-cli eval --adapter adapters/qwen3-4b-qlora --suite data/eval.jsonl --json
+    unsloth-cli eval --model exports/qwen3-4b-awq --suite data/eval.jsonl
+    unsloth-cli eval --model exports/qwen3-4b-gguf --suite data/eval.jsonl --json
 
 ## Key flags
 
-- `--adapter DIR` (required) — adapter directory produced by `unsloth-cli train`.
+- `--adapter DIR` — adapter directory produced by `unsloth-cli train`.
+- `--model DIR` — merged / quantized / GGUF directory produced by
+  `unsloth-cli export` (mutually exclusive with `--adapter`).
 - `--suite PATH` (required) — task-schema JSONL eval suite.
 - `--json` — emit the scored summary and per-record results as structured JSON.
 
 ## Exit codes
 
 - `0` success
-- `1` user-input error (missing adapter dir, missing/malformed suite)
-- `2` environment / setup error (ML stack not installed)
+- `1` user-input error (both/neither target, missing adapter or model dir,
+  missing/malformed suite)
+- `2` environment / setup error (ML stack not installed, llama.cpp missing, OOM)
 """
 
 _EXPORT = """\
