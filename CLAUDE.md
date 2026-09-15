@@ -251,9 +251,12 @@ not.
   `uv pip install --system` fails on the NGC image — PEP-668 as root, root-owned
   site-packages under `--user`). The pins are **validated against NGC 25.11's torch
   2.10** (`transformers==4.57.1 peft==0.18.0 trl==0.24.0 datasets==4.8.5 hf_transfer`,
-  then `--no-deps unsloth unsloth_zoo bitsandbytes`; the venv-pulled torch is then
-  uninstalled so the nv torch shows through). **Do not float these** — `peft>=0.19`
-  hard-requires `torchao>0.16`, which needs `torch>=2.11` the container lacks. The
+  then `--no-deps unsloth==2026.9.4 unsloth_zoo==2026.9.3 bitsandbytes==0.50.2`,
+  all three pinned — not left floating — to the versions measured live
+  2026-09-15 (bump procedure: `docs/dgx-spark.md`'s "Bumping the ... pins"
+  section); the venv-pulled torch is then uninstalled so the nv torch shows
+  through). **Do not float these** — `peft>=0.19` hard-requires `torchao>0.16`,
+  which needs `torch>=2.11` the container lacks. The
   exact recipe + Spark gotchas (UMA OOM → `PYTORCH_ALLOC_CONF=expandable_segments`,
   HF-cache mount, the version-matrix deadlock) live in
   [`docs/dgx-spark.md`](docs/dgx-spark.md); measured runs in

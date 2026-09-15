@@ -111,11 +111,19 @@ DEP_LAYER_PACKAGES: tuple[str, ...] = (
 )
 
 #: Dependency layer installed with ``uv pip install --no-deps`` — these must NOT
-#: drag their own torch/transformers in; the container's torch is used.
+#: drag their own torch/transformers in; the container's torch is used. Pinned
+#: (not left floating) to the versions measured live 2026-09-15 on NGC 25.11
+#: (torch 2.10) by running the exact install line this module composes
+#: (DEP_LAYER_PACKAGES then these, into a ``uv venv --system-site-packages``
+#: venv) via ``docker run --rm nvcr.io/nvidia/pytorch:25.11-py3 ...`` followed
+#: by ``uv pip list``: unsloth 2026.9.4, unsloth_zoo 2026.9.3 (matching
+#: docs/tested.md's 2026-09-15 row), bitsandbytes 0.50.2. See the "Bumping the
+#: unsloth / unsloth_zoo / bitsandbytes pins" section in docs/dgx-spark.md for
+#: the re-validation procedure before changing these.
 DEP_LAYER_NODEPS_PACKAGES: tuple[str, ...] = (
-    "unsloth",
-    "unsloth_zoo",
-    "bitsandbytes",
+    "unsloth==2026.9.4",
+    "unsloth_zoo==2026.9.3",
+    "bitsandbytes==0.50.2",
 )
 
 #: Pinned version of the astral uv standalone installer (supply-chain safety).
