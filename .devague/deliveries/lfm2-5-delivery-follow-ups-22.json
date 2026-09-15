@@ -2,7 +2,7 @@
   "plan_slug": "lfm2-5-delivery-follow-ups-22",
   "schema_version": 2,
   "created": "2026-09-15T16:51:55Z",
-  "updated": "2026-09-15T16:51:55Z",
+  "updated": "2026-09-15T17:08:21Z",
   "deviations": [
     {
       "id": "d1",
@@ -16,6 +16,21 @@
       "status": "proposed",
       "classification": "acceptable",
       "seq": 1
+    },
+    {
+      "id": "d2",
+      "what": "Live t9 run found that sloth export's --adapter/--output/--calib path sanitizer (_sanitize_path, export.py:246-273, landed in the #20 squash after its live validation) also runs INSIDE the container, where cwd is /workspace and HOME is the export home, so every real export exits 1 with 'path is outside the allowed roots' for the identity-mounted host path. Every export on main is broken. Proposed fix (not in any plan task): _container_kwargs forwards SLOTH_ALLOWED_ROOTS into the container env, set to the identity-mounted parents (adapter, output, calib, dataset), plus a unit test asserting the env reaches the docker argv and a fake in-container request under /workspace passes the sanitizer.",
+      "task_ref": "t9",
+      "reason": "blocking: t9's export rows (c10, c12, c21) cannot run until real exports work again",
+      "affects": [
+        "c10",
+        "c12",
+        "c21"
+      ],
+      "origin": "llm",
+      "status": "approved",
+      "classification": "needs-follow-up",
+      "seq": 2
     }
   ],
   "evidence": [],

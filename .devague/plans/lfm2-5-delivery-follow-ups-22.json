@@ -5,7 +5,7 @@
   "schema_version": 5,
   "status": "exported",
   "created": "2026-09-15T16:03:25Z",
-  "updated": "2026-09-15T16:20:12Z",
+  "updated": "2026-09-15T17:16:20Z",
   "targets": [
     {
       "id": "c1",
@@ -753,16 +753,16 @@
       "text": "Assumption c40 (the NGC banner is emitted by the container entrypoint, so only host-side capture can strip it) is unmeasured until t9's banner probe; if the banner turns out to be sloth's own bootstrap output, t1's design still holds but t2 could additionally silence it in-container",
       "kind": "unknown_nonblocking",
       "task_id": "t9",
-      "resolved": false,
-      "resolution": ""
+      "resolved": true,
+      "resolution": "Measured 2026-09-15 (t9): docker run --rm nvcr.io/nvidia/pytorch:25.11-py3 python -c pass prints 36 lines on stdout and 0 on stderr \u2014 the banner is the entrypoint's, so host-side capture (t1) is necessary; live train --json then gave 1 stdout line / 219 stderr lines (10 loss dicts on stderr)."
     },
     {
       "id": "r2",
       "text": "The bitsandbytes version to pin is unknown until t8 reads it from the container on the Spark (park v3); t8 cannot be finished on a machine without docker + the NGC image",
       "kind": "unknown_nonblocking",
       "task_id": "t8",
-      "resolved": false,
-      "resolution": ""
+      "resolved": true,
+      "resolution": "Measured by t8 in-container on 2026-09-15: bitsandbytes 0.50.2 (with unsloth 2026.9.4 / unsloth-zoo 2026.9.3); pinned."
     },
     {
       "id": "r3",
@@ -777,8 +777,8 @@
       "text": "Whether Unsloth dequantises a 4-bit-trained adapter on a 16-bit merge (r3 on the shipped plan) is unmeasured until t9; a failure turns into a /deviate adding the training-metadata read from assumption c11",
       "kind": "unknown_nonblocking",
       "task_id": "t9",
-      "resolved": false,
-      "resolution": ""
+      "resolved": true,
+      "resolution": "Measured 2026-09-15 (t9): runs/qlora-smoke (base unsloth/qwen3-1.7b-unsloth-bnb-4bit) \u2192 sloth export --format merged-16bit produced a 3.44 GB bf16 model.safetensors with no quantization_config in 150 s; Unsloth dequantises implicitly, no exporter change needed (assumption c11's conditional branch not taken)."
     },
     {
       "id": "r5",
@@ -793,8 +793,8 @@
       "text": "t1 and t8 both edit sloth/tune/container.py; the dependency serialises them, but t2 (train/eval/export call sites) and t4 (eval.py argparse) both touch eval.py \u2014 t4 owns argparse + preflight, t2 owns only the launch/emit call site at eval.py:200; the merge of that wave must be checked by hand",
       "kind": "unknown_nonblocking",
       "task_id": "t4",
-      "resolved": false,
-      "resolution": ""
+      "resolved": true,
+      "resolution": "t2 and t4 merged into feat/follow-ups-22-a without conflict (t4 owned argparse/preflight, t2 only the launch/emit call site); t4's inspect.signature bridge was removed in a follow-up integration commit once t5 landed."
     },
     {
       "id": "r7",
