@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-09-15
+
+### Changed
+
+- Delivery summary for the LFM2.5 target_modules + quantized export run updated with post-merge validation (evidence re-filed at the merge commit `445a490`)
+
 ## [0.7.0] - 2026-09-15
 
 ### Added
