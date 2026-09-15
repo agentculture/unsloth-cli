@@ -403,23 +403,7 @@ def cmd_train(args: argparse.Namespace) -> int | None:
 
     # 4a) Dry-run: resolve the plan on the host; also show the docker command.
     if dry_run:
-        plan = run_training(config, dry_run=True)
-        config_path = Path(args.config).resolve()
-        config_dir, extra_mounts, sloth_args = _resolve_container_invocation(config_path, config)
-        checkout = Path(__file__).resolve().parents[3]
-        cmd = container_mod.build_command(
-            sloth_args, workdir=config_dir, checkout=checkout, extra_mounts=extra_mounts
-        )
-        if json_mode:
-            result: dict[str, Any] = dict(plan)
-            result["docker_image"] = container_mod.NGC_IMAGE
-            result["docker_command"] = cmd
-            emit_result(result, json_mode=True)
-        else:
-            text = _render_plan_text(plan)
-            text += f"\ndocker-image:   {container_mod.NGC_IMAGE}"
-            text += f"\ndocker-command: {' '.join(cmd)}"
-            emit_result(text, json_mode=False)
+        _cmd_train_dry_run(args, config, json_mode)
         return
 
     # 4b) In-container: recursion guard — run the real trainer, no docker launch.
@@ -427,20 +411,51 @@ def cmd_train(args: argparse.Namespace) -> int | None:
     # section): a registry line is appended "running" before run_training and
     # atomically rewritten "ok"/"failed" after — dry-run (4a) never reaches here.
     if in_container:
-        run_record = registry_mod.start_run(config)
-        try:
-            plan = run_training(config, dry_run=False)
-        except Exception:
-            registry_mod.finish_run(run_record, status=registry_mod.STATUS_FAILED)
-            raise
-        registry_mod.finish_run(run_record, status=registry_mod.STATUS_OK)
-        if json_mode:
-            emit_result(plan, json_mode=True)
-        else:
-            emit_result(_render_plan_text(plan), json_mode=False)
+        _cmd_train_in_container(config, json_mode)
         return
 
     # 4c) Host real run: orchestrate via the NGC container.
+    _cmd_train_host(args, config, json_mode)
+
+
+def _cmd_train_dry_run(args: argparse.Namespace, config: RunConfig, json_mode: bool) -> None:
+    """Step 4a: resolve the plan on the host and print the docker command, no GPU work."""
+    plan = run_training(config, dry_run=True)
+    config_path = Path(args.config).resolve()
+    config_dir, extra_mounts, sloth_args = _resolve_container_invocation(config_path, config)
+    checkout = Path(__file__).resolve().parents[3]
+    cmd = container_mod.build_command(
+        sloth_args, workdir=config_dir, checkout=checkout, extra_mounts=extra_mounts
+    )
+    if json_mode:
+        result: dict[str, Any] = dict(plan)
+        result["docker_image"] = container_mod.NGC_IMAGE
+        result["docker_command"] = cmd
+        emit_result(result, json_mode=True)
+    else:
+        text = _render_plan_text(plan)
+        text += f"\ndocker-image:   {container_mod.NGC_IMAGE}"
+        text += f"\ndocker-command: {' '.join(cmd)}"
+        emit_result(text, json_mode=False)
+
+
+def _cmd_train_in_container(config: RunConfig, json_mode: bool) -> None:
+    """Step 4b: recursion guard — run the real trainer in-process, no docker launch."""
+    run_record = registry_mod.start_run(config)
+    try:
+        plan = run_training(config, dry_run=False)
+    except Exception:
+        registry_mod.finish_run(run_record, status=registry_mod.STATUS_FAILED)
+        raise
+    registry_mod.finish_run(run_record, status=registry_mod.STATUS_OK)
+    if json_mode:
+        emit_result(plan, json_mode=True)
+    else:
+        emit_result(_render_plan_text(plan), json_mode=False)
+
+
+def _cmd_train_host(args: argparse.Namespace, config: RunConfig, json_mode: bool) -> None:
+    """Step 4c: host real run — orchestrate the real job via the NGC container."""
     config_path = Path(args.config).resolve()
     config_dir, extra_mounts, sloth_args = _resolve_container_invocation(config_path, config)
     checkout = Path(__file__).resolve().parents[3]

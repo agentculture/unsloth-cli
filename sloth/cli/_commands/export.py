@@ -599,7 +599,6 @@ def _sloth_args(
     calib: Path | None,
     calib_samples: int | None,
     keep_intermediate: bool,
-    json_mode: bool,
 ) -> list[str]:
     """Build the ``python -m sloth export …`` argv forwarded into the container.
 
@@ -628,8 +627,7 @@ def _sloth_args(
     # --json is always forwarded to the container (unconditionally, regardless of
     # the host's own --json flag) so the container always prints a structured
     # result line for container.launch() to parse and return; the host re-renders
-    # that dict according to its OWN --json flag (json_mode is unused here now,
-    # kept as a parameter for call-site stability).
+    # that dict according to its OWN --json flag.
     args.append("--json")
     args.append("--in-container")
     return args
@@ -649,27 +647,48 @@ def _merge_mounts(
     return merged
 
 
+def _base_local_path(base: str | None) -> Path | None:
+    """Return the sanitized local directory *base* names, or ``None`` for a Hub id.
+
+    ``--base`` may be a Hub model id (``org/name``, left untouched — never mounted,
+    never sanitized) or a LOCAL directory. A value is treated as local when it is
+    syntactically a path (:func:`_looks_like_path` — absolute, or starting with
+    ``.``/``~``) or when it already exists on disk. Anything local is run through
+    :func:`_sanitize_path` so it is subject to the same allow-list as
+    ``--adapter``/``--output``/``--calib``.
+    """
+    if not base:
+        return None
+    if _looks_like_path(base) or Path(os.path.expanduser(base)).exists():
+        return _sanitize_path(base, "--base")
+    return None
+
+
 def _container_kwargs(
     container: Any,
     adapter: Path,
     output: Path,
     calib: Path | None,
     dataset: Path | None = None,
+    base: str | None = None,
 ) -> dict[str, Any]:
     """Return the keyword arguments shared by ``build_command`` and ``launch``.
 
-    Identity mounts (``host == container``) for the adapter, output and calibration
-    parents mirror ``eval.py``; ``sorted`` keeps the docker argv deterministic.
-    Anything :func:`container.export_launch_kwargs` contributes (the llama.cpp
-    cache mount and the ``HOME`` / ``UNSLOTH_LLAMA_TAG`` env, added by t8) is
-    merged in — the ``getattr`` fallback keeps this working against a container
-    module that does not have it yet.
+    Identity mounts (``host == container``) for the adapter, output, calibration
+    and (when local) base-model parents mirror ``eval.py``; ``sorted`` keeps the
+    docker argv deterministic. Anything :func:`container.export_launch_kwargs`
+    contributes (the llama.cpp cache mount and the ``HOME`` / ``UNSLOTH_LLAMA_TAG``
+    env, added by t8) is merged in — the ``getattr`` fallback keeps this working
+    against a container module that does not have it yet.
     """
     parents = {adapter.parent, output.parent}
     if calib is not None:
         parents.add(calib.parent)
     if dataset is not None:
         parents.add(dataset.parent)
+    base_path = _base_local_path(base)
+    if base_path is not None:
+        parents.add(base_path.parent)
     own_mounts = [(str(p), str(p)) for p in sorted(parents)]
 
     supplied = getattr(container, "export_launch_kwargs", lambda: {})() or {}
@@ -761,12 +780,16 @@ class _ExportRequest:
             calib=self.calibration_source,
             calib_samples=self.calib_samples,
             keep_intermediate=self.keep_intermediate,
-            json_mode=self.json_mode,
         )
 
     def container_kwargs(self, container: Any) -> dict[str, Any]:
         return _container_kwargs(
-            container, self.adapter_abs, self.output_abs, self.calib, self.dataset_path
+            container,
+            self.adapter_abs,
+            self.output_abs,
+            self.calib,
+            self.dataset_path,
+            base=self.base,
         )
 
 
