@@ -78,6 +78,7 @@ def _write_toml(
     method: str = "qlora",
     output: str | None = None,
     name: str = "run.toml",
+    hyperparameters: str = "",
 ) -> Path:
     out = output if output is not None else str(tmp_path / "adapters" / "out")
     toml = (
@@ -87,6 +88,8 @@ def _write_toml(
         f'dataset = "{dataset}"\n'
         f'output  = "{out}"\n'
     )
+    if hyperparameters:
+        toml += "\n[hyperparameters]\n" + hyperparameters.strip() + "\n"
     f = tmp_path / name
     f.write_text(toml, encoding="utf-8")
     return f
@@ -862,3 +865,345 @@ def test_in_container_flag_suppressed_from_help() -> None:
     train_parser = sub.choices["train"]
     help_text = train_parser.format_help()
     assert "--in-container" not in help_text
+
+
+# ---------------------------------------------------------------------------
+# t4 acceptance — host preflight: LFM2 preset hint, rank>32 hand-lane
+# diagnostic, chat-template check (covers c27, h17, c9, h8)
+# ---------------------------------------------------------------------------
+
+_LFM2_MODEL = "LiquidAI/LFM2.5-1.2B-Base"
+_VALID_TASK = '{"task": "echo", "input": "hi", "expected_output": "hi"}\n'
+
+
+def _make_hf_home(
+    tmp_path: Path,
+    repo_id: str,
+    *,
+    chat_template_jinja: bool = False,
+    tokenizer_chat_template: bool = False,
+    tokenizer_config: bool = True,
+) -> Path:
+    """Build a fake HF cache (``<HF_HOME>/hub/models--<org>--<name>/snapshots/<rev>/``).
+
+    Returns the ``HF_HOME`` root to export.  With no template flags set the
+    snapshot exists but carries neither a ``chat_template.jinja`` nor a
+    ``chat_template`` key — the "cached but chat-incapable" case.
+    """
+    hf_home = tmp_path / "hf"
+    snapshot = hf_home / "hub" / f"models--{repo_id.replace('/', '--')}" / "snapshots" / "deadbeef"
+    snapshot.mkdir(parents=True, exist_ok=True)
+    if chat_template_jinja:
+        (snapshot / "chat_template.jinja").write_text("{{ x }}", encoding="utf-8")
+    if tokenizer_config:
+        payload: dict[str, Any] = {"model_max_length": 128}
+        if tokenizer_chat_template:
+            payload["chat_template"] = "{{ x }}"
+        (snapshot / "tokenizer_config.json").write_text(json.dumps(payload), encoding="utf-8")
+    return hf_home
+
+
+def _err_lines(capsys: pytest.CaptureFixture[str]) -> list[str]:
+    return [ln for ln in capsys.readouterr().err.splitlines() if ln.strip()]
+
+
+# --- LFM2 target_modules hint (c27) ----------------------------------------
+
+
+def test_lfm2_without_target_modules_emits_single_preset_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A dry-run of an LFM2 model with no target_modules hints preset:lfm2 exactly once."""
+    monkeypatch.setenv(
+        "HF_HOME", str(_make_hf_home(tmp_path, _LFM2_MODEL, chat_template_jinja=True))
+    )
+    dataset = _write_dataset(tmp_path)
+    cfg = _write_toml(tmp_path, dataset=dataset, model=_LFM2_MODEL, method="lora")
+
+    rc = cmd_train(_make_args(cfg, dry_run=True, json_mode=True))
+    assert rc in (None, 0)
+    captured = capsys.readouterr()
+    lines = [ln for ln in captured.err.splitlines() if ln.strip()]
+    assert len(lines) == 1, lines
+    assert "preset:lfm2" in lines[0]
+    assert "target_modules" in lines[0]
+    # stdout is unchanged and still parses as the plan JSON.
+    payload = json.loads(captured.out)
+    assert payload["model"] == _LFM2_MODEL
+    assert payload["dry_run"] is True
+
+
+def test_lfm2_hint_on_real_host_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The hint fires on the real (non-dry-run) host path too, before the container launch."""
+    monkeypatch.setenv(
+        "HF_HOME", str(_make_hf_home(tmp_path, _LFM2_MODEL, chat_template_jinja=True))
+    )
+    dataset = _write_dataset(tmp_path)
+    cfg = _write_toml(tmp_path, dataset=dataset, model=_LFM2_MODEL, method="lora")
+    mock_launch = Mock()
+    monkeypatch.setattr(container_mod, "launch", mock_launch)
+
+    cmd_train(_make_args(cfg))
+    lines = _err_lines(capsys)
+    assert len(lines) == 1, lines
+    assert "preset:lfm2" in lines[0]
+    mock_launch.assert_called_once()
+
+
+def test_lfm2_hint_not_repeated_in_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The in-container recursion must not repeat the hint (one line per invocation)."""
+    monkeypatch.setenv(
+        "HF_HOME", str(_make_hf_home(tmp_path, _LFM2_MODEL, chat_template_jinja=True))
+    )
+    dataset = _write_dataset(tmp_path)
+    cfg = _write_toml(tmp_path, dataset=dataset, model=_LFM2_MODEL, method="lora")
+    monkeypatch.setattr(
+        train_mod,
+        "run_training",
+        lambda config, **_k: {"model": config.model, "hyperparameters": {}},
+    )
+
+    cmd_train(_make_args(cfg, in_container=True))
+    err = capsys.readouterr().err
+    assert "preset:lfm2" not in err
+
+
+def test_no_preset_hint_when_target_modules_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An explicit target_modules silences the LFM2 hint."""
+    monkeypatch.setenv(
+        "HF_HOME", str(_make_hf_home(tmp_path, _LFM2_MODEL, chat_template_jinja=True))
+    )
+    dataset = _write_dataset(tmp_path)
+    cfg = _write_toml(
+        tmp_path,
+        dataset=dataset,
+        model=_LFM2_MODEL,
+        method="lora",
+        hyperparameters='target_modules = "preset:lfm2"',
+    )
+    cmd_train(_make_args(cfg, dry_run=True))
+    assert _err_lines(capsys) == []
+
+
+def test_no_preset_hint_for_non_lfm2_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A non-LFM2 model never gets the preset:lfm2 hint."""
+    model = "unsloth/Qwen3-4B"
+    monkeypatch.setenv("HF_HOME", str(_make_hf_home(tmp_path, model, chat_template_jinja=True)))
+    dataset = _write_dataset(tmp_path)
+    cfg = _write_toml(tmp_path, dataset=dataset, model=model)
+    cmd_train(_make_args(cfg, dry_run=True))
+    assert _err_lines(capsys) == []
+
+
+def test_lfm2_match_is_case_insensitive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """'lfm2' matches case-insensitively anywhere in the model id."""
+    model = "liquidai/lfm2-350m"
+    monkeypatch.setenv("HF_HOME", str(_make_hf_home(tmp_path, model, chat_template_jinja=True)))
+    dataset = _write_dataset(tmp_path)
+    cfg = _write_toml(tmp_path, dataset=dataset, model=model, method="lora")
+    cmd_train(_make_args(cfg, dry_run=True))
+    lines = _err_lines(capsys)
+    assert len(lines) == 1 and "preset:lfm2" in lines[0]
+
+
+# --- rank > 32 hand-lane diagnostic (h17) ----------------------------------
+
+
+def test_lfm2_rank_above_32_warns_about_hand_lane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """lora_r > 32 on an LFM2 model warns that lobes' hand lane caps rank at 32 — never errors."""
+    monkeypatch.setenv(
+        "HF_HOME", str(_make_hf_home(tmp_path, _LFM2_MODEL, chat_template_jinja=True))
+    )
+    dataset = _write_dataset(tmp_path)
+    cfg = _write_toml(
+        tmp_path,
+        dataset=dataset,
+        model=_LFM2_MODEL,
+        method="lora",
+        hyperparameters='lora_r = 64\ntarget_modules = "preset:lfm2"',
+    )
+    rc = cmd_train(_make_args(cfg, dry_run=True))
+    assert rc in (None, 0)
+    lines = _err_lines(capsys)
+    assert len(lines) == 1, lines
+    assert "hand lane" in lines[0]
+    assert "32" in lines[0]
+
+
+def test_lfm2_rank_32_is_not_warned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Rank exactly at the cap is fine — the diagnostic is for rank > 32 only."""
+    monkeypatch.setenv(
+        "HF_HOME", str(_make_hf_home(tmp_path, _LFM2_MODEL, chat_template_jinja=True))
+    )
+    dataset = _write_dataset(tmp_path)
+    cfg = _write_toml(
+        tmp_path,
+        dataset=dataset,
+        model=_LFM2_MODEL,
+        method="lora",
+        hyperparameters='lora_r = 32\ntarget_modules = "preset:lfm2"',
+    )
+    cmd_train(_make_args(cfg, dry_run=True))
+    assert _err_lines(capsys) == []
+
+
+def test_non_lfm2_high_rank_is_not_warned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The hand-lane cap is an LFM2/lobes concern — a non-LFM2 model is left alone."""
+    model = "unsloth/Qwen3-4B"
+    monkeypatch.setenv("HF_HOME", str(_make_hf_home(tmp_path, model, chat_template_jinja=True)))
+    dataset = _write_dataset(tmp_path)
+    cfg = _write_toml(tmp_path, dataset=dataset, model=model, hyperparameters="lora_r = 64")
+    cmd_train(_make_args(cfg, dry_run=True))
+    assert _err_lines(capsys) == []
+
+
+# --- chat-template preflight (c9, h8) --------------------------------------
+
+
+def test_chat_dataset_cached_model_without_chat_template_exits_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cached model with neither template source refuses a chat-schema run with code 1."""
+    model = "acme/base-only"
+    monkeypatch.setenv("HF_HOME", str(_make_hf_home(tmp_path, model)))
+    dataset = _write_dataset(tmp_path)
+    cfg = _write_toml(tmp_path, dataset=dataset, model=model)
+
+    with pytest.raises(CliError) as exc_info:
+        cmd_train(_make_args(cfg, dry_run=True))
+    assert exc_info.value.code == 1
+    assert "chat" in exc_info.value.message.lower()
+    assert "task" in (exc_info.value.remediation or "").lower()
+
+
+def test_chat_template_jinja_file_satisfies_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A separate chat_template.jinja counts (LFM2.5-1.2B-Base ships exactly this)."""
+    model = "acme/jinja-only"
+    monkeypatch.setenv("HF_HOME", str(_make_hf_home(tmp_path, model, chat_template_jinja=True)))
+    dataset = _write_dataset(tmp_path)
+    cfg = _write_toml(tmp_path, dataset=dataset, model=model)
+    rc = cmd_train(_make_args(cfg, dry_run=True))
+    assert rc in (None, 0)
+    assert _err_lines(capsys) == []
+
+
+def test_tokenizer_config_chat_template_key_satisfies_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A ``chat_template`` key inside tokenizer_config.json counts too."""
+    model = "acme/tokenizer-key"
+    monkeypatch.setenv("HF_HOME", str(_make_hf_home(tmp_path, model, tokenizer_chat_template=True)))
+    dataset = _write_dataset(tmp_path)
+    cfg = _write_toml(tmp_path, dataset=dataset, model=model)
+    rc = cmd_train(_make_args(cfg, dry_run=True))
+    assert rc in (None, 0)
+    assert _err_lines(capsys) == []
+
+
+def test_uncached_model_emits_diagnostic_and_proceeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A model not yet in the local cache cannot be checked — diagnose, don't fail."""
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "empty-hf"))
+    dataset = _write_dataset(tmp_path)
+    cfg = _write_toml(tmp_path, dataset=dataset, model="acme/not-downloaded")
+    rc = cmd_train(_make_args(cfg, dry_run=True))
+    assert rc in (None, 0)
+    lines = _err_lines(capsys)
+    assert len(lines) == 1, lines
+    assert "chat template" in lines[0].lower()
+    assert "cache" in lines[0].lower()
+
+
+def test_task_schema_skips_the_chat_template_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A task-schema dataset needs no chat template — the check does not run at all."""
+    model = "acme/base-only"
+    monkeypatch.setenv("HF_HOME", str(_make_hf_home(tmp_path, model)))
+    dataset = _write_dataset(tmp_path, body=_VALID_TASK)
+    cfg = _write_toml(tmp_path, dataset=dataset, model=model)
+    rc = cmd_train(_make_args(cfg, dry_run=True))
+    assert rc in (None, 0)
+    assert _err_lines(capsys) == []
+
+
+def test_local_model_directory_counts_as_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A local model directory is 'cached': its own files are inspected."""
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "empty-hf"))
+    model_dir = tmp_path / "local-model"
+    model_dir.mkdir()
+    (model_dir / "chat_template.jinja").write_text("{{ x }}", encoding="utf-8")
+    dataset = _write_dataset(tmp_path)
+    cfg = _write_toml(tmp_path, dataset=dataset, model=str(model_dir))
+    rc = cmd_train(_make_args(cfg, dry_run=True))
+    assert rc in (None, 0)
+    assert _err_lines(capsys) == []
+
+
+def test_local_model_directory_without_template_exits_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A local model dir lacking any chat template refuses a chat-schema run."""
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "empty-hf"))
+    model_dir = tmp_path / "local-model"
+    model_dir.mkdir()
+    (model_dir / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+    dataset = _write_dataset(tmp_path)
+    cfg = _write_toml(tmp_path, dataset=dataset, model=str(model_dir))
+    with pytest.raises(CliError) as exc_info:
+        cmd_train(_make_args(cfg, dry_run=True))
+    assert exc_info.value.code == 1
+
+
+def test_chat_template_preflight_runs_before_the_scope_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The preflight sits between dataset validation and the scope guard."""
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "empty-hf"))
+    dataset = _write_dataset(tmp_path)
+    cfg = RunConfig(
+        model="LiquidAI/LFM2.5-1.2B-Base",
+        dataset=str(dataset),
+        output=str(tmp_path / "out"),
+        method="full",
+    )
+    monkeypatch.setattr(train_mod, "load_config", lambda _path: cfg)
+    with pytest.raises(CliError):
+        cmd_train(_make_args(tmp_path / "ignored.toml"))
+    err = capsys.readouterr().err
+    # Preflight diagnostics precede the scope-guard warning on stderr.
+    assert "preset:lfm2" in err
+    assert err.index("preset:lfm2") < err.lower().index("out of scope")
+
+
+def test_preflight_imports_no_transformers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The host preflight is stdlib-only: no transformers / huggingface_hub import."""
+    monkeypatch.setenv(
+        "HF_HOME", str(_make_hf_home(tmp_path, _LFM2_MODEL, chat_template_jinja=True))
+    )
+    dataset = _write_dataset(tmp_path)
+    cfg = _write_toml(tmp_path, dataset=dataset, model=_LFM2_MODEL, method="lora")
+    cmd_train(_make_args(cfg, dry_run=True))
+    assert "transformers" not in sys.modules
+    assert "huggingface_hub" not in sys.modules
