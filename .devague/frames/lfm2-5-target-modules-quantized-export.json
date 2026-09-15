@@ -4,7 +4,7 @@
   "schema_version": 6,
   "status": "exported",
   "created": "2026-09-15T06:00:34Z",
-  "updated": "2026-09-15T10:30:11Z",
+  "updated": "2026-09-15T13:42:43Z",
   "claims": [
     {
       "id": "c1",
@@ -1175,7 +1175,7 @@
         "assign-to-workforce wave 1 / t9"
       ],
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     },
     {
       "id": "l3",
@@ -1186,7 +1186,7 @@
         "assign-to-workforce wave 1 / t7"
       ],
       "origin": "llm",
-      "status": "proposed"
+      "status": "approved"
     }
   ],
   "obligations": [
