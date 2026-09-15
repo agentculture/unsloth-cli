@@ -116,6 +116,17 @@ def test_dry_run_text_plan(good_config: Path, capsys: pytest.CaptureFixture[str]
     assert "dry-run" in out.lower()
 
 
+def test_lfm2_lora_example_dry_run(capsys: pytest.CaptureFixture[str]) -> None:
+    """The shipped examples/lfm2-lora.toml dry-runs to exit 0 with its plan."""
+    rc = cmd_train(_make_args(Path("examples/lfm2-lora.toml"), dry_run=True))
+    assert rc in (None, 0)
+    out = capsys.readouterr().out
+    assert "LiquidAI/LFM2.5-1.2B-Base" in out
+    assert "lora" in out
+    assert "lora_r: 16" in out
+    assert "dry-run" in out.lower()
+
+
 def test_dry_run_json_plan(good_config: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """Dry-run with --json emits the same plan as a structured JSON object."""
     rc = cmd_train(_make_args(good_config, dry_run=True, json_mode=True))

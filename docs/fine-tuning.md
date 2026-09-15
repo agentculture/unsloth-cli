@@ -98,10 +98,39 @@ grad_accum    = 4     # default 4
 max_steps     = 10    # default 60 (smoke; raise for production)
 seed          = 3407  # default 3407
 load_in_4bit  = true  # default true (required for qlora)
+target_modules = "preset:lfm2"  # optional — see below
 ```
 
+### `target_modules`
+
+Optional key under `[hyperparameters]`. It accepts three forms:
+
+- a non-empty list of module names (e.g. `["q_proj", "k_proj"]`);
+- a single regex string matched against fully-qualified module paths;
+- `"preset:<name>"` — a known preset expanded to its regex at load time.
+
+Unknown presets are rejected by `load_config` at load time, before any GPU spend.
+`"preset:lfm2"` resolves to
+`model\.layers\.\d+\.(self_attn\.(q|k|v|out)_proj|conv\.(in|out)_proj|feed_forward\.w[123])`
+and adapts all 92 LoRA-able modules of LFM2.5-1.2B (24 attention, 20 short-conv,
+48 feed-forward). Unsloth's default adapts only q/k/v on the 6 attention layers,
+and a plain name list cannot reach the conv layers — hence the preset.
+
 Ready-to-run configs: [`examples/qlora-smoke.toml`](../examples/qlora-smoke.toml),
-[`examples/lora-smoke.toml`](../examples/lora-smoke.toml).
+[`examples/lora-smoke.toml`](../examples/lora-smoke.toml),
+[`examples/lfm2-lora.toml`](../examples/lfm2-lora.toml).
+
+## Deployment targets
+
+Target formats per deployment platform. Coverage is honest — see
+[`tested.md`](tested.md): the only formats live-tested on hardware so far are
+QLoRA bnb-4bit and bf16 LoRA on Qwen3-1.7B on GB10/Spark (2026-06-26).
+
+| Platform | Target format(s) | Live-tested |
+|----------|------------------|-------------|
+| Orin | `gguf`, `awq W4A16` | not yet — an explicit gap in [`tested.md`](tested.md) |
+| Thor | `nvfp4` | not yet — an explicit gap in [`tested.md`](tested.md) |
+| Spark | `nvfp4`; `bf16 + LoRA via lobes hand` | `bf16` LoRA on Qwen3-1.7B (2026-06-26, [`tested.md`](tested.md)) |
 
 ## The `/finetune` skill
 

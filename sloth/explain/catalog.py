@@ -190,6 +190,10 @@ Refuses to overwrite an existing file unless `--force` is passed.
 - `--path PATH` — override the written config path (default: `<output>/run.toml`).
 - `--json` — emit the write result as structured JSON.
 
+The generated file omits `target_modules` (optional; a list of module names, a
+single regex string, or a known preset such as `"preset:lfm2"`). Add it under
+`[hyperparameters]` to extend which modules the adapter touches.
+
 ## Exit codes
 
 - `0` success — config written.
@@ -223,6 +227,12 @@ are imported lazily inside the trainer, so `--dry-run` never loads the ML stack.
 - `--config TOML` (required) — run config: model, dataset, output, and method.
 - `--dry-run` — validate and resolve the plan without importing torch or training.
 - `--json` — emit the resolved plan / result as structured JSON to stdout.
+
+`[hyperparameters]` may set `target_modules` — a list of module names, a single
+regex string, or a known preset such as `"preset:lfm2"` (unknown presets fail at
+load time, before any GPU spend). `preset:lfm2` adapts all 92 LoRA-able modules
+of LFM2.5-1.2B (24 attention, 20 short-conv, 48 feed-forward); Unsloth's default
+adapts only q/k/v on the 6 attention layers.
 
 ## Exit codes
 
