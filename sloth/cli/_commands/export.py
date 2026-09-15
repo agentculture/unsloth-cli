@@ -272,8 +272,15 @@ def _sanitize_path(raw: str, what: str) -> Path:
 
 
 def _looks_like_path(value: str) -> bool:
-    """A --base that names a local directory rather than a Hub model id."""
-    return value.startswith((".", "~", os.sep)) or os.sep in value and Path(value).is_dir()
+    """A --base that names a local directory rather than a Hub model id.
+
+    Purely syntactic on purpose: the value is probed on disk only *after*
+    :func:`_sanitize_path` has canonicalised and allow-listed it. Hub ids look
+    like ``org/name`` (one separator, no leading ``.``/``~``/``/``).
+    """
+    if value.startswith((".", "~", os.sep)):
+        return True
+    return value.count(os.sep) >= 2
 
 
 # ---------------------------------------------------------------------------
