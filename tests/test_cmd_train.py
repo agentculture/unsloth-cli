@@ -243,8 +243,9 @@ def test_invalid_dataset_raises_cli_error_1(tmp_path: Path) -> None:
         body='{"messages": [{"role": "wizard", "content": "x"}]}\n',
     )
     toml = _write_toml(tmp_path, dataset=bad)
+    args = _make_args(toml, dry_run=True)
     with pytest.raises(CliError) as exc_info:
-        cmd_train(_make_args(toml, dry_run=True))
+        cmd_train(args)
     assert exc_info.value.code == 1
     assert exc_info.value.remediation
 
@@ -253,8 +254,9 @@ def test_invalid_dataset_error_hint_contract(tmp_path: Path) -> None:
     """The invalid-dataset CliError renders as ``error:`` / ``hint:`` lines."""
     bad = _write_dataset(tmp_path, body="not valid json\n")
     toml = _write_toml(tmp_path, dataset=bad)
+    args = _make_args(toml, dry_run=True)
     with pytest.raises(CliError) as exc_info:
-        cmd_train(_make_args(toml, dry_run=True))
+        cmd_train(args)
     buf = io.StringIO()
     emit_error(exc_info.value, json_mode=False, stream=buf)
     text = buf.getvalue()
@@ -276,8 +278,9 @@ def test_invalid_dataset_validates_before_backend(
         raise AssertionError("run_training called despite invalid dataset")
 
     monkeypatch.setattr(train_mod, "run_training", _must_not_run)
+    args = _make_args(toml, dry_run=False)
     with pytest.raises(CliError) as exc_info:
-        cmd_train(_make_args(toml, dry_run=False))
+        cmd_train(args)
     assert exc_info.value.code == 1
     mock_launch.assert_not_called()
 
@@ -297,8 +300,9 @@ def test_bad_dataset_does_not_call_container_launch(
     mock_launch = Mock()
     monkeypatch.setattr(container_mod, "launch", mock_launch)
 
+    args = _make_args(toml, dry_run=False)
     with pytest.raises(CliError) as exc_info:
-        cmd_train(_make_args(toml, dry_run=False))
+        cmd_train(args)
     assert exc_info.value.code == 1
     mock_launch.assert_not_called()
 
@@ -384,8 +388,9 @@ def test_h1_anchor_bad_dataset_and_out_of_scope_never_invoke_container(
 
 def test_missing_config_propagates_cli_error(tmp_path: Path) -> None:
     """A non-existent config file surfaces load_config's CliError (code 2)."""
+    args = _make_args(tmp_path / "nope.toml", dry_run=True)
     with pytest.raises(CliError) as exc_info:
-        cmd_train(_make_args(tmp_path / "nope.toml", dry_run=True))
+        cmd_train(args)
     assert exc_info.value.code == 2
 
 
@@ -483,8 +488,9 @@ def test_host_real_run_propagates_launch_cli_error(
             )
         ),
     )
+    args = _make_args(good_config, dry_run=False)
     with pytest.raises(CliError) as exc_info:
-        cmd_train(_make_args(good_config, dry_run=False))
+        cmd_train(args)
     assert exc_info.value.code == 2
 
 
@@ -793,8 +799,9 @@ def test_in_container_failed_run_records_failed_and_reraises(
         raise CliError(code=2, message="GPU out of memory", remediation="free some VRAM")
 
     monkeypatch.setattr(train_mod, "run_training", _boom)
+    args = _make_args(good_config, dry_run=False, in_container=True)
     with pytest.raises(CliError) as exc_info:
-        cmd_train(_make_args(good_config, dry_run=False, in_container=True))
+        cmd_train(args)
     assert exc_info.value.code == 2
 
     runs_root = Path(good_config).parent / "adapters"
@@ -1013,7 +1020,8 @@ def test_lfm2_match_is_case_insensitive(
     cfg = _write_toml(tmp_path, dataset=dataset, model=model, method="lora")
     cmd_train(_make_args(cfg, dry_run=True))
     lines = _err_lines(capsys)
-    assert len(lines) == 1 and "preset:lfm2" in lines[0]
+    assert len(lines) == 1
+    assert "preset:lfm2" in lines[0]
 
 
 # --- rank > 32 hand-lane diagnostic (h17) ----------------------------------
@@ -1085,8 +1093,9 @@ def test_chat_dataset_cached_model_without_chat_template_exits_1(
     dataset = _write_dataset(tmp_path)
     cfg = _write_toml(tmp_path, dataset=dataset, model=model)
 
+    args = _make_args(cfg, dry_run=True)
     with pytest.raises(CliError) as exc_info:
-        cmd_train(_make_args(cfg, dry_run=True))
+        cmd_train(args)
     assert exc_info.value.code == 1
     assert "chat" in exc_info.value.message.lower()
     assert "task" in (exc_info.value.remediation or "").lower()
@@ -1171,8 +1180,9 @@ def test_local_model_directory_without_template_exits_1(
     (model_dir / "tokenizer_config.json").write_text("{}", encoding="utf-8")
     dataset = _write_dataset(tmp_path)
     cfg = _write_toml(tmp_path, dataset=dataset, model=str(model_dir))
+    args = _make_args(cfg, dry_run=True)
     with pytest.raises(CliError) as exc_info:
-        cmd_train(_make_args(cfg, dry_run=True))
+        cmd_train(args)
     assert exc_info.value.code == 1
 
 
@@ -1189,8 +1199,9 @@ def test_chat_template_preflight_runs_before_the_scope_guard(
         method="full",
     )
     monkeypatch.setattr(train_mod, "load_config", lambda _path: cfg)
+    args = _make_args(tmp_path / "ignored.toml")
     with pytest.raises(CliError):
-        cmd_train(_make_args(tmp_path / "ignored.toml"))
+        cmd_train(args)
     err = capsys.readouterr().err
     # Preflight diagnostics precede the scope-guard warning on stderr.
     assert "preset:lfm2" in err

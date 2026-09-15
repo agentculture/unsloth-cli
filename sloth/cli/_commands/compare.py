@@ -49,9 +49,8 @@ def _export_deltas(summary_a: dict[str, Any], summary_b: dict[str, Any]) -> dict
     runs' export presence/formats differ, else ``{}``."""
     fp_a = _export_fingerprint(summary_a)
     fp_b = _export_fingerprint(summary_b)
-    if fp_a == fp_b:
-        return {}
-    return {"exports": {"a": fp_a, "b": fp_b}}
+    same = fp_a["count"] == fp_b["count"] and fp_a["formats"] == fp_b["formats"]
+    return {} if same else {"exports": {"a": fp_a, "b": fp_b}}
 
 
 def _config_deltas(meta_a: dict[str, Any] | None, meta_b: dict[str, Any] | None) -> dict[str, Any]:

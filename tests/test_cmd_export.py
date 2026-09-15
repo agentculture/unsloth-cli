@@ -685,7 +685,8 @@ def test_estimate_prefers_cached_config(tmp_path: Path, monkeypatch: pytest.Monk
     monkeypatch.setenv("HF_HOME", str(tmp_path))
     est = export_mod._estimate_bytes("acme/tiny-9000b", "merged-16bit", tmp_path)
     # The id heuristic would say 9000e9 params; the config says ~0.2M.
-    assert est is not None and est < 10**8
+    assert est is not None
+    assert est < 10**8
 
 
 # ---------------------------------------------------------------------------

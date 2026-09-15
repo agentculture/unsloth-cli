@@ -624,7 +624,7 @@ def test_register_in_container_not_in_help() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture()
+@pytest.fixture
 def tmp_model(tmp_path: Path) -> Path:
     """A merged-model directory carrying an AWQ compressed-tensors config.json."""
     d = tmp_path / "model"
@@ -662,7 +662,8 @@ def test_adapter_and_model_are_mutually_exclusive(
         cmd_eval(args)
     err = exc_info.value
     assert err.code == 1
-    assert "--adapter" in err.message and "--model" in err.message
+    assert "--adapter" in err.message
+    assert "--model" in err.message
     assert err.remediation
 
 
@@ -791,7 +792,8 @@ def test_register_model_flag() -> None:
     args3 = parser.parse_args(
         ["eval", "--model", "/m", "--suite", "/b.jsonl", "--in-container", "--json"]
     )
-    assert args3.in_container is True and args3.json is True
+    assert args3.in_container is True
+    assert args3.json is True
 
 
 # ---------------------------------------------------------------------------

@@ -59,7 +59,7 @@ sys.exit(0)
 """
 
 
-@pytest.fixture()
+@pytest.fixture
 def stub_env(tmp_path: Path) -> dict[str, str]:
     """Put a stub ``sloth`` first on PATH and point it at a log file."""
     bin_dir = tmp_path / "bin"

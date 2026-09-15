@@ -56,6 +56,7 @@ import json
 import os
 import shlex
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -630,22 +631,56 @@ def _render_plan_text(plan: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def cmd_export(args: argparse.Namespace) -> int:
-    """Handler for ``sloth export``.
+@dataclass(frozen=True)
+class _ExportRequest:
+    """Everything ``cmd_export`` resolved on the host before choosing a lane."""
 
-    Validates everything cheaply (adapter, format, quant, calibration, base,
-    output) and then takes one of four branches: ``--dry-run`` (plan only),
-    ``safetensors`` (pure stdlib copy), ``--in-container`` (delegate to
-    :func:`sloth.tune._exporter.run_export`), or the host lane (atomic
-    ``<output>.partial`` write inside the NGC container).
-    """
-    json_mode = bool(getattr(args, "json", False))
-    dry_run = bool(getattr(args, "dry_run", False))
-    in_container = bool(getattr(args, "in_container", False))
-    force = bool(getattr(args, "force", False))
-    keep_intermediate = bool(getattr(args, "keep_intermediate", False))
+    fmt: str
+    quant: list[str]
+    base: str
+    adapter: Path  # as given (safetensors lane keeps relative paths)
+    adapter_abs: Path
+    output: Path
+    output_abs: Path
+    calib: Path | None
+    calib_samples: int | None
+    dataset_path: Path | None
+    estimated: int | None
+    free: int | None
+    keep_intermediate: bool
+    json_mode: bool
 
-    # --- validation (exits 1 before anything is launched or written) ---------
+    @property
+    def partial(self) -> Path:
+        return Path(str(self.output_abs) + PARTIAL_SUFFIX)
+
+    @property
+    def calibration_source(self) -> Path | None:
+        # The resolved training dataset rides into the container as the calibration
+        # source; the container never re-resolves host paths.
+        return self.calib if self.calib is not None else self.dataset_path
+
+    def sloth_args(self) -> list[str]:
+        return _sloth_args(
+            fmt=self.fmt,
+            adapter=self.adapter_abs,
+            output=self.partial,
+            base=self.base,
+            quant=self.quant,
+            calib=self.calibration_source,
+            calib_samples=self.calib_samples,
+            keep_intermediate=self.keep_intermediate,
+            json_mode=self.json_mode,
+        )
+
+    def container_kwargs(self, container: Any) -> dict[str, Any]:
+        return _container_kwargs(
+            container, self.adapter_abs, self.output_abs, self.calib, self.dataset_path
+        )
+
+
+def _resolve_request(args: argparse.Namespace) -> _ExportRequest:
+    """Validate every input cheaply (exit 1 before anything is launched or written)."""
     adapter = Path(args.adapter)
     _validate_adapter(adapter)
     fmt = _validate_format(args.format)
@@ -654,117 +689,116 @@ def cmd_export(args: argparse.Namespace) -> int:
     calib = _validate_calib(getattr(args, "calib", None), calib_samples, fmt)
     base = _resolve_base(getattr(args, "base", None), adapter, fmt)
     output = _resolve_output(getattr(args, "output", None), adapter, fmt)
-
     adapter_abs = adapter.resolve()
     output_abs = output.resolve()
-    estimated = _estimate_bytes(base, fmt, adapter_abs)
-    free = _free_bytes(output_abs)
     dataset_str = _training_dataset(adapter_abs) if fmt in CALIBRATED_FORMATS else None
-    dataset_path = Path(dataset_str) if dataset_str else None
+    return _ExportRequest(
+        fmt=fmt,
+        quant=quant,
+        base=base,
+        adapter=adapter,
+        adapter_abs=adapter_abs,
+        output=output,
+        output_abs=output_abs,
+        calib=calib,
+        calib_samples=calib_samples,
+        dataset_path=Path(dataset_str) if dataset_str else None,
+        estimated=_estimate_bytes(base, fmt, adapter_abs),
+        free=_free_bytes(output_abs),
+        keep_intermediate=bool(getattr(args, "keep_intermediate", False)),
+        json_mode=bool(getattr(args, "json", False)),
+    )
 
-    # --- dry-run: resolve the plan, launch nothing, write nothing -----------
-    if dry_run:
-        docker_command: str | None = None
-        if fmt in CONTAINER_FORMATS:
-            import sloth.tune.container as container  # lazy: keeps the stdlib lane clean
 
-            partial = Path(str(output_abs) + PARTIAL_SUFFIX)
-            kwargs = _container_kwargs(container, adapter_abs, output_abs, calib, dataset_path)
-            sloth_args = _sloth_args(
-                fmt=fmt,
-                adapter=adapter_abs,
-                output=partial,
-                base=base,
-                quant=quant,
-                # The resolved training dataset rides into the container as the
-                # calibration source; the container never re-resolves host paths.
-                calib=calib if calib is not None else dataset_path,
-                calib_samples=calib_samples,
-                keep_intermediate=keep_intermediate,
-                json_mode=json_mode,
-            )
-            docker_command = shlex.join(container.build_command(sloth_args, **kwargs))
-        plan: dict[str, Any] = {
-            "dry_run": True,
-            "format": fmt,
-            "quant": quant,
-            "base": base,
-            "adapter": str(adapter_abs),
-            "output": str(output_abs),
-            "estimated_bytes": estimated,
-            "free_bytes": free,
-            "docker_command": docker_command,
-        }
-        emit_result(plan if json_mode else _render_plan_text(plan), json_mode=json_mode)
-        return 0
+def _run_dry_run(req: _ExportRequest) -> int:
+    """Resolve the plan, launch nothing, write nothing."""
+    docker_command: str | None = None
+    if req.fmt in CONTAINER_FORMATS:
+        import sloth.tune.container as container  # lazy: keeps the stdlib lane clean
 
-    # --- safetensors: pure stdlib, no container, today's behaviour ----------
-    if fmt == "safetensors":
-        files = _export_safetensors(adapter, output)
-        result = {
-            "output": str(output.resolve()),
-            "format": fmt,
-            "files": files,
-        }
-        if json_mode:
-            emit_result(result, json_mode=True)
-        else:
-            files_display = ", ".join(files) if files else "(none)"
-            emit_result(
-                f"exported adapter to {output}\nformat: {fmt}\nfiles: {files_display}",
-                json_mode=False,
-            )
-        return 0
-
-    # --- in-container: the ML seam (lazy import, never reached on the host) --
-    if in_container:
-        from sloth.tune._exporter import run_export  # lazy: imports the heavy stack
-
-        summary: dict[str, Any] = run_export(
-            {
-                "format": fmt,
-                "quant": quant,
-                "base": base,
-                "adapter": str(adapter_abs),
-                "output": str(output_abs),
-                "calib": str(calib) if calib is not None else None,
-                "calib_samples": calib_samples,
-                "keep_intermediate": keep_intermediate,
-                "dataset": _training_dataset(adapter_abs),
-                # The host renames <output>.partial -> <output> on success; record
-                # the final path so export.json and the result never name .partial.
-                "final_output": _final_output(output_abs),
-            }
+        docker_command = shlex.join(
+            container.build_command(req.sloth_args(), **req.container_kwargs(container))
         )
-        result = {"output": _final_output(output_abs), "format": fmt, **summary}
-        if json_mode:
-            emit_result(result, json_mode=True)
-        else:
-            files = summary.get("files") or {}
-            lines = [f"exported {fmt} model to {output_abs}"]
-            lines += [f"  {name}: {size} bytes" for name, size in sorted(files.items())]
-            emit_result("\n".join(lines), json_mode=False)
-        return 0
+    plan: dict[str, Any] = {
+        "dry_run": True,
+        "format": req.fmt,
+        "quant": req.quant,
+        "base": req.base,
+        "adapter": str(req.adapter_abs),
+        "output": str(req.output_abs),
+        "estimated_bytes": req.estimated,
+        "free_bytes": req.free,
+        "docker_command": docker_command,
+    }
+    emit_result(plan if req.json_mode else _render_plan_text(plan), json_mode=req.json_mode)
+    return 0
 
-    # --- host lane: no-clobber → disk gate → atomic container run -----------
-    _check_clobber(output_abs, force)
-    # Fail closed on the host: a calibrated format with no resolvable calibration
-    # source must not cost a container launch (dry-run is exempt so plans render).
-    if fmt in CALIBRATED_FORMATS and calib is None and dataset_path is None:
+
+def _run_safetensors(req: _ExportRequest) -> int:
+    """Pure stdlib, no container — today's behaviour, byte for byte."""
+    files = _export_safetensors(req.adapter, req.output)
+    if req.json_mode:
+        emit_result(
+            {"output": str(req.output.resolve()), "format": req.fmt, "files": files},
+            json_mode=True,
+        )
+        return 0
+    files_display = ", ".join(files) if files else "(none)"
+    emit_result(
+        f"exported adapter to {req.output}\nformat: {req.fmt}\nfiles: {files_display}",
+        json_mode=False,
+    )
+    return 0
+
+
+def _run_in_container(req: _ExportRequest) -> int:
+    """The ML seam (lazy import; never reached on the host)."""
+    from sloth.tune._exporter import run_export  # lazy: imports the heavy stack
+
+    final_output = _final_output(req.output_abs)
+    summary: dict[str, Any] = run_export(
+        {
+            "format": req.fmt,
+            "quant": req.quant,
+            "base": req.base,
+            "adapter": str(req.adapter_abs),
+            "output": str(req.output_abs),
+            "calib": str(req.calib) if req.calib is not None else None,
+            "calib_samples": req.calib_samples,
+            "keep_intermediate": req.keep_intermediate,
+            "dataset": _training_dataset(req.adapter_abs),
+            # The host renames <output>.partial -> <output> on success; record the
+            # final path so export.json and the result never name .partial.
+            "final_output": final_output,
+        }
+    )
+    if req.json_mode:
+        emit_result({"output": final_output, "format": req.fmt, **summary}, json_mode=True)
+        return 0
+    files = summary.get("files") or {}
+    lines = [f"exported {req.fmt} model to {req.output_abs}"]
+    lines += [f"  {name}: {size} bytes" for name, size in sorted(files.items())]
+    emit_result("\n".join(lines), json_mode=False)
+    return 0
+
+
+def _require_calibration_source(req: _ExportRequest) -> None:
+    """Fail closed on the host: a calibrated format needs a resolvable calibration
+    source before a container launch is paid for (dry-run is exempt so plans render)."""
+    if req.fmt in CALIBRATED_FORMATS and req.calibration_source is None:
         raise CliError(
             code=EXIT_USER_ERROR,
             message=(
-                f"--format {fmt} needs calibration data and the adapter's training dataset "
-                "could not be resolved from training_metadata.json"
+                f"--format {req.fmt} needs calibration data and the adapter's training "
+                "dataset could not be resolved from training_metadata.json"
             ),
             remediation="Pass --calib <jsonl> (chat or task schema), or export from the "
             "directory the adapter was trained in so its relative dataset path resolves.",
         )
-    _check_disk(estimated, free, output_abs, fmt)
 
-    import sloth.tune.container as container  # lazy: module level stays container-free
 
-    partial = Path(str(output_abs) + PARTIAL_SUFFIX)
+def _prepare_partial(partial: Path) -> None:
+    """Create the staging dir, clearing a leftover from an earlier run."""
     if partial.exists():
         emit_diagnostic(
             f"note: clearing a leftover staging directory from an earlier run: {partial}"
@@ -772,28 +806,27 @@ def cmd_export(args: argparse.Namespace) -> int:
         shutil.rmtree(partial)
     partial.mkdir(parents=True)
 
-    kwargs = _container_kwargs(container, adapter_abs, output_abs, calib, dataset_path)
-    sloth_args = _sloth_args(
-        fmt=fmt,
-        adapter=adapter_abs,
-        output=partial,
-        base=base,
-        quant=quant,
-        calib=calib if calib is not None else dataset_path,
-        calib_samples=calib_samples,
-        keep_intermediate=keep_intermediate,
-        json_mode=json_mode,
-    )
+
+def _run_host(req: _ExportRequest, force: bool) -> int:
+    """No-clobber → calibration → disk gate → atomic container run."""
+    _check_clobber(req.output_abs, force)
+    _require_calibration_source(req)
+    _check_disk(req.estimated, req.free, req.output_abs, req.fmt)
+
+    import sloth.tune.container as container  # lazy: module level stays container-free
+
+    partial = req.partial
+    _prepare_partial(partial)
 
     # launch() raises CliError on any non-zero container exit; a non-zero return is
     # treated the same way. Either way the staging dir is LEFT IN PLACE and <output>
     # is never created, so a killed/OOM run cannot be mistaken for a finished export.
-    code = container.launch(sloth_args, **kwargs)
+    code = container.launch(req.sloth_args(), **req.container_kwargs(container))
     if code:
         raise CliError(
             code=EXIT_ENV_ERROR,
             message=(
-                f"the {fmt} export container exited with status {code}; "
+                f"the {req.fmt} export container exited with status {code}; "
                 f"the partial output was left at {partial}"
             ),
             remediation=(
@@ -802,12 +835,31 @@ def cmd_export(args: argparse.Namespace) -> int:
             ),
         )
 
-    if output_abs.exists():  # only reachable with --force (no-clobber checked above)
-        shutil.rmtree(output_abs)
-    output_abs.parent.mkdir(parents=True, exist_ok=True)
-    partial.rename(output_abs)
-    emit_diagnostic(f"export complete: {output_abs}")
+    if req.output_abs.exists():  # only reachable with --force (no-clobber checked above)
+        shutil.rmtree(req.output_abs)
+    req.output_abs.parent.mkdir(parents=True, exist_ok=True)
+    partial.rename(req.output_abs)
+    emit_diagnostic(f"export complete: {req.output_abs}")
     return 0
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    """Handler for ``sloth export``.
+
+    Validates everything cheaply (adapter, format, quant, calibration, base,
+    output) and then takes one of four lanes: ``--dry-run`` (plan only),
+    ``safetensors`` (pure stdlib copy), ``--in-container`` (delegate to
+    :func:`sloth.tune._exporter.run_export`), or the host lane (atomic
+    ``<output>.partial`` write inside the NGC container).
+    """
+    req = _resolve_request(args)
+    if getattr(args, "dry_run", False):
+        return _run_dry_run(req)
+    if req.fmt == "safetensors":
+        return _run_safetensors(req)
+    if getattr(args, "in_container", False):
+        return _run_in_container(req)
+    return _run_host(req, force=bool(getattr(args, "force", False)))
 
 
 # ---------------------------------------------------------------------------

@@ -196,7 +196,7 @@ def _fake_backend(
     return backend, events
 
 
-@pytest.fixture()
+@pytest.fixture
 def install_backend(monkeypatch):
     """Install a fake backend and return (backend, events)."""
 
@@ -250,8 +250,9 @@ def test_missing_stack_raises_cli_error_with_ngc_hint(tmp_path, monkeypatch):
         raise ImportError("No module named 'llmcompressor'")
 
     monkeypatch.setattr(_exporter, "_load_backend", _boom)
+    plan = _plan(tmp_path, "merged-16bit")
     with pytest.raises(CliError) as excinfo:
-        run_export(_plan(tmp_path, "merged-16bit"))
+        run_export(plan)
     assert excinfo.value.code == 2
     assert "nvcr.io/nvidia/pytorch" in excinfo.value.remediation
 
@@ -264,8 +265,9 @@ def test_backend_import_oom_raises_cli_error_with_memory_hint(tmp_path, monkeypa
         raise OutOfMemoryError("CUDA error: out of memory")
 
     monkeypatch.setattr(_exporter, "_load_backend", _boom)
+    plan = _plan(tmp_path, "merged-16bit")
     with pytest.raises(CliError) as excinfo:
-        run_export(_plan(tmp_path, "merged-16bit"))
+        run_export(plan)
     assert excinfo.value.code == 2
     assert "out of memory" in excinfo.value.message.lower()
     assert "drop_caches" in excinfo.value.remediation
@@ -278,15 +280,17 @@ def test_export_oom_during_run_raises_cli_error(tmp_path, install_backend):
         raise RuntimeError("CUDA out of memory. Tried to allocate 2 GiB")
 
     backend.fast_model.from_pretrained = _boom
+    plan = _plan(tmp_path, "merged-16bit")
     with pytest.raises(CliError) as excinfo:
-        run_export(_plan(tmp_path, "merged-16bit"))
+        run_export(plan)
     assert excinfo.value.code == 2
     assert "drop_caches" in excinfo.value.remediation
 
 
 def test_unknown_format_is_a_user_error(tmp_path):
+    plan = _plan(tmp_path, "ggml")
     with pytest.raises(CliError) as excinfo:
-        run_export(_plan(tmp_path, "ggml"))
+        run_export(plan)
     assert excinfo.value.code == 1
     assert "merged-16bit" in excinfo.value.remediation
 
@@ -502,8 +506,9 @@ def test_enough_calibration_samples_emits_no_diagnostic(tmp_path, install_backen
 
 
 def test_quantised_export_without_calibration_is_a_user_error(tmp_path):
+    plan = _plan(tmp_path, "awq")
     with pytest.raises(CliError) as excinfo:
-        run_export(_plan(tmp_path, "awq"))
+        run_export(plan)
     assert excinfo.value.code == 1
     assert "--calib" in excinfo.value.remediation
 
