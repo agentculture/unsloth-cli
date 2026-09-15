@@ -286,7 +286,7 @@ def _render_plan_text(plan: dict[str, Any]) -> str:
 
 
 def _resolve_container_invocation(
-    config_path: Path, config: RunConfig, json_mode: bool
+    config_path: Path, config: RunConfig
 ) -> tuple[Path, list[tuple[str, str]], list[str]]:
     """Resolve absolute paths and build the container invocation components.
 
@@ -295,10 +295,13 @@ def _resolve_container_invocation(
     host real-run (passed to :func:`~sloth.tune.container.launch`) branches,
     so both branches produce an identical docker command.
 
-    ``sloth_args`` is ``["train", "--config", <abs-config-path>, "--in-container"]``
-    (plus ``"--json"`` when *json_mode* is set).  Passing the absolute config
-    path together with identity mounts (``host_path == container_path``) means
-    the path resolves unchanged inside the container without any
+    ``sloth_args`` is ``["train", "--config", <abs-config-path>, "--json",
+    "--in-container"]`` — ``--json`` is always forwarded (regardless of the
+    host's own ``--json`` flag) so the container always emits a structured
+    result the host can capture from :func:`~sloth.tune.container.launch`'s
+    return value and re-render for its own caller.  Passing the absolute
+    config path together with identity mounts (``host_path == container_path``)
+    means the path resolves unchanged inside the container without any
     ``/workspace/<name>`` rewriting.
     """
     # Relative dataset/output paths resolve against the current working directory
@@ -328,10 +331,11 @@ def _resolve_container_invocation(
     extra_mounts: list[tuple[str, str]] = [(str(p), str(p)) for p in sorted(mount_parents)]
 
     # Forward the ABSOLUTE config path; identity mounts make it resolve inside
-    # the container without rewriting to /workspace.
-    sloth_args: list[str] = ["train", "--config", str(config_path), "--in-container"]
-    if json_mode:
-        sloth_args.append("--json")
+    # the container without rewriting to /workspace. ``--json`` is always
+    # forwarded (unconditionally) so the container always prints a structured
+    # result line for container.launch() to parse and return — the host then
+    # renders it for its own caller according to the HOST's --json flag.
+    sloth_args: list[str] = ["train", "--config", str(config_path), "--json", "--in-container"]
 
     return base_dir, extra_mounts, sloth_args
 
@@ -401,9 +405,7 @@ def cmd_train(args: argparse.Namespace) -> int | None:
     if dry_run:
         plan = run_training(config, dry_run=True)
         config_path = Path(args.config).resolve()
-        config_dir, extra_mounts, sloth_args = _resolve_container_invocation(
-            config_path, config, json_mode
-        )
+        config_dir, extra_mounts, sloth_args = _resolve_container_invocation(config_path, config)
         checkout = Path(__file__).resolve().parents[3]
         cmd = container_mod.build_command(
             sloth_args, workdir=config_dir, checkout=checkout, extra_mounts=extra_mounts
@@ -440,14 +442,21 @@ def cmd_train(args: argparse.Namespace) -> int | None:
 
     # 4c) Host real run: orchestrate via the NGC container.
     config_path = Path(args.config).resolve()
-    config_dir, extra_mounts, sloth_args = _resolve_container_invocation(
-        config_path, config, json_mode
-    )
+    config_dir, extra_mounts, sloth_args = _resolve_container_invocation(config_path, config)
     checkout = Path(__file__).resolve().parents[3]
-    # launch() raises CliError on any non-zero container exit; success falls through.
-    container_mod.launch(
+    # launch() raises CliError on any non-zero container exit, and otherwise returns
+    # the parsed JSON result the container printed (its own train result — see the
+    # "Run registry" module docstring). Emit it through the host's own output
+    # contract so a host caller sees the same shape the in-container path would
+    # have printed, honouring the HOST's --json flag (independent of the --json
+    # unconditionally forwarded into the container above).
+    result = container_mod.launch(
         sloth_args, workdir=str(config_dir), checkout=checkout, extra_mounts=extra_mounts
     )
+    if json_mode:
+        emit_result(result, json_mode=True)
+    else:
+        emit_result(_render_plan_text(result), json_mode=False)
 
 
 # ---------------------------------------------------------------------------

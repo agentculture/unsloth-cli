@@ -88,20 +88,27 @@ def _make_args(
 
 
 class _RecordingLaunch:
-    """Fake ``container.launch`` that records its call and returns *rc*."""
+    """Fake ``container.launch`` that records its call and returns *result*.
 
-    def __init__(self, rc: int = 0) -> None:
-        self.rc = rc
+    ``launch()`` never returns an int (t1/t2: it returns the parsed JSON result
+    dict the container printed, or raises ``CliError`` on failure), so this
+    fake's default return value is a dict, not ``0``.
+    """
+
+    def __init__(self, result: dict | None = None) -> None:
+        self.result: dict = result if result is not None else {}
         self.calls: list[tuple[tuple, dict]] = []
 
     def __call__(self, sloth_args, **kwargs):  # noqa: D102 - test double
         self.calls.append((tuple(sloth_args), kwargs))
-        return self.rc
+        return self.result
 
 
-def _fake_launch_env(monkeypatch: pytest.MonkeyPatch, rc: int = 0) -> _RecordingLaunch:
+def _fake_launch_env(
+    monkeypatch: pytest.MonkeyPatch, result: dict | None = None
+) -> _RecordingLaunch:
     """Install a recording fake launch and return it."""
-    fake = _RecordingLaunch(rc=rc)
+    fake = _RecordingLaunch(result=result)
     monkeypatch.setattr("sloth.tune.container.launch", fake)
     return fake
 
@@ -771,7 +778,7 @@ def test_non_empty_output_with_force_proceeds(
         fake.calls.append((tuple(sloth_args), kwargs))
         partial = Path(sloth_args[sloth_args.index("--output") + 1])
         (partial / "model.safetensors").write_bytes(b"new")
-        return 0
+        return {}
 
     monkeypatch.setattr("sloth.tune.container.launch", _launch)
 
@@ -797,7 +804,7 @@ def test_container_writes_partial_and_host_renames(
         seen["output_arg"] = str(partial)
         assert partial.is_dir(), "the host must create <output>.partial before launching"
         (partial / "model.safetensors").write_bytes(b"merged")
-        return 0
+        return {}
 
     monkeypatch.setattr("sloth.tune.container.launch", _launch)
 
@@ -811,7 +818,12 @@ def test_container_writes_partial_and_host_renames(
 def test_killed_container_leaves_partial_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A launcher reporting 137 (SIGKILL/OOM) leaves <output> absent and .partial present."""
+    """A killed (SIGKILL/OOM) container leaves <output> absent and .partial present.
+
+    ``container.launch`` never returns a non-zero int any more (t1/t2): it
+    raises ``CliError`` on any container failure. This fake mirrors that
+    contract instead of returning 137.
+    """
     adapter = _make_adapter(tmp_path)
     _fake_statvfs(monkeypatch, 10**12)
     output_dir = tmp_path / "out"
@@ -819,7 +831,7 @@ def test_killed_container_leaves_partial_only(
     def _launch(sloth_args, **kwargs):
         partial = Path(sloth_args[sloth_args.index("--output") + 1])
         (partial / "half-written.safetensors").write_bytes(b"partial")
-        return 137
+        raise CliError(code=2, message="Container was killed (exit 137)", remediation="free memory")
 
     monkeypatch.setattr("sloth.tune.container.launch", _launch)
 
@@ -869,7 +881,7 @@ def test_stale_partial_is_replaced(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         partial = Path(sloth_args[sloth_args.index("--output") + 1])
         assert list(partial.iterdir()) == []
         (partial / "fresh.bin").write_bytes(b"new")
-        return 0
+        return {}
 
     monkeypatch.setattr("sloth.tune.container.launch", _launch)
 
@@ -925,6 +937,67 @@ def test_json_flag_forwarded_to_container(tmp_path: Path, monkeypatch: pytest.Mo
     )
     assert cmd_export(args) == 0
     assert "--json" in fake.calls[0][0]
+
+
+# ---------------------------------------------------------------------------
+# t2 acceptance — --json always forwarded into the container; the host emits
+# the dict container.launch() returns via emit_result, honouring the HOST's
+# own --json flag (independent of what was forwarded into the container).
+# ---------------------------------------------------------------------------
+
+
+def test_json_forwarded_to_container_even_without_host_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--json is forwarded into the container argv UNCONDITIONALLY, even when
+    the host itself was not invoked with --json."""
+    adapter = _make_adapter(tmp_path)
+    fake = _fake_launch_env(monkeypatch)
+    _fake_statvfs(monkeypatch, 10**12)
+    args = _make_args(
+        adapter=str(adapter), format="merged-4bit", output=str(tmp_path / "o"), json_mode=False
+    )
+    assert cmd_export(args) == 0
+    assert "--json" in fake.calls[0][0]
+
+
+def test_host_emits_launch_result_as_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """The dict container.launch() returns is emitted verbatim as JSON on stdout
+    when the host's own --json flag is set."""
+    adapter = _make_adapter(tmp_path)
+    fake_result = {"output": str(tmp_path / "o"), "format": "merged-4bit", "files": {"a": 1}}
+    _fake_launch_env(monkeypatch, result=fake_result)
+    _fake_statvfs(monkeypatch, 10**12)
+
+    args = _make_args(
+        adapter=str(adapter), format="merged-4bit", output=str(tmp_path / "o"), json_mode=True
+    )
+    assert cmd_export(args) == 0
+
+    out = capsys.readouterr().out
+    assert json.loads(out) == fake_result
+
+
+def test_host_emits_launch_result_as_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """In text mode, the launch() result is rendered with the same renderer the
+    in-container path uses (_emit_export_summary) — host stdout is exactly that."""
+    adapter = _make_adapter(tmp_path)
+    output_dir = tmp_path / "o"
+    fake_result = {"output": str(output_dir), "format": "merged-4bit", "files": {"a.bin": 5}}
+    _fake_launch_env(monkeypatch, result=fake_result)
+    _fake_statvfs(monkeypatch, 10**12)
+
+    args = _make_args(
+        adapter=str(adapter), format="merged-4bit", output=str(output_dir), json_mode=False
+    )
+    assert cmd_export(args) == 0
+
+    out = capsys.readouterr().out
+    assert out == "exported merged-4bit model to {}\n  a.bin: 5 bytes\n".format(output_dir)
 
 
 def test_keep_intermediate_forwarded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

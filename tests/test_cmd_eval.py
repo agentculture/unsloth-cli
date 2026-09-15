@@ -46,6 +46,20 @@ def _make_args(**kwargs: Any) -> argparse.Namespace:
     return argparse.Namespace(**defaults)
 
 
+#: A minimal, well-formed eval summary standing in for the dict
+#: ``sloth.tune.container.launch`` now returns (t1/t2: launch never returns an
+#: int). Host-path launch fakes below return this so the host's own text-mode
+#: rendering (``_render_text``, which indexes ``total``/``exact_match``/
+#: ``exact_match_pct``) has real keys to render, exactly mirroring what the
+#: in-container run would have printed.
+_FAKE_EVAL_SUMMARY: dict[str, Any] = {
+    "total": 1,
+    "exact_match": 1,
+    "exact_match_pct": 100.0,
+    "results": [],
+}
+
+
 def _fake_run_eval_perfect(adapter_path: str, suite_path: str) -> dict[str, Any]:
     """Return a perfect-score eval summary without touching torch/peft."""
     return {
@@ -414,7 +428,7 @@ def test_host_routes_to_container_launch(
         launch_calls.append(
             {"sloth_args": list(sloth_args), "workdir": workdir, "checkout": checkout, **kwargs}
         )
-        return 0
+        return dict(_FAKE_EVAL_SUMMARY)
 
     monkeypatch.setattr(eval_mod.container, "launch", _fake_launch)
 
@@ -445,7 +459,7 @@ def test_host_routes_json_flag_when_set(
 
     def _fake_launch(sloth_args: list[str], **kwargs: Any) -> int:
         forwarded_args.append(list(sloth_args))
-        return 0
+        return dict(_FAKE_EVAL_SUMMARY)
 
     monkeypatch.setattr(eval_mod.container, "launch", _fake_launch)
 
@@ -455,6 +469,87 @@ def test_host_routes_json_flag_when_set(
     assert forwarded_args, "launch must be called"
     assert "--json" in forwarded_args[0], "--json must be forwarded to the container"
     assert "--in-container" in forwarded_args[0]
+
+
+# ---------------------------------------------------------------------------
+# t2 acceptance — --json always forwarded into the container; the host emits
+# the dict container.launch() returns via emit_result, honouring the HOST's
+# own --json flag (independent of what was forwarded into the container).
+# ---------------------------------------------------------------------------
+
+
+def test_host_json_forwarded_even_without_host_json(
+    tmp_adapter: Path,
+    tmp_suite: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--json is forwarded into the container argv UNCONDITIONALLY, even when
+    the host itself was not invoked with --json."""
+    forwarded_args: list[list[str]] = []
+
+    def _fake_launch(sloth_args: list[str], **kwargs: Any) -> dict[str, Any]:
+        forwarded_args.append(list(sloth_args))
+        return dict(_FAKE_EVAL_SUMMARY)
+
+    monkeypatch.setattr(eval_mod.container, "launch", _fake_launch)
+
+    args = _make_args(
+        adapter=str(tmp_adapter), suite=str(tmp_suite), json=False, in_container=False
+    )
+    cmd_eval(args)
+
+    assert forwarded_args, "launch must be called"
+    assert "--json" in forwarded_args[0], "--json must be forwarded to the container"
+
+
+def test_host_emits_launch_result_as_json(
+    tmp_adapter: Path,
+    tmp_suite: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The dict container.launch() returns is emitted verbatim as JSON on stdout
+    when the host's own --json flag is set."""
+    fake_result = {
+        "total": 2,
+        "exact_match": 2,
+        "exact_match_pct": 100.0,
+        "results": [{"index": 0, "task": "reverse", "exact_match": True}],
+    }
+    monkeypatch.setattr(eval_mod.container, "launch", lambda *a, **kw: dict(fake_result))
+
+    args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), json=True, in_container=False)
+    cmd_eval(args)
+
+    out = capsys.readouterr().out
+    assert json.loads(out) == fake_result
+
+
+def test_host_emits_launch_result_as_text(
+    tmp_adapter: Path,
+    tmp_suite: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """In text mode, the launch() result is rendered with the same renderer the
+    in-container path uses (_render_text) — host stdout is exactly that."""
+    fake_result = {
+        "total": 2,
+        "exact_match": 2,
+        "exact_match_pct": 100.0,
+        "results": [{"index": 0, "task": "reverse", "exact_match": True}],
+    }
+    monkeypatch.setattr(eval_mod.container, "launch", lambda *a, **kw: dict(fake_result))
+
+    args = _make_args(
+        adapter=str(tmp_adapter), suite=str(tmp_suite), json=False, in_container=False
+    )
+    cmd_eval(args)
+
+    out = capsys.readouterr().out
+    target = eval_mod._resolve_target(args)
+    expected = eval_mod._render_text(target, eval_mod._render_suite_label([tmp_suite]), fake_result)
+    assert out == expected + "\n"
 
 
 def test_host_returns_0_on_launch_success(
@@ -467,7 +562,7 @@ def test_host_returns_0_on_launch_success(
     FIX 1+2: launch() raises on failure; on success the handler falls through
     (implicit None return) — no explicit return value.
     """
-    monkeypatch.setattr(eval_mod.container, "launch", lambda *a, **kw: 0)
+    monkeypatch.setattr(eval_mod.container, "launch", lambda *a, **kw: dict(_FAKE_EVAL_SUMMARY))
     args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), in_container=False)
     rc = cmd_eval(args)
     assert rc in (None, 0)
@@ -522,7 +617,7 @@ def test_host_extra_mounts_cover_adapter_and_suite_parents(
     def _capture_launch(sloth_args: list[str], **kwargs: Any) -> int:
         captured["sloth_args"] = list(sloth_args)
         captured.update(kwargs)
-        return 0
+        return dict(_FAKE_EVAL_SUMMARY)
 
     monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
 
@@ -700,7 +795,7 @@ def test_host_routes_model_to_container(
     def _capture_launch(sloth_args: list[str], **kwargs: Any) -> int:
         captured["sloth_args"] = list(sloth_args)
         captured.update(kwargs)
-        return 0
+        return dict(_FAKE_EVAL_SUMMARY)
 
     monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
 
@@ -1048,7 +1143,7 @@ def test_directory_suite_all_valid_expands_and_launches(
 
     def _capture_launch(sloth_args: list[str], **kwargs: Any) -> int:
         captured["sloth_args"] = list(sloth_args)
-        return 0
+        return dict(_FAKE_EVAL_SUMMARY)
 
     monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
 
@@ -1077,7 +1172,7 @@ def test_single_jsonl_suite_still_works_unchanged(
 
     def _capture_launch(sloth_args: list[str], **kwargs: Any) -> int:
         captured["sloth_args"] = list(sloth_args)
-        return 0
+        return dict(_FAKE_EVAL_SUMMARY)
 
     monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
 
@@ -1166,7 +1261,7 @@ def test_host_forwards_quant_and_batch_size_to_container(
 
     def _capture_launch(sloth_args: list[str], **kwargs: Any) -> int:
         captured["sloth_args"] = list(sloth_args)
-        return 0
+        return dict(_FAKE_EVAL_SUMMARY)
 
     monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
 
@@ -1198,7 +1293,7 @@ def test_host_forwards_default_batch_size_when_not_set(
 
     def _capture_launch(sloth_args: list[str], **kwargs: Any) -> int:
         captured["sloth_args"] = list(sloth_args)
-        return 0
+        return dict(_FAKE_EVAL_SUMMARY)
 
     monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
 
