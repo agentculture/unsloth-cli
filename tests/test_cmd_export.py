@@ -1346,6 +1346,47 @@ def test_container_kwargs_forward_allowed_roots_env(tmp_path: Path) -> None:
     assert "HOME" in env
 
 
+def test_container_kwargs_local_base_forwarded_to_mounts_and_env(tmp_path: Path) -> None:
+    """A LOCAL --base directory is identity-mounted and allow-listed like the others.
+
+    Reproduces the "approved local models fail" finding: the adapter/output tree
+    and the base-model tree live under different parents, and both must appear.
+    """
+    from sloth.tune import container as container_mod
+
+    adapter = tmp_path / "runs" / "lora"
+    output = tmp_path / "exports" / "merged"
+    base_dir = tmp_path / "models" / "mybase"
+    base_dir.mkdir(parents=True)
+
+    kwargs = export_mod._container_kwargs(container_mod, adapter, output, None, base=str(base_dir))
+
+    targets = [target for _host, target in kwargs["extra_mounts"]]
+    assert str(base_dir.parent) in targets
+    assert str(adapter.parent) in targets
+    assert str(output.parent) in targets
+
+    env = dict(kwargs["env"])
+    roots = env[export_mod.ALLOWED_ROOTS_ENV].split(os.pathsep)
+    assert set(roots) == {str(adapter.parent), str(output.parent), str(base_dir.parent)}
+
+
+def test_container_kwargs_hub_base_id_adds_no_mount(tmp_path: Path) -> None:
+    """A Hub model id (not a local path) is left untouched — no extra mount/root."""
+    from sloth.tune import container as container_mod
+
+    adapter = tmp_path / "runs" / "lora"
+    output = tmp_path / "exports" / "merged"
+
+    kwargs = export_mod._container_kwargs(
+        container_mod, adapter, output, None, base="LiquidAI/LFM2.5-1.2B-Instruct"
+    )
+
+    env = dict(kwargs["env"])
+    roots = env[export_mod.ALLOWED_ROOTS_ENV].split(os.pathsep)
+    assert set(roots) == {str(adapter.parent), str(output.parent)}
+
+
 def test_sanitize_path_accepts_forwarded_root_outside_cwd_and_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
