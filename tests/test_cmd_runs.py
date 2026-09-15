@@ -148,6 +148,57 @@ def test_show_output_dir_exists_false_when_removed(
     assert payload["output_dir_exists"] is False
 
 
+def test_show_includes_exports_key_empty_when_none(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out_dir = tmp_path / "adapters" / "out"
+    out_dir.mkdir(parents=True)
+    cfg = _make_config(tmp_path, out_dir)
+    record = start_run(cfg)
+    finish_run(record, STATUS_OK)
+
+    rc = cmd_runs_show(
+        _args(runs_root=str(tmp_path / "adapters"), run_id=record.run_id, json_mode=True)
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["exports"] == []
+
+
+def test_show_includes_exports_from_index(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out_dir = tmp_path / "adapters" / "out"
+    out_dir.mkdir(parents=True)
+    cfg = _make_config(tmp_path, out_dir)
+    record = start_run(cfg)
+    finish_run(record, STATUS_OK)
+    (out_dir / "exports.json").write_text(
+        json.dumps(
+            [
+                {
+                    "format": "gguf",
+                    "quant": ["q4_k_m"],
+                    "base": "unsloth/Qwen3-4B",
+                    "adapter": str(out_dir),
+                    "files": {"model.gguf": 10},
+                    "calibration": None,
+                    "versions": {},
+                    "timestamp": "2026-07-06T00:00:00+00:00",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    rc = cmd_runs_show(
+        _args(runs_root=str(tmp_path / "adapters"), run_id=record.run_id, json_mode=True)
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["exports"][0]["format"] == "gguf"
+
+
 def test_show_unknown_run_id_raises_cli_error_1(tmp_path: Path) -> None:
     with pytest.raises(CliError) as exc_info:
         cmd_runs_show(_args(runs_root=str(tmp_path), run_id="does-not-exist"))
@@ -178,6 +229,7 @@ def test_show_json_shape_includes_registry_fields(
         "finished",
         "status",
         "output_dir_exists",
+        "exports",
     ):
         assert key in payload
 

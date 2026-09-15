@@ -36,6 +36,24 @@ def _dict_key_deltas(a: dict[str, Any], b: dict[str, Any], keys: Iterable[str]) 
     return deltas
 
 
+def _export_fingerprint(summary: dict[str, Any]) -> dict[str, Any]:
+    """Reduce a run's ``exports`` list to a comparable fingerprint: how many
+    exports it has, and which formats are present."""
+    exports = summary.get("exports") or []
+    formats = sorted({e.get("format") for e in exports if isinstance(e, dict) and e.get("format")})
+    return {"count": len(exports), "formats": formats}
+
+
+def _export_deltas(summary_a: dict[str, Any], summary_b: dict[str, Any]) -> dict[str, Any]:
+    """Return ``{"exports": {"a": fingerprint, "b": fingerprint}}`` when the two
+    runs' export presence/formats differ, else ``{}``."""
+    fp_a = _export_fingerprint(summary_a)
+    fp_b = _export_fingerprint(summary_b)
+    if fp_a == fp_b:
+        return {}
+    return {"exports": {"a": fp_a, "b": fp_b}}
+
+
 def _config_deltas(meta_a: dict[str, Any] | None, meta_b: dict[str, Any] | None) -> dict[str, Any]:
     """Return ``{key: {"a": val, "b": val}}`` for every top-level, dataset, or
     hyperparameter key that differs between the two metadata dicts.
@@ -73,6 +91,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
     summary_a = build_summary(dir_a)
     summary_b = build_summary(dir_b)
     deltas = _config_deltas(summary_a.get("metadata"), summary_b.get("metadata"))
+    deltas.update(_export_deltas(summary_a, summary_b))
 
     report: dict[str, Any] = {"a": summary_a, "b": summary_b, "deltas": deltas}
 
