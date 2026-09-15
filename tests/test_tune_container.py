@@ -778,7 +778,8 @@ class TestQuantizationPins:
     def test_pin_matrix_comment_documents_the_choice(self) -> None:
         source = inspect.getsource(container)
         assert "0.10.0.3" in source, "the rejected llmcompressor version must be documented"
-        assert "AWQ" in source and "LFM2" in source
+        assert "AWQ" in source
+        assert "LFM2" in source
         assert "2.11" in source
 
 

@@ -710,7 +710,7 @@ def _resolve_request(args: argparse.Namespace) -> _ExportRequest:
     )
 
 
-def _run_dry_run(req: _ExportRequest) -> int:
+def _run_dry_run(req: _ExportRequest) -> None:
     """Resolve the plan, launch nothing, write nothing."""
     docker_command: str | None = None
     if req.fmt in CONTAINER_FORMATS:
@@ -731,10 +731,9 @@ def _run_dry_run(req: _ExportRequest) -> int:
         "docker_command": docker_command,
     }
     emit_result(plan if req.json_mode else _render_plan_text(plan), json_mode=req.json_mode)
-    return 0
 
 
-def _run_safetensors(req: _ExportRequest) -> int:
+def _run_safetensors(req: _ExportRequest) -> None:
     """Pure stdlib, no container — today's behaviour, byte for byte."""
     files = _export_safetensors(req.adapter, req.output)
     if req.json_mode:
@@ -742,16 +741,15 @@ def _run_safetensors(req: _ExportRequest) -> int:
             {"output": str(req.output.resolve()), "format": req.fmt, "files": files},
             json_mode=True,
         )
-        return 0
+        return
     files_display = ", ".join(files) if files else "(none)"
     emit_result(
         f"exported adapter to {req.output}\nformat: {req.fmt}\nfiles: {files_display}",
         json_mode=False,
     )
-    return 0
 
 
-def _run_in_container(req: _ExportRequest) -> int:
+def _run_in_container(req: _ExportRequest) -> None:
     """The ML seam (lazy import; never reached on the host)."""
     from sloth.tune._exporter import run_export  # lazy: imports the heavy stack
 
@@ -774,12 +772,11 @@ def _run_in_container(req: _ExportRequest) -> int:
     )
     if req.json_mode:
         emit_result({"output": final_output, "format": req.fmt, **summary}, json_mode=True)
-        return 0
+        return
     files = summary.get("files") or {}
     lines = [f"exported {req.fmt} model to {req.output_abs}"]
     lines += [f"  {name}: {size} bytes" for name, size in sorted(files.items())]
     emit_result("\n".join(lines), json_mode=False)
-    return 0
 
 
 def _require_calibration_source(req: _ExportRequest) -> None:
@@ -807,7 +804,7 @@ def _prepare_partial(partial: Path) -> None:
     partial.mkdir(parents=True)
 
 
-def _run_host(req: _ExportRequest, force: bool) -> int:
+def _run_host(req: _ExportRequest, force: bool) -> None:
     """No-clobber → calibration → disk gate → atomic container run."""
     _check_clobber(req.output_abs, force)
     _require_calibration_source(req)
@@ -840,7 +837,6 @@ def _run_host(req: _ExportRequest, force: bool) -> int:
     req.output_abs.parent.mkdir(parents=True, exist_ok=True)
     partial.rename(req.output_abs)
     emit_diagnostic(f"export complete: {req.output_abs}")
-    return 0
 
 
 def cmd_export(args: argparse.Namespace) -> int:
@@ -854,12 +850,14 @@ def cmd_export(args: argparse.Namespace) -> int:
     """
     req = _resolve_request(args)
     if getattr(args, "dry_run", False):
-        return _run_dry_run(req)
-    if req.fmt == "safetensors":
-        return _run_safetensors(req)
-    if getattr(args, "in_container", False):
-        return _run_in_container(req)
-    return _run_host(req, force=bool(getattr(args, "force", False)))
+        _run_dry_run(req)
+    elif req.fmt == "safetensors":
+        _run_safetensors(req)
+    elif getattr(args, "in_container", False):
+        _run_in_container(req)
+    else:
+        _run_host(req, force=bool(getattr(args, "force", False)))
+    return 0
 
 
 # ---------------------------------------------------------------------------
