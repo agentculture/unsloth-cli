@@ -178,7 +178,11 @@ grad_accum    = 4                 # default: 4
 max_steps     = 60                # default: 60 (quick smoke-run; raise for production)
 seed          = 3407              # default: 3407
 load_in_4bit  = true              # default: true (required for qlora)
+target_modules = "preset:lfm2"    # optional — list of names, regex, or preset
 ```
+
+`target_modules` accepts a list of module names, a single regex string, or
+`"preset:lfm2"` (see `docs/fine-tuning.md`).
 
 A metadata file is written next to the adapter output recording model, method,
 dataset SHA-256 and line count, hyperparameters, and an ISO-8601 timestamp.
