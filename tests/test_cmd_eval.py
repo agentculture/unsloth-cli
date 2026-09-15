@@ -96,7 +96,7 @@ def _fake_run_eval_perfect(
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture()
+@pytest.fixture
 def tmp_adapter(tmp_path: Path) -> Path:
     """A minimal adapter directory (just needs to exist as a directory)."""
     d = tmp_path / "adapter"
@@ -104,7 +104,7 @@ def tmp_adapter(tmp_path: Path) -> Path:
     return d
 
 
-@pytest.fixture()
+@pytest.fixture
 def tmp_adapter_with_config(tmp_path: Path) -> tuple[Path, str]:
     """An adapter directory with a valid adapter_config.json.
 
@@ -118,7 +118,7 @@ def tmp_adapter_with_config(tmp_path: Path) -> tuple[Path, str]:
     return d, base_model_name
 
 
-@pytest.fixture()
+@pytest.fixture
 def tmp_suite(tmp_path: Path) -> Path:
     """A two-record task-schema JSONL eval suite."""
     f = tmp_path / "suite.jsonl"

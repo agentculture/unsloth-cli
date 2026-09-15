@@ -68,12 +68,12 @@ def _write_dataset(tmp_path: Path, body: str, name: str = "data.jsonl") -> Path:
     return f
 
 
-@pytest.fixture()
+@pytest.fixture
 def valid_chat_dataset(tmp_path: Path) -> Path:
     return _write_dataset(tmp_path, _VALID_CHAT, name="chat.jsonl")
 
 
-@pytest.fixture()
+@pytest.fixture
 def valid_task_dataset(tmp_path: Path) -> Path:
     return _write_dataset(tmp_path, _VALID_TASK, name="task.jsonl")
 
