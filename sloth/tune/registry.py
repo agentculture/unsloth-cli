@@ -153,8 +153,15 @@ def compute_config_hash(config: RunConfig) -> str:
     opaque fingerprint (not decoded back into hyperparameters) — ``sloth
     compare`` reads the actual hyperparameters from each run's
     ``training_metadata.json`` instead.
+
+    Top-level keys whose value is ``None`` are dropped before hashing (no
+    recursion into nested values). This keeps the hash stable when an
+    optional field is left unset, regardless of whether it defaults to
+    ``None`` — an unset field should not perturb the fingerprint of every
+    pre-existing run.
     """
-    canonical = json.dumps(dataclasses.asdict(config), sort_keys=True, default=str)
+    fields = {k: v for k, v in dataclasses.asdict(config).items() if v is not None}
+    canonical = json.dumps(fields, sort_keys=True, default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
