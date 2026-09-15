@@ -7,11 +7,11 @@ unsloth dependency layer with **uv** (never ``pip``), bind-mount this checkout +
 the working directory, and run ``python -m sloth <args>`` *inside* the container.
 
 This module is the host-side orchestrator. It is **pure stdlib** — it imports
-``json``/``os``/``shutil``/``subprocess``/``shlex``/``sys``/``pathlib`` only and **never** imports
-torch/unsloth/datasets/trl/peft — so it loads on a machine with no GPU and no ML
-stack, keeping the introspection verbs import-light. The only code that imports
-the heavy stack is :mod:`sloth.tune._trainer`, which becomes the in-container
-entrypoint reached via ``python -m sloth``.
+``json``/``os``/``shutil``/``subprocess``/``shlex``/``sys``/``pathlib`` only and
+**never** imports torch/unsloth/datasets/trl/peft — so it loads on a machine
+with no GPU and no ML stack, keeping the introspection verbs import-light. The
+only code that imports the heavy stack is :mod:`sloth.tune._trainer`, which
+becomes the in-container entrypoint reached via ``python -m sloth``.
 
 Public API
 ----------
@@ -74,10 +74,6 @@ from sloth.cli._output import emit_diagnostic
 #: NVIDIA's official NGC PyTorch container with a Blackwell-compatible torch.
 #: Pinned and deterministic; bumping it is a documented, deliberate change.
 NGC_IMAGE: str = "nvcr.io/nvidia/pytorch:25.11-py3"
-
-#: How many trailing captured stdout lines are quoted when a run ends with no
-#: parseable JSON result line (enough context to debug, short enough to read).
-RESULT_TAIL_LINES: int = 20
 
 #: Dependency layer installed with ``uv pip install`` into the in-container venv.
 #: Pinned to a set validated against NGC 25.11's torch 2.10 + the container's
@@ -724,9 +720,11 @@ def launch(
     stdout, so the **last captured line that parses as a JSON object is the
     result** and is returned to the caller — which renders it (text or JSON) on
     the host's stdout. This is fail-closed: a container that exits 0 without such
-    a line raises ``CliError(code=2)`` quoting the last
-    :data:`RESULT_TAIL_LINES` captured lines, rather than reporting a success it
-    cannot substantiate.
+    a line raises ``CliError(code=2)`` naming how many lines were captured,
+    rather than reporting a success it cannot substantiate. The error is a
+    single-line summary, not a quote of those lines — :func:`_stream` already
+    teed every one of them to the host's stderr as the container ran, so the
+    human watching already saw them there.
 
     Parameters mirror :func:`build_command` (including *env* and *extra_mounts*,
     forwarded verbatim — see :func:`export_launch_kwargs` for the export-run pair);
@@ -768,17 +766,15 @@ def launch(
         result = _last_json_object(lines)
         if result is not None:
             return result
-        tail = "\n".join(lines[-RESULT_TAIL_LINES:]) if lines else "(no output captured)"
         raise CliError(
             code=EXIT_ENV_ERROR,
             message=(
-                "Container exited 0 but produced no JSON result line on stdout. "
-                f"Last {RESULT_TAIL_LINES} captured lines:\n{tail}"
+                f"container exited 0 without printing a JSON result ({len(lines)} lines "
+                "captured; see the container output above on stderr)"
             ),
             remediation=(
-                "The in-container run must end with a single-line JSON result on stdout "
-                "(the host appends --json). Re-run with the container output above in view, "
-                "and check that the in-container sloth verb emitted its result."
+                "Re-run and check the container output above on stderr for why the "
+                "in-container sloth verb did not emit its result."
             ),
         )
     if code == 1:
