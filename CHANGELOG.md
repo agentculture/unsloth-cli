@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-09-15
+
+### Added
+
+- `target_modules` run-config key (name list, regex string, or `preset:lfm2`) with `sloth/tune/presets.py`; the lfm2 preset adapts all 92 LoRA-able modules of LFM2.5 incl. the short-conv blocks (live-validated on DGX Spark)
+- `sloth train` host preflight: LFM2 hint when `target_modules` is unset, lobes hand-lane rank-cap diagnostic, chat-template check from the local HF cache
+- `sloth export --format merged-16bit | merged-4bit | gguf | awq | nvfp4` (container-backed) with `--quant`, `--calib`, `--calib-samples`, `--base`, `--force`, `--dry-run`, `--keep-intermediate`; disk estimate, no-clobber, atomic `.partial` output; `export.json` + `<adapter>/exports.json` provenance
+- `sloth eval --model DIR` to score merged / quantized outputs (quantization-loss check); exports surfaced in `runs show`, `summarize`, `compare`
+- `sloth/tune/_exporter.py` lazy in-container seam: Unsloth merged/GGUF saves, llm-compressor AWQ W4A16 (LFM2 per-layer mappings) and NVFP4
+- container: persistent export HOME + llama.cpp cache mount, `UNSLOTH_LLAMA_TAG` pin, `env` passthrough, MemFree preflight hint
+- /finetune skill `--export-format` / `--quant`; `examples/lfm2-lora.toml`; docs/tested.md rows for every format (2026-09-15)
+
+### Changed
+
+- dep layer pins: `datasets==4.8.5`, `+ llmcompressor==0.11.0`, `+ compressed-tensors==0.16.0`; `training_metadata.json` records `dataset.path`; `compute_config_hash` ignores unset optional fields
+
 ## [0.6.2] - 2026-09-15
 
 ### Added

@@ -2,7 +2,7 @@
   "plan_slug": "lfm2-5-target-modules-quantized-export",
   "schema_version": 2,
   "created": "2026-09-15T11:22:08Z",
-  "updated": "2026-09-15T12:01:31Z",
+  "updated": "2026-09-15T12:02:05Z",
   "deviations": [
     {
       "id": "d1",
@@ -46,6 +46,20 @@
       "status": "approved",
       "classification": "acceptable",
       "seq": 3
+    },
+    {
+      "id": "d4",
+      "what": "single PR from the plan branch instead of the two PRs decided in c16; t6 and t13 become two validation commits on the same branch, both recorded in docs/tested.md",
+      "task_ref": "t13",
+      "reason": "user decision 2026-09-15 ('one PR from this branch'): the fan-out merged every wave into one branch, so PR1/PR2 commits are interleaved and splitting them would need conflict-prone cherry-picks",
+      "affects": [
+        "t6",
+        "t13"
+      ],
+      "origin": "user",
+      "status": "approved",
+      "classification": "acceptable",
+      "seq": 4
     }
   ],
   "evidence": [],

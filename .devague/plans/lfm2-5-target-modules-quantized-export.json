@@ -5,7 +5,7 @@
   "schema_version": 5,
   "status": "exported",
   "created": "2026-09-15T10:02:14Z",
-  "updated": "2026-09-15T11:33:07Z",
+  "updated": "2026-09-15T12:51:14Z",
   "targets": [
     {
       "id": "c1",
@@ -709,6 +709,22 @@
       "id": "r8",
       "text": "t11 inferences unverified until t13: llama-completion may or may not echo the prompt (a startswith strip guards it); eval --model picks the first *.gguf alphabetically when a dir holds several (a kept F16 intermediate would win over Q4_K_M) \u2014 t13 must evaluate a clean gguf dir or add a selector",
       "kind": "unknown_nonblocking",
+      "task_id": "t13",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r9",
+      "text": "the /finetune skill's resolve_sloth prefers any 'sloth' on PATH over the checkout it lives in; on this box PATH has an editable install of a different worktree (unsloth-cli-worktrees/spec-291, metadata 0.5.0), so the first run-mode validation exercised that branch's code and its export rejected --quant. Decide whether the skill should prefer 'uv run --project <its own repo>' when invoked from inside a checkout",
+      "kind": "follow_up",
+      "task_id": "t13",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r10",
+      "text": "in-container trl/transformers training progress dicts ({'loss': ...}) are printed to stdout and pass through the shipped host path, so 'sloth train --json' stdout is not pure JSON (pre-existing; observed in the skill run-mode log). Route trainer logging to stderr or suppress it",
+      "kind": "follow_up",
       "task_id": "t13",
       "resolved": false,
       "resolution": ""
