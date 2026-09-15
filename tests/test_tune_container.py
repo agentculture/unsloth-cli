@@ -1011,20 +1011,25 @@ class TestLaunchResultCapture:
         result = launch(["eval"], workdir=tmp_path, checkout=tmp_path, skip_preflight=True)
         assert result == {"ok": True}
 
-    def test_exit_0_without_json_fails_closed_with_last_20_lines(
+    def test_exit_0_without_json_fails_closed_with_single_line_message(
         self, tmp_path: Path, monkeypatch
     ) -> None:
         lines = [f"banner-{i:02d}" for i in range(40)]
-        self._stub(monkeypatch, lines)
+        # Go through the real `_stream` (via `_fake_popen`) rather than the
+        # `_stub` shortcut, so the captured lines are actually teed to
+        # `sys.stderr` as `launch()` documents — the error message must stay a
+        # single physical line and rely on that already-streamed output
+        # instead of re-quoting it.
+        _proc, buf, _record = _fake_popen(monkeypatch, lines)
         with pytest.raises(CliError) as exc_info:
             launch(["train"], workdir=tmp_path, checkout=tmp_path, skip_preflight=True)
         err = exc_info.value
         assert err.code == 2
-        # The last 20 captured lines are quoted; the earlier ones are not.
-        for line in lines[20:]:
-            assert line in err.message
-        assert "banner-19" not in err.message
-        assert err.remediation
+        assert err.message.count("\n") == 0
+        assert "40" in err.message
+        assert err.remediation.count("\n") == 0
+        # The banner lines were already streamed to stderr as they arrived.
+        assert "banner-39" in buf.getvalue()
 
     def test_exit_0_with_no_output_at_all_fails_closed(self, tmp_path: Path, monkeypatch) -> None:
         self._stub(monkeypatch, [])
