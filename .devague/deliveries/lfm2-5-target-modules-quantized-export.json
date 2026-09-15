@@ -2,7 +2,7 @@
   "plan_slug": "lfm2-5-target-modules-quantized-export",
   "schema_version": 2,
   "created": "2026-09-15T11:22:08Z",
-  "updated": "2026-09-15T13:42:43Z",
+  "updated": "2026-09-15T13:49:07Z",
   "deviations": [
     {
       "id": "d1",
@@ -554,6 +554,34 @@
       ],
       "origin": "llm",
       "status": "approved",
+      "superseded": false
+    },
+    {
+      "id": "b9",
+      "kind": "amended",
+      "behavior_text": "sloth eval (--adapter and --model) scores only the generated continuation: generate() output is sliced past the prompt before decoding, so exact-match no longer compares against 'Task:/Input:/Output:' + completion (pre-existing bug in run_eval, found by PR #20 review; earlier 0/4 scores were partly this)",
+      "caused_by": [
+        "c39"
+      ],
+      "evidence_refs": [
+        "e16"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false
+    },
+    {
+      "id": "b10",
+      "kind": "added",
+      "behavior_text": "sloth export --base <id> is honoured for every container format: when it differs from adapter_config.json's base, the adapter is staged with a rewritten base_model_name_or_path (weights symlinked) so Unsloth merges against the override; --output may not overlap the adapter dir; an existing non-directory --output is rejected; several GGUFs in an eval --model dir must be disambiguated with --model <file.gguf>",
+      "caused_by": [
+        "c5"
+      ],
+      "evidence_refs": [
+        "e11"
+      ],
+      "origin": "llm",
+      "status": "proposed",
       "superseded": false
     }
   ],

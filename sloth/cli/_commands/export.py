@@ -91,12 +91,16 @@ GGML_QUANTS: frozenset[str] = frozenset(
 #: intermediate alongside the requested quant; the 4-bit / compressed-tensors
 #: formats land near 0.6 bytes/param.  These constants are heuristics — t13
 #: tightens them against measured artifact sizes.
+#: Peak bytes per parameter written under --output during an export. awq/nvfp4
+#: first materialise a 16-bit merged checkpoint (2.0) inside the output dir and
+#: then the compressed model (~0.6, measured 0.9 for LFM2.5-1.2B), so their
+#: peak is the sum; gguf writes a merged checkpoint plus an F16 intermediate.
 BYTES_PER_PARAM: dict[str, float] = {
     "merged-16bit": 2.0,
     "merged-4bit": 0.6,
     "gguf": 4.0,
-    "awq": 0.6,
-    "nvfp4": 0.6,
+    "awq": 2.6,
+    "nvfp4": 2.6,
 }
 
 # Canonical PEFT file names that MUST be present in the adapter directory.
@@ -332,9 +336,12 @@ def _params_from_config(config: dict[str, Any]) -> float | None:
     if min(hidden, layers, vocab, intermediate) <= 0:
         return None
 
-    heads = int(config.get("num_attention_heads") or 0)
-    kv_heads = int(config.get("num_key_value_heads") or heads)
-    head_dim = int(config.get("head_dim") or (hidden // heads if heads else 0))
+    try:
+        heads = int(config.get("num_attention_heads") or 0)
+        kv_heads = int(config.get("num_key_value_heads") or heads)
+        head_dim = int(config.get("head_dim") or (hidden // heads if heads else 0))
+    except (TypeError, ValueError):
+        heads = kv_heads = head_dim = 0  # malformed optional fields -> square approximation
     if heads and head_dim:
         attn = 2 * hidden * heads * head_dim + 2 * hidden * kv_heads * head_dim
     else:  # shapes unavailable — the square-projection approximation
@@ -504,10 +511,25 @@ def _resolve_base(explicit: str | None, adapter: Path, fmt: str) -> str | None:
     return base
 
 
+def _reject_output_overlapping_adapter(output: Path, adapter: Path) -> None:
+    """A container export must never write into (or over) its own source adapter."""
+    out, src = output.resolve(), adapter.resolve()
+    if out == src or out.is_relative_to(src) or src.is_relative_to(out):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"--output {output} overlaps the source adapter {adapter}",
+            remediation="Export into a separate directory; the adapter is the input, not the "
+            "destination (a --force run would otherwise delete it).",
+        )
+
+
 def _resolve_output(raw_output: str | None, adapter: Path, fmt: str) -> Path:
     """Resolve ``--output``; container formats must name one explicitly."""
     if raw_output:
-        return _sanitize_path(raw_output, "--output")
+        output = _sanitize_path(raw_output, "--output")
+        if fmt in CONTAINER_FORMATS:
+            _reject_output_overlapping_adapter(output, adapter)
+        return output
     if fmt in CONTAINER_FORMATS:
         raise CliError(
             code=EXIT_USER_ERROR,
@@ -518,7 +540,13 @@ def _resolve_output(raw_output: str | None, adapter: Path, fmt: str) -> Path:
 
 
 def _check_clobber(output: Path, force: bool) -> None:
-    """Refuse a non-empty *output* unless *force* (container lane only)."""
+    """Refuse a non-empty *output* unless *force*; refuse a non-directory outright."""
+    if output.exists() and not output.is_dir():
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"--output exists and is not a directory: {output}",
+            remediation="Name a directory (new or empty) with --output <dir>.",
+        )
     if not output.is_dir():
         return
     try:

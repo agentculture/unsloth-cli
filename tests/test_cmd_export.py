@@ -653,13 +653,13 @@ def test_dry_run_text_mode(tmp_path: Path, capsys: pytest.CaptureFixture) -> Non
 def test_estimated_bytes_scales_with_format(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """gguf (F16 intermediate) estimates more than merged-16bit, which beats nvfp4."""
+    """gguf (F16 intermediate) > nvfp4 (merged intermediate + compressed) > merged-16bit."""
     adapter = _make_adapter(tmp_path, base="unsloth/Qwen3-4B")
     monkeypatch.setenv("HF_HOME", str(tmp_path / "empty-cache"))  # force the id heuristic
     estimates = {}
     for fmt in ("merged-16bit", "gguf", "nvfp4"):
         estimates[fmt] = export_mod._estimate_bytes("unsloth/Qwen3-4B", fmt, adapter)
-    assert estimates["gguf"] > estimates["merged-16bit"] > estimates["nvfp4"]
+    assert estimates["gguf"] > estimates["nvfp4"] > estimates["merged-16bit"]
     # 4B params at 2 bytes/param for the merged bf16 artifact.
     assert estimates["merged-16bit"] == pytest.approx(8e9, rel=0.01)
 
@@ -1206,3 +1206,46 @@ def test_sanitize_path_resolves_dotdot_and_symlinks(tmp_path: Path, monkeypatch)
     (tmp_path / "a").mkdir()
     real = export_mod._sanitize_path("a/../a", "--output")
     assert real == (tmp_path / "a").resolve()
+
+
+# ---------------------------------------------------------------------------
+# PR #20 review fixes (Qodo threads 2, 3, 6, 12)
+# ---------------------------------------------------------------------------
+
+
+def test_container_output_overlapping_adapter_is_rejected(tmp_path: Path, monkeypatch) -> None:
+    """--output equal to / inside / containing the adapter would delete it under --force."""
+    monkeypatch.chdir(tmp_path)
+    adapter = _make_adapter(tmp_path)
+    for bad in (adapter, adapter / "sub", adapter.parent):
+        with pytest.raises(CliError) as exc_info:
+            export_mod._resolve_output(str(bad), adapter, "gguf")
+        assert exc_info.value.code == 1
+        assert "overlaps" in exc_info.value.message
+    ok = export_mod._resolve_output(str(tmp_path / "elsewhere"), adapter, "gguf")
+    assert ok == (tmp_path / "elsewhere").resolve()
+
+
+def test_output_that_is_a_regular_file_is_rejected(tmp_path: Path) -> None:
+    target = tmp_path / "not-a-dir"
+    target.write_text("x")
+    with pytest.raises(CliError) as exc_info:
+        export_mod._check_clobber(target, force=True)
+    assert exc_info.value.code == 1
+    assert "not a directory" in exc_info.value.message
+
+
+def test_params_from_config_tolerates_malformed_optional_fields() -> None:
+    config = {
+        "hidden_size": 8,
+        "num_hidden_layers": 2,
+        "vocab_size": 16,
+        "intermediate_size": 32,
+        "num_attention_heads": "many",  # malformed optional field
+    }
+    assert export_mod._params_from_config(config) is not None
+
+
+def test_compressed_estimate_covers_the_merged_intermediate() -> None:
+    assert export_mod.BYTES_PER_PARAM["awq"] > export_mod.BYTES_PER_PARAM["merged-16bit"]
+    assert export_mod.BYTES_PER_PARAM["nvfp4"] > export_mod.BYTES_PER_PARAM["merged-16bit"]

@@ -35,7 +35,7 @@ import pytest
 
 from sloth.cli._errors import CliError
 from sloth.tune import _exporter
-from sloth.tune._exporter import run_export
+from sloth.tune._exporter import DEFAULT_GGUF_QUANT, _append_index, _find_gguf, run_export
 
 _REPO_ROOT = str(Path(__file__).parent.parent)
 _HEAVY = {"torch", "unsloth", "llmcompressor", "compressed_tensors", "transformers", "peft"}
@@ -630,3 +630,63 @@ def test_llama_cpp_tag_is_none_without_env_or_info_file(tmp_path, monkeypatch):
     monkeypatch.delenv("UNSLOTH_LLAMA_TAG", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))
     assert _exporter._llama_cpp_tag() is None
+
+
+# ---------------------------------------------------------------------------
+# PR #20 review fixes (Qodo threads 1, 4, 10, 13)
+# ---------------------------------------------------------------------------
+
+
+def test_base_override_stages_adapter_with_rewritten_config(tmp_path, install_backend):
+    """--base that differs from adapter_config's base is what Unsloth actually loads."""
+    _, events = install_backend()
+    plan = _plan(tmp_path, "merged-16bit")
+    plan["base"] = "org/other-base"
+    run_export(plan)
+    loaded = events["loaded"][0]["model_name"]
+    assert loaded.endswith("_adapter-override")
+    # Staging dir is cleaned up after the export unless keep_intermediate.
+    assert not Path(loaded).exists()
+
+
+def test_base_matching_adapter_config_loads_adapter_directly(tmp_path, install_backend):
+    _, events = install_backend()
+    plan = _plan(tmp_path, "merged-16bit")
+    run_export(plan)
+    assert events["loaded"][0]["model_name"] == plan["adapter"]
+
+
+def test_find_gguf_rejects_ambiguous_directories(tmp_path):
+    (tmp_path / "a.Q4_K_M.gguf").write_bytes(b"GGUF")
+    (tmp_path / "a.F16.gguf").write_bytes(b"GGUF")
+    with pytest.raises(CliError) as exc_info:
+        _find_gguf(tmp_path)
+    assert exc_info.value.code == 1
+    assert "--model" in (exc_info.value.remediation or "")
+
+
+def test_find_gguf_returns_the_single_file(tmp_path):
+    only = tmp_path / "a.Q4_K_M.gguf"
+    only.write_bytes(b"GGUF")
+    assert _find_gguf(tmp_path) == only
+
+
+def test_gguf_export_json_records_the_resolved_default_quant(tmp_path, install_backend):
+    install_backend()
+    plan = _plan(tmp_path, "gguf")
+    plan["quant"] = []
+    result = run_export(plan)
+    record = json.loads(Path(result["export_json"]).read_text())
+    assert record["quant"] == list(DEFAULT_GGUF_QUANT)
+
+
+def test_append_index_takes_a_lock_file(tmp_path):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    _append_index(adapter, {"format": "gguf"})
+    _append_index(adapter, {"format": "awq"})
+    assert (adapter / ".exports.json.lock").exists()
+    assert [r["format"] for r in json.loads((adapter / "exports.json").read_text())] == [
+        "gguf",
+        "awq",
+    ]

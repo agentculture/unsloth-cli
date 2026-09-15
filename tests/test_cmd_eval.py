@@ -704,6 +704,8 @@ def test_host_routes_model_to_container(
 
     monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
 
+    # A GGUF target: the export home mount (llama.cpp cache) must ride along.
+    (tmp_model / "model.gguf").write_bytes(b"GGUF")
     args = _make_args(adapter=None, model=str(tmp_model), suite=str(tmp_suite))
     rc = cmd_eval(args)
     assert rc in (None, 0)
@@ -724,6 +726,15 @@ def test_host_routes_model_to_container(
     assert container_mod.EXPORT_HOME in targets
     env = dict(captured.get("env") or [])
     assert env.get("HOME") == container_mod.EXPORT_HOME
+
+    # A transformers-loadable dir (bf16 / awq / nvfp4) needs no llama.cpp cache and
+    # therefore no writable export home.
+    (tmp_model / "model.gguf").unlink()
+    captured.clear()
+    cmd_eval(_make_args(adapter=None, model=str(tmp_model), suite=str(tmp_suite)))
+    targets = {target for _, target in (captured.get("extra_mounts") or [])}
+    assert container_mod.EXPORT_HOME not in targets
+    assert "HOME" not in dict(captured.get("env") or [])
 
 
 def test_in_container_model_calls_run_eval_model(
@@ -849,7 +860,9 @@ class _FakeModel:
         self.eval_called = True
 
     def generate(self, input_ids: str, max_new_tokens: int = 0) -> list[str]:
-        return [input_ids]
+        # prompt + continuation, like a real generate(); the continuation echoes the
+        # prompt so decode() can map it to the configured answer.
+        return [input_ids + input_ids]
 
 
 def _fake_backend(answers: dict[str, str]) -> Any:

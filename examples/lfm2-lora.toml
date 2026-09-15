@@ -10,7 +10,9 @@
 # smoke run (max_steps = 10), not a production adapter.
 
 [run]
-model   = "LiquidAI/LFM2.5-1.2B-Base"
+model   = "LiquidAI/LFM2.5-1.2B-Base"   # a LoRA must be SERVED on the checkpoint it was trained on:
+                                          # lobes' hand lane serves -Instruct by default, so train on
+                                          # "LiquidAI/LFM2.5-1.2B-Instruct" for hand; Base is the #16 target
 method  = "lora"                     # "lora" or "qlora" — the only supported methods
 dataset = "examples/chat-smoke.jsonl"
 output  = "runs/lfm2-lora"

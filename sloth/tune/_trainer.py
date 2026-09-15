@@ -443,7 +443,11 @@ def run_eval(adapter_path: str, suite_path: str) -> dict[str, Any]:
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
         with torch.no_grad():
             outputs = model.generate(**inputs, max_new_tokens=100)
-        prediction = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        # generate() returns prompt + continuation; exact-match must score only the
+        # continuation, else every prediction is prefixed by the Task/Input/Output prompt.
+        ids = inputs["input_ids"]
+        prompt_len = int(ids.shape[-1]) if hasattr(ids, "shape") else len(ids[0])
+        prediction = tokenizer.decode(outputs[0][prompt_len:], skip_special_tokens=True)
         expected = record["expected_output"]
         exact_match = prediction.strip() == expected.strip()
         eval_results.append(

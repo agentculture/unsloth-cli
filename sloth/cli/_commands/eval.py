@@ -120,7 +120,9 @@ def _resolve_target(args: argparse.Namespace) -> _EvalTarget:
 
     flag, value = ("--adapter", adapter) if adapter else ("--model", model)
     path = Path(value)
-    if not path.is_dir():
+    # --model also accepts a single .gguf file (disambiguates multi-quant export dirs).
+    gguf_file = flag == "--model" and path.is_file() and path.suffix == ".gguf"
+    if not path.is_dir() and not gguf_file:
         remediation = (
             "Pass an existing adapter directory with --adapter <path>. "
             "Run `sloth train` to produce an adapter."
@@ -157,6 +159,13 @@ def _merge_mounts(
     return merged
 
 
+def _needs_llama_cpp(path: Path) -> bool:
+    """True when the --model target is a GGUF file or a directory holding one."""
+    if path.is_file():
+        return path.suffix == ".gguf"
+    return any(path.glob("*.gguf"))
+
+
 def _launch_container(target: _EvalTarget, suite_abs: Path, *, json_mode: bool) -> None:
     """Re-run this eval inside the NGC container with ``--in-container``.
 
@@ -180,7 +189,9 @@ def _launch_container(target: _EvalTarget, suite_abs: Path, *, json_mode: bool) 
         "checkout": str(_repo_root()),
     }
     supplied: dict[str, Any] = {}
-    if target.flag == "--model":
+    if target.flag == "--model" and _needs_llama_cpp(target.path):
+        # Only GGUF scoring needs the llama.cpp cache (and its writable export home);
+        # transformers-loadable dirs (bf16 / awq / nvfp4) run without it.
         supplied = getattr(container, "export_launch_kwargs", lambda: {})() or {}
     kwargs["extra_mounts"] = _merge_mounts(own_mounts, list(supplied.get("extra_mounts") or []))
     for key, value in supplied.items():

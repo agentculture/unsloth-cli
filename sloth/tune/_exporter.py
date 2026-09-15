@@ -342,12 +342,44 @@ def _resolve_calibration(plan: dict[str, Any]) -> _Calibration:
 # ---------------------------------------------------------------------------
 
 
+def _adapter_for_base(plan: dict[str, Any], output: Path) -> str:
+    """Return the adapter dir to load, honouring a ``--base`` override.
+
+    Unsloth resolves the base from ``adapter_config.json``'s
+    ``base_model_name_or_path``. When the plan's ``base`` differs, a staged copy of
+    the adapter is written under ``<output>/_adapter-override`` with that one key
+    rewritten (weights are symlinked), so the proven load path is unchanged and the
+    override really is what gets merged — not just what provenance records.
+    """
+    adapter = Path(plan["adapter"])
+    base = plan.get("base")
+    config_path = adapter / "adapter_config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return str(adapter)
+    if not base or config.get("base_model_name_or_path") == base:
+        return str(adapter)
+    staged = output / "_adapter-override"
+    if staged.exists():
+        shutil.rmtree(staged)
+    staged.mkdir(parents=True)
+    for entry in adapter.iterdir():
+        if entry.name == "adapter_config.json" or entry.name.startswith("_"):
+            continue
+        if entry.is_file():
+            os.symlink(entry.resolve(), staged / entry.name)
+    config["base_model_name_or_path"] = base
+    (staged / "adapter_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+    return str(staged)
+
+
 def _load_adapter(
-    backend: _Backend, plan: dict[str, Any], *, load_in_4bit: bool = False
+    backend: _Backend, plan: dict[str, Any], output: Path, *, load_in_4bit: bool = False
 ) -> tuple[Any, Any]:
     """Load the trained adapter (base + LoRA deltas) through Unsloth."""
     return backend.fast_model.from_pretrained(
-        model_name=plan["adapter"],
+        model_name=_adapter_for_base(plan, output),
         load_in_4bit=load_in_4bit,
         dtype=None,
     )
@@ -361,7 +393,9 @@ def _export_merged(backend: _Backend, plan: dict[str, Any], output: Path) -> Non
     4-bit format loads the base with ``load_in_4bit=True`` before merging.
     """
     save_method = MERGED_FORMATS[plan["format"]]
-    model, tokenizer = _load_adapter(backend, plan, load_in_4bit=(plan["format"] == "merged-4bit"))
+    model, tokenizer = _load_adapter(
+        backend, plan, output, load_in_4bit=(plan["format"] == "merged-4bit")
+    )
     model.save_pretrained_merged(str(output), tokenizer, save_method=save_method)
 
 
@@ -399,7 +433,7 @@ def _collect_gguf(output: Path, quant: list[str], *, keep_intermediate: bool) ->
 def _export_gguf(backend: _Backend, plan: dict[str, Any], output: Path) -> None:
     """Convert the adapter to GGUF, then normalise Unsloth's ``_gguf`` suffix dir."""
     quant = _requested_gguf_quant(plan)
-    model, tokenizer = _load_adapter(backend, plan)
+    model, tokenizer = _load_adapter(backend, plan, output)
     model.save_pretrained_gguf(str(output), tokenizer, quantization_method=quant)
     keep = bool(plan.get("keep_intermediate"))
     _collect_gguf(output, quant, keep_intermediate=keep)
@@ -517,7 +551,7 @@ def _export_compressed(
     """Merge to 16-bit, then one-shot quantise to AWQ W4A16_ASYM or NVFP4."""
     # Step 1 — a 16-bit merged checkpoint is the input llm-compressor quantises.
     merged_dir = output / "_merged-16bit"
-    model, tokenizer = _load_adapter(backend, plan)
+    model, tokenizer = _load_adapter(backend, plan, output)
     model.save_pretrained_merged(str(merged_dir), tokenizer, save_method="merged_16bit")
 
     # Step 2 — reload the merged checkpoint through plain transformers (Unsloth's
@@ -568,16 +602,30 @@ def _collect_files(output: Path) -> dict[str, int]:
 def _append_index(adapter: Path, record: dict[str, Any]) -> None:
     """Append *record* to ``<adapter>/exports.json`` (a JSON list; created if absent)."""
     index_path = adapter / "exports.json"
-    entries: list[Any] = []
-    if index_path.is_file():
-        try:
-            loaded = json.loads(index_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            loaded = None
-        if isinstance(loaded, list):
-            entries = loaded
-    entries.append(record)
-    index_path.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+    lock_path = adapter / ".exports.json.lock"
+    # Serialise concurrent exports of the same adapter (cross-process flock) so a
+    # read-modify-write never drops another export's record.
+    with open(lock_path, "w", encoding="utf-8") as lock:
+        _flock(lock)
+        entries: list[Any] = []
+        if index_path.is_file():
+            try:
+                loaded = json.loads(index_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                loaded = None
+            if isinstance(loaded, list):
+                entries = loaded
+        entries.append(record)
+        index_path.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+
+
+def _flock(handle: Any) -> None:
+    """Take an exclusive advisory lock (POSIX); a no-op where fcntl is unavailable."""
+    try:
+        import fcntl  # noqa: PLC0415 - POSIX only
+    except ImportError:  # pragma: no cover - non-POSIX
+        return
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
 
 
 def _write_export_json(
@@ -588,10 +636,13 @@ def _write_export_json(
 ) -> tuple[Path, dict[str, Any]]:
     """Write ``<output>/export.json`` and mirror the record into the adapter's index."""
     final_output = plan.get("final_output") or str(output)
+    quant = list(plan.get("quant") or [])
+    if plan["format"] == "gguf" and not quant:
+        quant = list(DEFAULT_GGUF_QUANT)  # the default actually used for conversion
     record = {
         "format": plan["format"],
         "output": final_output,
-        "quant": list(plan.get("quant") or []),
+        "quant": quant,
         "base": plan.get("base"),
         "adapter": plan.get("adapter"),
         "files": _collect_files(output),
@@ -685,6 +736,9 @@ def run_export(plan: dict[str, Any]) -> dict[str, Any]:
             ) from exc
         raise
 
+    staged_override = output / "_adapter-override"
+    if staged_override.exists() and not plan.get("keep_intermediate"):
+        shutil.rmtree(staged_override, ignore_errors=True)
     export_json, record = _write_export_json(plan, output, calibration)
     final_output = plan.get("final_output") or str(output)
     return {
@@ -786,8 +840,20 @@ def _quant_info(model_dir: Path) -> tuple[str | None, str | None]:
 
 
 def _find_gguf(model_dir: Path) -> Path | None:
-    """Return the first ``*.gguf`` file directly inside *model_dir*, or ``None``."""
+    """Return the single ``*.gguf`` inside *model_dir* (``None`` if there is none).
+
+    Several GGUF files (e.g. a ``--quant q4_k_m,q8_0`` export, or a kept F16
+    intermediate) are ambiguous: rather than silently scoring the alphabetically
+    first one, exit 1 and ask for the exact file via ``--model <file.gguf>``.
+    """
     candidates = sorted(model_dir.glob("*.gguf"))
+    if len(candidates) > 1:
+        names = ", ".join(c.name for c in candidates)
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"{model_dir} holds several GGUF files: {names}",
+            remediation="Point --model at the exact file, e.g. --model <dir>/<name>.gguf.",
+        )
     return candidates[0] if candidates else None
 
 
@@ -919,8 +985,24 @@ def _predict_transformers(
         inputs = tokenizer(_eval_prompt(record), return_tensors="pt").to(device)
         with backend.torch.no_grad():
             outputs = model.generate(**inputs, max_new_tokens=max_tokens)
-        predictions.append(tokenizer.decode(outputs[0], skip_special_tokens=True))
+        # Score the continuation only: generate() returns prompt + new tokens, and
+        # exact-match against expected_output must not include the "Task:/Input:/
+        # Output:" prompt (same fix as run_eval).
+        predictions.append(
+            tokenizer.decode(_continuation(outputs[0], inputs), skip_special_tokens=True)
+        )
     return predictions
+
+
+def _continuation(sequence: Any, inputs: Any) -> Any:
+    """Slice the generated continuation off a ``generate()`` output row."""
+    ids = inputs["input_ids"] if isinstance(inputs, dict) else getattr(inputs, "input_ids", None)
+    shape = getattr(ids, "shape", None)
+    prompt_len = int(shape[-1]) if shape is not None else (len(ids) if ids is not None else 0)
+    try:
+        return sequence[prompt_len:]
+    except TypeError:
+        return sequence
 
 
 def run_eval_model(
@@ -964,6 +1046,11 @@ def run_eval_model(
         When the ML stack is unavailable, llama.cpp is missing, or the GPU OOMs.
     """
     directory = Path(model_dir)
+    if directory.is_file() and directory.suffix == ".gguf":
+        gguf_file = directory
+        directory = directory.parent
+    else:
+        gguf_file = None
     if not directory.is_dir():
         raise CliError(
             code=EXIT_USER_ERROR,
@@ -978,7 +1065,7 @@ def run_eval_model(
     records = validate_dataset(Path(suite_path), schema="task")
     quant_method, quant_format = _quant_info(directory)
 
-    gguf = _find_gguf(directory)
+    gguf = gguf_file if gguf_file is not None else _find_gguf(directory)
     try:
         if gguf is not None:
             predictions = _predict_gguf(gguf, records, max_new_tokens)
