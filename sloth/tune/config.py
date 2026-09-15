@@ -117,6 +117,12 @@ class RunConfig:
     seed: int = DEFAULT_SEED
     load_in_4bit: bool = DEFAULT_LOAD_IN_4BIT
 
+    # PEFT target-module selection: a literal name list, a literal regex
+    # string, or a "preset:<name>" reference. Stored as written in the TOML —
+    # resolving "preset:<name>" to its regex happens at the call site via
+    # sloth.tune.presets.resolve_target_modules(), not here.
+    target_modules: list[str] | str | None = None
+
 
 # ---------------------------------------------------------------------------
 # Hyperparameter validation
@@ -187,6 +193,77 @@ def _require_bool(hp: dict, key: str, default: bool) -> bool:
             remediation=f"Set `{key} = true` or `{key} = false` in [hyperparameters].",
         )
     return value
+
+
+_TARGET_MODULES_REMEDIATION = (
+    "Set `target_modules` in [hyperparameters] to one of three forms: "
+    "a non-empty list of non-empty strings (e.g. "
+    '`target_modules = ["q_proj", "k_proj"]`), a single non-empty regex '
+    'string (e.g. `target_modules = "model\\.layers\\.\\d+\\.self_attn\\..*"`), '
+    'or a known preset name as `"preset:<name>"` (e.g. `target_modules = "preset:lfm2"`). '
+    "Omit the key entirely to leave target_modules unset."
+)
+
+
+def _require_target_modules(hp: dict) -> list[str] | str | None:
+    """Return ``hp["target_modules"]``, validated, or ``None`` if absent.
+
+    Accepted forms:
+
+    - absent -> ``None``
+    - a non-empty ``list[str]`` of non-empty strings -> returned unchanged
+    - a non-empty ``str`` (a regex, or ``"preset:<name>"``) -> returned
+      unchanged (preset names are checked against
+      :data:`sloth.tune.presets.PRESETS` here so an unknown preset fails at
+      load time, before any GPU spend)
+
+    Anything else (wrong type, empty list/string, unknown preset) raises
+    ``CliError(code=1)`` whose remediation names all three accepted forms.
+    """
+    if "target_modules" not in hp:
+        return None
+
+    value = hp["target_modules"]
+
+    if isinstance(value, list):
+        if not value or not all(isinstance(item, str) and item for item in value):
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message="hyperparameter 'target_modules' list must be non-empty "
+                "and contain only non-empty strings",
+                remediation=_TARGET_MODULES_REMEDIATION,
+            )
+        return value
+
+    if isinstance(value, str):
+        if not value:
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message="hyperparameter 'target_modules' string must be non-empty",
+                remediation=_TARGET_MODULES_REMEDIATION,
+            )
+        if value.startswith("preset:"):
+            # Import locally to avoid any risk of a module-level import cycle
+            # between config.py and presets.py; both are pure stdlib so the
+            # cost is negligible.
+            from sloth.tune.presets import PRESETS
+
+            name = value[len("preset:") :]
+            if name not in PRESETS:
+                raise CliError(
+                    code=EXIT_USER_ERROR,
+                    message=f"hyperparameter 'target_modules' references unknown preset "
+                    f"'{value}'. Known presets: {sorted(PRESETS)}.",
+                    remediation=_TARGET_MODULES_REMEDIATION,
+                )
+        return value
+
+    raise CliError(
+        code=EXIT_USER_ERROR,
+        message="hyperparameter 'target_modules' must be a list of strings, a regex "
+        f"string, or a 'preset:<name>' string, got {type(value).__name__}",
+        remediation=_TARGET_MODULES_REMEDIATION,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -276,4 +353,5 @@ def load_config(path: str | Path) -> RunConfig:
         max_steps=_require_int(hp, "max_steps", DEFAULT_MAX_STEPS, minimum=1),
         seed=_require_int(hp, "seed", DEFAULT_SEED, minimum=0),
         load_in_4bit=_require_bool(hp, "load_in_4bit", DEFAULT_LOAD_IN_4BIT),
+        target_modules=_require_target_modules(hp),
     )

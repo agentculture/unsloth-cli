@@ -22,6 +22,7 @@ from sloth.tune.config import (
     RunConfig,
     load_config,
 )
+from sloth.tune.presets import PRESETS
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -271,3 +272,110 @@ def test_non_bool_load_in_4bit_raises_cli_error(tmp_path: Path) -> None:
     with pytest.raises(CliError) as exc_info:
         load_config(toml_file)
     assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# target_modules — c2, h28
+# ---------------------------------------------------------------------------
+
+
+def test_target_modules_absent_defaults_to_none(tmp_path: Path) -> None:
+    toml_file = _write_toml(tmp_path, _BASE_RUN)
+    config = load_config(toml_file)
+    assert config.target_modules is None
+
+
+def test_target_modules_explicit_list_round_trips(tmp_path: Path) -> None:
+    toml_file = _write_toml(
+        tmp_path,
+        _BASE_RUN + '\n[hyperparameters]\ntarget_modules = ["q_proj", "k_proj", "v_proj"]\n',
+    )
+    config = load_config(toml_file)
+    assert config.target_modules == ["q_proj", "k_proj", "v_proj"]
+
+
+def test_target_modules_regex_string_round_trips(tmp_path: Path) -> None:
+    regex = r"model\.layers\.\d+\.self_attn\.(q|k|v)_proj"
+    # TOML literal strings (single quotes) pass backslashes through verbatim.
+    toml_file = _write_toml(
+        tmp_path,
+        _BASE_RUN + f"\n[hyperparameters]\ntarget_modules = '{regex}'\n",
+    )
+    config = load_config(toml_file)
+    assert config.target_modules == regex
+
+
+def test_target_modules_preset_lfm2_stored_verbatim(tmp_path: Path) -> None:
+    # load_config stores the value as written in TOML — resolution to the
+    # regex happens separately via presets.resolve_target_modules() at the
+    # call site (the trainer), not inside load_config.
+    toml_file = _write_toml(
+        tmp_path,
+        _BASE_RUN + '\n[hyperparameters]\ntarget_modules = "preset:lfm2"\n',
+    )
+    config = load_config(toml_file)
+    assert config.target_modules == "preset:lfm2"
+
+
+def test_preset_lfm2_resolves_to_documented_regex() -> None:
+    assert PRESETS["lfm2"] == (
+        r"model\.layers\.\d+\.(self_attn\.(q|k|v|out)_proj|"
+        r"conv\.(in|out)_proj|feed_forward\.w[123])"
+    )
+
+
+def test_target_modules_wrong_type_raises_cli_error_with_hint(tmp_path: Path) -> None:
+    toml_file = _write_toml(tmp_path, _BASE_RUN + "\n[hyperparameters]\ntarget_modules = 42\n")
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
+    remediation = exc_info.value.remediation
+    assert "list" in remediation
+    assert "regex" in remediation or "string" in remediation
+    assert "preset" in remediation
+
+
+def test_target_modules_empty_list_raises_cli_error(tmp_path: Path) -> None:
+    toml_file = _write_toml(tmp_path, _BASE_RUN + "\n[hyperparameters]\ntarget_modules = []\n")
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
+
+
+def test_target_modules_empty_string_raises_cli_error(tmp_path: Path) -> None:
+    toml_file = _write_toml(tmp_path, _BASE_RUN + '\n[hyperparameters]\ntarget_modules = ""\n')
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
+
+
+def test_target_modules_list_with_non_string_element_raises_cli_error(
+    tmp_path: Path,
+) -> None:
+    toml_file = _write_toml(
+        tmp_path, _BASE_RUN + '\n[hyperparameters]\ntarget_modules = ["q_proj", 1]\n'
+    )
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
+
+
+def test_target_modules_list_with_empty_string_element_raises_cli_error(
+    tmp_path: Path,
+) -> None:
+    toml_file = _write_toml(
+        tmp_path, _BASE_RUN + '\n[hyperparameters]\ntarget_modules = ["q_proj", ""]\n'
+    )
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
+
+
+def test_target_modules_unknown_preset_raises_cli_error(tmp_path: Path) -> None:
+    toml_file = _write_toml(
+        tmp_path, _BASE_RUN + '\n[hyperparameters]\ntarget_modules = "preset:nope"\n'
+    )
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
+    assert "preset:nope" in exc_info.value.message or "nope" in exc_info.value.message
