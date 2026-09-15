@@ -60,23 +60,25 @@ _EVAL_KEYS = ("exact_match_pct", "f1")
 def _eval_deltas(summary_a: dict[str, Any], summary_b: dict[str, Any]) -> dict[str, Any]:
     """Return ``{"eval": {"a": {...}, "b": {...}}}`` (``exact_match_pct`` and
     ``f1`` from each side's ``eval`` block) when BOTH runs have an
-    ``eval.json`` (i.e. ``summary["eval"]`` is not ``None`` on either side).
+    ``eval.json`` (i.e. ``summary["eval"]`` is not ``None`` on either side)
+    AND their ``_EVAL_KEYS`` projections actually differ.
 
     Read-only: never recomputes a metric, just re-shapes the two numbers
     :func:`sloth.tune.summary.build_summary` already read. Returns ``{}``
     when either side lacks an eval — nothing to compare, so nothing is shown,
-    exactly like the rest of this module's delta helpers degrade silently.
+    exactly like the rest of this module's delta helpers degrade silently —
+    or when both sides' projected metrics are identical, so two runs with
+    matching evals report no eval delta.
     """
     eval_a = summary_a.get("eval")
     eval_b = summary_b.get("eval")
     if eval_a is None or eval_b is None:
         return {}
-    return {
-        "eval": {
-            "a": {key: eval_a.get(key) for key in _EVAL_KEYS},
-            "b": {key: eval_b.get(key) for key in _EVAL_KEYS},
-        }
-    }
+    proj_a = {key: eval_a.get(key) for key in _EVAL_KEYS}
+    proj_b = {key: eval_b.get(key) for key in _EVAL_KEYS}
+    if proj_a == proj_b:
+        return {}
+    return {"eval": {"a": proj_a, "b": proj_b}}
 
 
 def _config_deltas(meta_a: dict[str, Any] | None, meta_b: dict[str, Any] | None) -> dict[str, Any]:

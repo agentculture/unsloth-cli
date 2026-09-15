@@ -174,6 +174,26 @@ def _resolve_and_validate_suite(raw_entries: list[str]) -> list[Path]:
     return resolved
 
 
+def _validate_batch_size(batch_size: int) -> None:
+    """Raise ``CliError(code=1)`` unless *batch_size* is a positive integer.
+
+    Called before suite validation or any container launch so a bogus
+    ``--batch-size`` (0 or negative) never reaches the ML seam or spends a
+    docker/GPU cycle. ``1`` is a legitimate value — it is the explicit
+    unbatched (one prompt per ``generate()`` call) mode.
+    """
+    if batch_size < 1:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"--batch-size must be >= 1, got {batch_size}",
+            remediation=(
+                "Pass a positive integer with --batch-size (1 for the explicit "
+                "unbatched mode, the default is "
+                f"{DEFAULT_BATCH_SIZE})."
+            ),
+        )
+
+
 def _render_suite_label(suite_paths: list[Path]) -> str:
     """A short display label for the resolved suite: the single path, or a count."""
     if len(suite_paths) == 1:
@@ -358,6 +378,9 @@ def cmd_eval(args: argparse.Namespace) -> int | None:
     quant = getattr(args, "quant", None)
     _raw_batch_size = getattr(args, "batch_size", None)
     batch_size = DEFAULT_BATCH_SIZE if _raw_batch_size is None else int(_raw_batch_size)
+
+    # --- validate --batch-size BEFORE suite validation or container launch ---
+    _validate_batch_size(batch_size)
 
     # --- resolve the target: exactly one of --adapter / --model --------------
     target = _resolve_target(args)

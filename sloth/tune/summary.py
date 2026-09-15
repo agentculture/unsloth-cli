@@ -21,6 +21,7 @@ reads the numbers ``sloth eval`` already wrote to disk.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -110,15 +111,15 @@ def read_eval(output_dir: str | Path) -> dict[str, Any] | None:
     """Read+parse ``eval.json`` directly inside *output_dir* (the file
     :func:`sloth.tune.metrics.write_eval_json` writes for ``sloth eval``).
 
-    Returns ``None`` on absence or a parse failure — tolerated, never raised,
-    exactly like :func:`read_trainer_state`. Read-only: this module never
-    computes or recomputes a metric, it only reads the numbers ``sloth eval``
-    already wrote.
+    Returns ``None`` on absence, a decode failure, or a parse failure —
+    tolerated, never raised, exactly like :func:`read_trainer_state`.
+    Read-only: this module never computes or recomputes a metric, it only
+    reads the numbers ``sloth eval`` already wrote.
     """
     eval_path = Path(output_dir) / _EVAL_JSON_NAME
     try:
         raw = eval_path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
     try:
         parsed = json.loads(raw)
@@ -333,7 +334,7 @@ def build_summary(output_dir: str | Path) -> dict[str, Any]:
 
     for export in exports:
         export_output = export.get("output")
-        if not export_output:
+        if not export_output or not isinstance(export_output, (str, os.PathLike)):
             continue
         export_eval_payload = read_eval(export_output)
         if export_eval_payload is not None:

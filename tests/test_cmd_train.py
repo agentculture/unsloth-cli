@@ -95,7 +95,7 @@ def _write_toml(
     return f
 
 
-@pytest.fixture()
+@pytest.fixture
 def good_config(tmp_path: Path) -> Path:
     """A valid run.toml + valid chat dataset; returns the toml path."""
     dataset = _write_dataset(tmp_path)

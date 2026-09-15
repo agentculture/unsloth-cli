@@ -68,12 +68,12 @@ def _write_dataset(tmp_path: Path, body: str, name: str = "data.jsonl") -> Path:
     return f
 
 
-@pytest.fixture()
+@pytest.fixture
 def valid_chat_dataset(tmp_path: Path) -> Path:
     return _write_dataset(tmp_path, _VALID_CHAT, name="chat.jsonl")
 
 
-@pytest.fixture()
+@pytest.fixture
 def valid_task_dataset(tmp_path: Path) -> Path:
     return _write_dataset(tmp_path, _VALID_TASK, name="task.jsonl")
 
@@ -403,7 +403,7 @@ def test_main_validate_unknown_command_would_have_caught_missing_registration(
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture()
+@pytest.fixture
 def suite_file(tmp_path: Path) -> Path:
     """A single valid task-schema suite file."""
     f = tmp_path / "suite.jsonl"
@@ -415,7 +415,7 @@ def suite_file(tmp_path: Path) -> Path:
     return f
 
 
-@pytest.fixture()
+@pytest.fixture
 def suite_dir(tmp_path: Path) -> Path:
     """A suite directory with two valid task-schema files."""
     d = tmp_path / "suite_dir"
@@ -481,8 +481,9 @@ def test_suite_directory_with_malformed_file_names_file_and_line(tmp_path: Path)
     )
     (d / "z_bad.jsonl").write_text("not valid json\n", encoding="utf-8")
 
+    args = _make_args(suite=d)
     with pytest.raises(CliError) as exc_info:
-        cmd_validate(_make_args(suite=d))
+        cmd_validate(args)
     err = exc_info.value
     assert err.code == 1
     assert "z_bad.jsonl" in err.message
@@ -491,8 +492,9 @@ def test_suite_directory_with_malformed_file_names_file_and_line(tmp_path: Path)
 
 def test_suite_missing_path_raises_cli_error(tmp_path: Path) -> None:
     """A --suite path that does not exist raises CliError(code=1)."""
+    args = _make_args(suite=tmp_path / "nope")
     with pytest.raises(CliError) as exc_info:
-        cmd_validate(_make_args(suite=tmp_path / "nope"))
+        cmd_validate(args)
     assert exc_info.value.code == 1
 
 
@@ -500,8 +502,9 @@ def test_suite_empty_directory_raises_cli_error(tmp_path: Path) -> None:
     """A --suite directory with no *.jsonl files raises CliError(code=1)."""
     empty = tmp_path / "empty"
     empty.mkdir()
+    args = _make_args(suite=empty)
     with pytest.raises(CliError) as exc_info:
-        cmd_validate(_make_args(suite=empty))
+        cmd_validate(args)
     assert exc_info.value.code == 1
 
 
@@ -522,14 +525,34 @@ def test_suite_uses_same_validate_suite_function_as_eval(
     assert calls == [(str(suite_dir), "task")]
 
 
-def test_suite_explicit_schema_override(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    """--suite honours an explicit --schema override (not just the task default)."""
+def test_suite_with_non_task_schema_raises_cli_error(tmp_path: Path) -> None:
+    """qodo: a --suite validated against a non-task --schema must NOT be
+    reported valid — sloth eval always enforces the task schema for suites,
+    so a chat-schema file that "passes" here with --schema chat would fail
+    sloth eval anyway. --suite always validates against task; an explicit
+    non-task --schema is a user error."""
     chat_suite = tmp_path / "chat_suite.jsonl"
     chat_suite.write_text('{"messages": [{"role": "user", "content": "hi"}]}\n', encoding="utf-8")
-    rc = cmd_validate(_make_args(suite=chat_suite, schema="chat", json_mode=True))
+    args = _make_args(suite=chat_suite, schema="chat", json_mode=True)
+    with pytest.raises(CliError) as exc_info:
+        cmd_validate(args)
+    err = exc_info.value
+    assert err.code == 1
+    assert err.remediation
+
+
+def test_suite_with_explicit_task_schema_is_accepted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--suite --schema task (the suite default, passed explicitly) still works."""
+    task_suite = tmp_path / "task_suite.jsonl"
+    task_suite.write_text(
+        '{"task": "reverse", "input": "abc", "expected_output": "cba"}\n', encoding="utf-8"
+    )
+    rc = cmd_validate(_make_args(suite=task_suite, schema="task", json_mode=True))
     assert rc in (None, 0)
     payload = json.loads(capsys.readouterr().out)
-    assert payload["schema"] == "chat"
+    assert payload["schema"] == "task"
     assert payload["total_records"] == 1
 
 

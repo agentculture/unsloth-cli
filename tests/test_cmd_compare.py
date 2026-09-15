@@ -303,6 +303,29 @@ def test_compare_shows_eval_delta_when_both_sides_have_eval_json(
     assert payload["deltas"]["eval"]["b"] == {"exact_match_pct": 90.0, "f1": 0.95}
 
 
+def test_compare_no_eval_delta_when_metrics_are_identical(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Both sides have an eval.json with IDENTICAL exact_match_pct/f1: no
+    eval delta should be reported (qodo finding: previously any two eval
+    blocks were reported as differing without comparing values)."""
+    dataset = _write_dataset(tmp_path)
+    dir_a = tmp_path / "exp-a"
+    dir_a.mkdir()
+    write_metadata(dir_a, model="m", method="lora", dataset_path=dataset, hyperparameters={})
+    _write_eval_json(dir_a, exact_match_pct=75.0, f1=0.8)
+
+    dir_b = tmp_path / "exp-b"
+    dir_b.mkdir()
+    write_metadata(dir_b, model="m", method="lora", dataset_path=dataset, hyperparameters={})
+    _write_eval_json(dir_b, exact_match_pct=75.0, f1=0.8)
+
+    rc = cmd_compare(_args(str(dir_a), str(dir_b), json_mode=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "eval" not in payload["deltas"]
+
+
 def test_compare_no_eval_delta_when_one_side_missing_eval_json(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

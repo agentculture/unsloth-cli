@@ -96,7 +96,7 @@ def _fake_run_eval_perfect(
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture()
+@pytest.fixture
 def tmp_adapter(tmp_path: Path) -> Path:
     """A minimal adapter directory (just needs to exist as a directory)."""
     d = tmp_path / "adapter"
@@ -104,7 +104,7 @@ def tmp_adapter(tmp_path: Path) -> Path:
     return d
 
 
-@pytest.fixture()
+@pytest.fixture
 def tmp_adapter_with_config(tmp_path: Path) -> tuple[Path, str]:
     """An adapter directory with a valid adapter_config.json.
 
@@ -118,7 +118,7 @@ def tmp_adapter_with_config(tmp_path: Path) -> tuple[Path, str]:
     return d, base_model_name
 
 
-@pytest.fixture()
+@pytest.fixture
 def tmp_suite(tmp_path: Path) -> Path:
     """A two-record task-schema JSONL eval suite."""
     f = tmp_path / "suite.jsonl"
@@ -1097,7 +1097,7 @@ def test_run_eval_model_without_ml_stack(
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture()
+@pytest.fixture
 def tmp_suite_dir_valid(tmp_path: Path) -> Path:
     """A suite directory with two valid task-schema *.jsonl files."""
     d = tmp_path / "suite_dir"
@@ -1113,7 +1113,7 @@ def tmp_suite_dir_valid(tmp_path: Path) -> Path:
     return d
 
 
-@pytest.fixture()
+@pytest.fixture
 def tmp_suite_dir_malformed(tmp_path: Path) -> Path:
     """A suite directory whose second file has a malformed line 2."""
     d = tmp_path / "suite_dir_bad"
@@ -1370,3 +1370,65 @@ def test_in_container_forwards_quant_and_batch_size_when_seam_accepts_them(
     assert calls[0]["suite_paths"] == [tmp_suite]
     assert calls[0]["quant"] == "q4_k_m"
     assert calls[0]["batch_size"] == 4
+
+
+# ---------------------------------------------------------------------------
+# qodo — --batch-size must be validated on the host before suite validation
+# or container launch; 0 and negative values are user errors, not silent 1s.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad_batch_size", [0, -3])
+def test_batch_size_below_one_raises_cli_error(
+    tmp_adapter: Path,
+    tmp_suite: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bad_batch_size: int,
+) -> None:
+    """--batch-size 0 or negative raises CliError(code=1) before the container
+    is ever launched — batch-size validation happens before suite validation
+    and before any launch() call."""
+    launched: list[Any] = []
+
+    def _fail_if_launched(sloth_args: list[str], **kwargs: Any) -> int:
+        launched.append(sloth_args)
+        raise AssertionError("container.launch must not be called for a bad --batch-size")
+
+    monkeypatch.setattr(eval_mod.container, "launch", _fail_if_launched)
+
+    args = _make_args(
+        adapter=str(tmp_adapter),
+        suite=str(tmp_suite),
+        batch_size=bad_batch_size,
+        in_container=False,
+    )
+    with pytest.raises(CliError) as exc_info:
+        cmd_eval(args)
+    assert exc_info.value.code == 1
+    assert not launched
+
+
+def test_batch_size_one_is_accepted(
+    tmp_adapter: Path,
+    tmp_suite: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--batch-size 1 stays the explicit unbatched mode — it is not rejected."""
+    captured: dict[str, Any] = {}
+
+    def _capture_launch(sloth_args: list[str], **kwargs: Any) -> dict[str, Any]:
+        captured["sloth_args"] = list(sloth_args)
+        return dict(_FAKE_EVAL_SUMMARY)
+
+    monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
+
+    args = _make_args(
+        adapter=str(tmp_adapter),
+        suite=str(tmp_suite),
+        batch_size=1,
+        in_container=False,
+    )
+    rc = cmd_eval(args)
+    assert rc in (None, 0)
+    forwarded = captured["sloth_args"]
+    assert forwarded[forwarded.index("--batch-size") + 1] == "1"
