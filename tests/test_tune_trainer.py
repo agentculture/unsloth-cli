@@ -29,7 +29,7 @@ from types import SimpleNamespace
 import pytest
 
 from sloth.cli._errors import CliError
-from sloth.tune import _trainer
+from sloth.tune import _trainer, metrics
 from sloth.tune._trainer import run_eval, run_training
 from sloth.tune.config import RunConfig
 from sloth.tune.presets import PRESETS
@@ -657,6 +657,186 @@ class TestGpuOomMapping:
 
 
 # ---------------------------------------------------------------------------
+# Fake tokenizer / model kit for the eval tests
+#
+# These stand in for transformers' tensors closely enough to exercise the REAL
+# slicing arithmetic: ``input_ids``/``attention_mask`` are 2-D objects with
+# ``.shape`` and row indexing, rows support ``.sum()`` and slicing, and the fake
+# tokenizer *actually decodes the token slice it is handed* — so a wrong prompt
+# offset shows up as a prediction that still contains its own prompt, rather
+# than being hidden behind a canned decode() return value.
+# ---------------------------------------------------------------------------
+
+
+class _FakeRow(list):
+    """A 1-D tensor stand-in: a list that also answers ``.sum()`` and slices."""
+
+    def sum(self) -> int:
+        return sum(self)
+
+    def __getitem__(self, key):  # type: ignore[override]
+        item = list.__getitem__(self, key)
+        return _FakeRow(item) if isinstance(key, slice) else item
+
+
+class _FakeBatch:
+    """A 2-D tensor stand-in: ``.shape`` plus row indexing."""
+
+    def __init__(self, rows: list[list[int]]) -> None:
+        self.rows = [_FakeRow(r) for r in rows]
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (len(self.rows), len(self.rows[0]) if self.rows else 0)
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, index: int) -> _FakeRow:
+        return self.rows[index]
+
+
+class _FakeInputs(dict):
+    """A BatchEncoding stand-in: a dict that also supports ``.to(device)``."""
+
+    def to(self, _device):  # noqa: D102 - trivial
+        return self
+
+
+class _FakeTokenizer:
+    """Word-level tokenizer over a growing vocabulary; decodes what it is given."""
+
+    def __init__(self, *, pad_token: str | None = None, eos_token: str | None = "</s>") -> None:
+        self.pad_token = pad_token
+        self.eos_token = eos_token
+        self.padding_side = "right"
+        self._ids: dict[str, int] = {}
+        self._words: dict[int, str] = {}
+
+    def _id(self, word: str) -> int:
+        if word not in self._ids:
+            token_id = len(self._ids) + 1
+            self._ids[word] = token_id
+            self._words[token_id] = word
+        return self._ids[word]
+
+    def encode(self, text: str) -> list[int]:
+        return [self._id(word) for word in text.split()]
+
+    def __call__(self, text, return_tensors: str = "pt", padding: bool = False) -> _FakeInputs:
+        texts = [text] if isinstance(text, str) else list(text)
+        sequences = [self.encode(t) for t in texts]
+        masks = [[1] * len(s) for s in sequences]
+        if padding:
+            assert self.pad_token is not None, "padding requested without a pad token"
+            pad_id = self._id(self.pad_token)
+            width = max(len(s) for s in sequences)
+            padded, padded_masks = [], []
+            for seq, mask in zip(sequences, masks):
+                gap = width - len(seq)
+                if self.padding_side == "left":
+                    padded.append([pad_id] * gap + seq)
+                    padded_masks.append([0] * gap + mask)
+                else:
+                    padded.append(seq + [pad_id] * gap)
+                    padded_masks.append(mask + [0] * gap)
+            sequences, masks = padded, padded_masks
+        return _FakeInputs(input_ids=_FakeBatch(sequences), attention_mask=_FakeBatch(masks))
+
+    def decode(self, tokens, skip_special_tokens: bool = True) -> str:
+        words = [self._words[int(t)] for t in tokens]
+        if skip_special_tokens:
+            words = [w for w in words if w not in {self.pad_token, self.eos_token}]
+        return " ".join(words)
+
+
+class _FakeEvalModel:
+    """Appends the configured answer's tokens to the (padded) prompt row."""
+
+    def __init__(self, tokenizer: _FakeTokenizer, answers: dict[str, str]) -> None:
+        self.tokenizer = tokenizer
+        self.answers = answers
+        self.batch_widths: list[int] = []
+
+    def eval(self):  # noqa: D102 - trivial
+        return self
+
+    def parameters(self):  # noqa: D102 - trivial
+        yield SimpleNamespace(device="cpu")
+
+    def generate(self, input_ids=None, attention_mask=None, max_new_tokens: int = 16):
+        self.batch_widths.append(len(input_ids))
+        rows = []
+        for i in range(len(input_ids)):
+            row = list(input_ids[i])
+            mask = list(attention_mask[i]) if attention_mask is not None else [1] * len(row)
+            prompt = self.tokenizer.decode(
+                _FakeRow([t for t, m in zip(row, mask) if m]), skip_special_tokens=False
+            )
+            answer = next(
+                (a for key, a in self.answers.items() if key in prompt),
+                "UNKNOWN",
+            )
+            rows.append(row + self.tokenizer.encode(answer))
+        return _FakeBatch(rows)
+
+
+def _install_fake_ml(
+    monkeypatch, *, tokenizer: _FakeTokenizer, model: _FakeEvalModel, calls: dict | None = None
+) -> dict:
+    """Inject fake torch/transformers/peft modules built around *tokenizer*/*model*."""
+    log: dict = calls if calls is not None else {}
+    base_model = object()
+    log["_fake_base_model"] = base_model
+
+    class _FakeAutoModel:
+        @staticmethod
+        def from_pretrained(name, **kw):
+            log["causal_lm_name"] = name
+            return base_model
+
+    class _FakePeftModel:
+        @staticmethod
+        def from_pretrained(base, adapter_path, **kw):
+            log["peft_base"] = base
+            log["peft_adapter"] = adapter_path
+            return model
+
+    class _FakeAutoTokenizer:
+        @staticmethod
+        def from_pretrained(name, **kw):
+            return tokenizer
+
+    class _FakeNoGrad:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *exc):
+            return False
+
+    fake_torch = SimpleNamespace(no_grad=_FakeNoGrad)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(AutoModelForCausalLM=_FakeAutoModel, AutoTokenizer=_FakeAutoTokenizer),
+    )
+    monkeypatch.setitem(sys.modules, "peft", SimpleNamespace(PeftModel=_FakePeftModel))
+    return log
+
+
+def _write_task_suite(path: Path, rows: list[tuple[str, str, str]]) -> Path:
+    """Write a task-schema JSONL suite from ``(task, input, expected_output)`` rows."""
+    path.write_text(
+        "".join(
+            json.dumps({"task": t, "input": i, "expected_output": e}) + "\n" for t, i, e in rows
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+# ---------------------------------------------------------------------------
 # 8. run_eval — PeftModel load sequence (moved from test_cmd_eval)
 # ---------------------------------------------------------------------------
 
@@ -687,74 +867,18 @@ class TestRunEval:
         )
 
     def _inject_fake_ml(self, monkeypatch, *, base_model_name: str, adapter_dir: str) -> dict:
-        """Inject fake torch/transformers/peft and return a call-log dict."""
-        calls: dict = {}
-        fake_base_model = object()
+        """Inject fake torch/transformers/peft and return a call-log dict.
 
-        from types import SimpleNamespace
-        from unittest.mock import MagicMock
-
-        # A dict that also supports ``.to(device)`` (mirrors a transformers BatchEncoding).
-        class _FakeInputs(dict):
-            def to(self, device):
-                calls["inputs_moved_to"] = device
-                return self
-
-        # fake model returned by PeftModel.from_pretrained — exposes parameters()/eval()/
-        # generate() like a real (GPU-resident) model so run_eval can read its device.
-        class _FakeEvalModel:
-            def eval(self):
-                return self
-
-            def parameters(self):
-                yield SimpleNamespace(device="cpu")
-
-            def generate(self, **kw):
-                return [[1, 2, 3]]
-
-        # fake PeftModel (records base + adapter_path)
-        class FakePeftModel:
-            @staticmethod
-            def from_pretrained(base, adapter_path, **kw):
-                calls["peft_base"] = base
-                calls["peft_adapter"] = adapter_path
-                return _FakeEvalModel()
-
-        # fake AutoModelForCausalLM (records the name it was called with)
-        class FakeAutoModel:
-            @staticmethod
-            def from_pretrained(name, **kw):
-                calls["causal_lm_name"] = name
-                return fake_base_model
-
-        # fake AutoTokenizer
-        class _FakeTok:
-            def __call__(self, prompt, **kw):
-                return _FakeInputs(input_ids=[[1, 2, 3]])
-
-            def decode(self, tokens, **kw):
-                return "cba"
-
-        class FakeAutoTokenizer:
-            @staticmethod
-            def from_pretrained(name, **kw):
-                return _FakeTok()
-
-        fake_torch = MagicMock()
-        fake_torch.no_grad.return_value.__enter__ = lambda s: None
-        fake_torch.no_grad.return_value.__exit__ = lambda s, *a: False
-
-        fake_transformers = SimpleNamespace(
-            AutoModelForCausalLM=FakeAutoModel,
-            AutoTokenizer=FakeAutoTokenizer,
-        )
-        fake_peft_mod = SimpleNamespace(PeftModel=FakePeftModel)
-
-        monkeypatch.setitem(sys.modules, "torch", fake_torch)
-        monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-        monkeypatch.setitem(sys.modules, "peft", fake_peft_mod)
-
-        calls["_fake_base_model"] = fake_base_model
+        The fake tokenizer decodes the **actual token slice** run_eval hands it
+        (see ``_FakeTokenizer``), so a prediction that still carried its prompt
+        would be visible in the scored output instead of being masked by a canned
+        decode() answer.
+        """
+        tokenizer = _FakeTokenizer()
+        model = _FakeEvalModel(tokenizer, {"abc": "cba"})
+        calls = _install_fake_ml(monkeypatch, tokenizer=tokenizer, model=model)
+        calls["_tokenizer"] = tokenizer
+        calls["_model"] = model
         return calls
 
     def test_peft_load_sequence_base_model_then_adapter(self, tmp_path: Path, monkeypatch) -> None:
@@ -836,3 +960,280 @@ class TestRunEval:
 
         with pytest.raises((CliError, ImportError)):
             run_eval(str(adapter_dir), str(suite_file))
+
+
+# ---------------------------------------------------------------------------
+# 9. sloth.tune.metrics — pure-stdlib scoring (exact match + token F1)
+# ---------------------------------------------------------------------------
+
+
+class TestMetrics:
+    """The scoring core both eval seams share. Pure stdlib: no torch, no transformers."""
+
+    def test_token_f1_partial_overlap_is_two_thirds(self) -> None:
+        """f1('a b c', 'a b d') == 0.667 to three decimals (2 of 3 tokens shared)."""
+        assert round(metrics.token_f1("a b c", "a b d"), 3) == 0.667
+
+    def test_token_f1_identical_and_disjoint(self) -> None:
+        assert metrics.token_f1("hello world", "hello world") == 1.0
+        assert metrics.token_f1("hello", "world") == 0.0
+
+    def test_token_f1_is_case_and_punctuation_insensitive(self) -> None:
+        assert metrics.token_f1("Hello, world!", "hello world") == 1.0
+
+    def test_token_f1_empty_sides(self) -> None:
+        """Two blanks match; exactly one blank does not."""
+        assert metrics.token_f1("", "") == 1.0
+        assert metrics.token_f1("", "a") == 0.0
+        assert metrics.token_f1("a", "") == 0.0
+
+    def test_token_f1_counts_repeats_as_a_multiset(self) -> None:
+        """Repeating a token does not earn extra credit for it."""
+        assert round(metrics.token_f1("a a a a", "a"), 3) == 0.4
+
+    def test_summarize_reports_totals_and_mean_f1(self) -> None:
+        records = [
+            {"task": "t", "input": "i", "expected_output": "a b c"},
+            {"task": "t", "input": "j", "expected_output": "x y z"},
+        ]
+        scored = metrics.score_records(records, ["a b c", "x y q"])
+        summary = metrics.summarize(scored)
+        assert summary["total"] == 2
+        assert summary["exact_match"] == 1
+        assert summary["exact_match_pct"] == 50.0
+        # (1.0 + 2/3) / 2
+        assert round(summary["f1"], 3) == 0.833
+
+    def test_score_records_indices_continue_across_files(self) -> None:
+        records = [{"task": "t", "input": "i", "expected_output": "a"}]
+        scored = metrics.score_records(records, ["a"], start_index=7, source="s.jsonl")
+        assert scored[0]["index"] == 7
+        assert scored[0]["file"] == "s.jsonl"
+
+    def test_metrics_imports_only_stdlib(self) -> None:
+        """Every top-level import of metrics.py resolves to a stdlib module."""
+        source = Path(_trainer.__file__).with_name("metrics.py").read_text(encoding="utf-8")
+        roots: set[str] = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                roots.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                roots.add(node.module.split(".")[0])
+        non_stdlib = {r for r in roots if r not in sys.stdlib_module_names}
+        assert not non_stdlib, f"metrics.py imports non-stdlib modules: {sorted(non_stdlib)}"
+
+
+# ---------------------------------------------------------------------------
+# 10. run_eval — batched generation, per-file scoring, eval.json
+# ---------------------------------------------------------------------------
+
+
+def _adapter_with_config(tmp_path: Path) -> Path:
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text(
+        json.dumps({"base_model_name_or_path": "unsloth/Qwen3-4B", "peft_type": "LORA"}),
+        encoding="utf-8",
+    )
+    return adapter
+
+
+class TestRunEvalBatching:
+    """Batched, left-padded generation must slice each row's prompt off correctly."""
+
+    def test_predictions_exclude_their_own_prompt(self, tmp_path: Path, monkeypatch) -> None:
+        """Three prompts of DIFFERENT lengths, one batch: no prediction keeps its prompt.
+
+        This is the regression that left padding makes subtle — every row is
+        ``pad* + prompt + continuation``, so the continuation starts at the shared
+        PADDED width, not at the row's own token count.
+        """
+        adapter = _adapter_with_config(tmp_path)
+        suite = _write_task_suite(
+            tmp_path / "suite.jsonl",
+            [
+                ("reverse", "abc", "cba"),
+                ("reverse", "a much longer input here", "erehtupni"),
+                ("reverse", "mid length input", "tupnidim"),
+            ],
+        )
+        tokenizer = _FakeTokenizer(pad_token="<pad>")
+        model = _FakeEvalModel(
+            tokenizer,
+            {
+                "abc": "cba",
+                "a much longer input here": "erehtupni",
+                "mid length input": "tupnidim",
+            },
+        )
+        _install_fake_ml(monkeypatch, tokenizer=tokenizer, model=model)
+
+        result = run_eval(str(adapter), suite_paths=[suite], batch_size=8)
+
+        assert model.batch_widths == [3], "all three prompts must go through ONE generate() call"
+        assert tokenizer.padding_side == "left"
+        predictions = [r["prediction"] for r in result["results"]]
+        assert predictions == ["cba", "erehtupni", "tupnidim"]
+        for entry in result["results"]:
+            prompt = f"Task: {entry['task']}\nInput: {entry['input']}\nOutput:"
+            assert not entry["prediction"].startswith(prompt)
+            for word in prompt.split():
+                assert word not in entry["prediction"].split()
+        assert result["exact_match"] == 3
+
+    def test_batches_are_chunked_at_batch_size(self, tmp_path: Path, monkeypatch) -> None:
+        adapter = _adapter_with_config(tmp_path)
+        suite = _write_task_suite(
+            tmp_path / "suite.jsonl",
+            [("echo", f"w{i}", f"w{i}") for i in range(5)],
+        )
+        tokenizer = _FakeTokenizer(pad_token="<pad>")
+        model = _FakeEvalModel(tokenizer, {f"w{i}": f"w{i}" for i in range(5)})
+        _install_fake_ml(monkeypatch, tokenizer=tokenizer, model=model)
+
+        result = run_eval(str(adapter), suite_paths=[suite], batch_size=2)
+        assert model.batch_widths == [2, 2, 1]
+        assert result["exact_match"] == 5
+
+    def test_eos_is_adopted_as_the_pad_token(self, tmp_path: Path, monkeypatch) -> None:
+        """pad_token=None with eos set ⇒ eos becomes the pad token, batching proceeds."""
+        adapter = _adapter_with_config(tmp_path)
+        suite = _write_task_suite(
+            tmp_path / "suite.jsonl", [("echo", "a", "a"), ("echo", "b b b", "b")]
+        )
+        tokenizer = _FakeTokenizer(pad_token=None, eos_token="<eos>")
+        model = _FakeEvalModel(tokenizer, {"Input: a": "a", "Input: b b b": "b"})
+        _install_fake_ml(monkeypatch, tokenizer=tokenizer, model=model)
+
+        result = run_eval(str(adapter), suite_paths=[suite], batch_size=4)
+        assert tokenizer.pad_token == "<eos>"
+        assert model.batch_widths == [2]
+        assert [r["prediction"] for r in result["results"]] == ["a", "b"]
+
+    def test_no_pad_and_no_eos_falls_back_to_batch_size_one(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        """Unpaddable tokenizer ⇒ batch size 1 plus a stderr diagnostic, same scores."""
+        adapter = _adapter_with_config(tmp_path)
+        suite = _write_task_suite(
+            tmp_path / "suite.jsonl", [("echo", "a", "a"), ("echo", "b b b", "b")]
+        )
+        tokenizer = _FakeTokenizer(pad_token=None, eos_token=None)
+        model = _FakeEvalModel(tokenizer, {"Input: a": "a", "Input: b b b": "b"})
+        _install_fake_ml(monkeypatch, tokenizer=tokenizer, model=model)
+
+        result = run_eval(str(adapter), suite_paths=[suite], batch_size=8)
+
+        captured = capsys.readouterr()
+        assert model.batch_widths == [1, 1]
+        assert "batch size 1" in captured.err
+        assert captured.out == "", "diagnostics must never reach stdout"
+        assert [r["prediction"] for r in result["results"]] == ["a", "b"]
+
+
+class TestRunEvalSuiteShape:
+    """Per-file entries + the aggregate, and the eval.json written next to the adapter."""
+
+    def _run(self, tmp_path: Path, monkeypatch, suites: list[Path], **kwargs):
+        adapter = _adapter_with_config(tmp_path)
+        tokenizer = _FakeTokenizer(pad_token="<pad>")
+        model = _FakeEvalModel(tokenizer, {"abc": "cba", "xyz": "zyx"})
+        _install_fake_ml(monkeypatch, tokenizer=tokenizer, model=model)
+        return adapter, run_eval(str(adapter), suite_paths=suites, **kwargs)
+
+    def test_signature_accepts_the_cli_keywords(self) -> None:
+        """``eval.py::_call_eval_seam`` introspects these exact parameter names."""
+        params = inspect.signature(run_eval).parameters
+        assert "suite_paths" in params
+        assert "quant" in params
+        assert "batch_size" in params
+        assert list(params)[0] == "adapter_path"
+
+    def test_single_suite_keeps_the_legacy_positional_call(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """``run_eval(target, suite_path)`` — the fallback call — still works."""
+        adapter = _adapter_with_config(tmp_path)
+        suite = _write_task_suite(tmp_path / "s.jsonl", [("reverse", "abc", "cba")])
+        tokenizer = _FakeTokenizer(pad_token="<pad>")
+        model = _FakeEvalModel(tokenizer, {"abc": "cba"})
+        _install_fake_ml(monkeypatch, tokenizer=tokenizer, model=model)
+
+        result = run_eval(str(adapter), str(suite))
+        assert result["total"] == 1
+        assert result["files"][0]["path"] == str(suite)
+
+    def test_per_file_entries_plus_aggregate(self, tmp_path: Path, monkeypatch) -> None:
+        good = _write_task_suite(tmp_path / "good.jsonl", [("reverse", "abc", "cba")])
+        bad = _write_task_suite(tmp_path / "bad.jsonl", [("reverse", "xyz", "nope")])
+        _adapter, result = self._run(tmp_path, monkeypatch, [good, bad])
+
+        assert [f["path"] for f in result["files"]] == [str(good), str(bad)]
+        assert result["files"][0]["exact_match"] == 1
+        assert result["files"][0]["exact_match_pct"] == 100.0
+        assert result["files"][0]["f1"] == 1.0
+        assert result["files"][1]["exact_match"] == 0
+        assert result["files"][1]["f1"] == 0.0
+        # Aggregate over both files, at the TOP level (what the CLI prints today).
+        assert result["total"] == 2
+        assert result["exact_match"] == 1
+        assert result["exact_match_pct"] == 50.0
+        assert result["f1"] == 0.5
+        assert [r["index"] for r in result["results"]] == [0, 1]
+        assert len(result["results"]) == 2
+
+    def test_eval_json_is_written_into_the_adapter_dir(self, tmp_path: Path, monkeypatch) -> None:
+        suite = _write_task_suite(tmp_path / "s.jsonl", [("reverse", "abc", "cba")])
+        adapter, result = self._run(tmp_path, monkeypatch, [suite])
+
+        written = json.loads((adapter / "eval.json").read_text(encoding="utf-8"))
+        assert written["suite_paths"] == [str(suite)]
+        assert written["target"] == "adapter"
+        assert written["written_at"].startswith("20")
+        for key, value in result.items():
+            assert written[key] == value
+
+    def test_eval_json_is_overwritten_on_re_run(self, tmp_path: Path, monkeypatch) -> None:
+        first = _write_task_suite(tmp_path / "one.jsonl", [("reverse", "abc", "cba")])
+        adapter, _ = self._run(tmp_path, monkeypatch, [first])
+        second = _write_task_suite(
+            tmp_path / "two.jsonl", [("reverse", "abc", "cba"), ("reverse", "xyz", "zyx")]
+        )
+        tokenizer = _FakeTokenizer(pad_token="<pad>")
+        model = _FakeEvalModel(tokenizer, {"abc": "cba", "xyz": "zyx"})
+        _install_fake_ml(monkeypatch, tokenizer=tokenizer, model=model)
+        run_eval(str(adapter), suite_paths=[second])
+
+        written = json.loads((adapter / "eval.json").read_text(encoding="utf-8"))
+        assert written["suite_paths"] == [str(second)]
+        assert written["total"] == 2
+
+
+class TestPaddedPromptWidth:
+    """The continuation offset under left padding — the subtle bit, tested directly."""
+
+    def _inputs(self, rows: list[list[int]], masks: list[list[int]]) -> _FakeInputs:
+        return _FakeInputs(input_ids=_FakeBatch(rows), attention_mask=_FakeBatch(masks))
+
+    def test_offset_is_the_shared_padded_width_not_the_row_token_count(self) -> None:
+        """Row 0 is left-padded: its own token count (2) is NOT where generation starts."""
+        inputs = self._inputs([[9, 9, 1, 2], [3, 4, 5, 6]], [[0, 0, 1, 1], [1, 1, 1, 1]])
+        assert _trainer._padded_prompt_width(inputs, 0) == 4
+        assert _trainer._padded_prompt_width(inputs, 1) == 4
+
+    def test_offset_without_an_attention_mask_is_the_input_width(self) -> None:
+        inputs = _FakeInputs(input_ids=_FakeBatch([[1, 2, 3]]))
+        assert _trainer._padded_prompt_width(inputs, 0) == 3
+
+
+def test_resolve_suite_paths_prefers_the_list(tmp_path: Path) -> None:
+    resolved = _trainer.resolve_suite_paths("legacy.jsonl", ["a.jsonl", "b.jsonl"])
+    assert [str(p) for p in resolved] == ["a.jsonl", "b.jsonl"]
+    assert [str(p) for p in _trainer.resolve_suite_paths("legacy.jsonl", None)] == ["legacy.jsonl"]
+
+
+def test_resolve_suite_paths_without_any_suite_is_a_user_error() -> None:
+    with pytest.raises(CliError) as exc_info:
+        _trainer.resolve_suite_paths(None, None)
+    assert exc_info.value.code == 1
+    assert exc_info.value.remediation

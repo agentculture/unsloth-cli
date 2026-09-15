@@ -143,3 +143,56 @@ def test_exporter_import_does_not_load_unsloth_or_llmcompressor():
         f"Expected returncode 0, got {result.returncode}\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
+
+
+def test_metrics_import_loads_no_ml_stack():
+    """sloth.tune.metrics is pure stdlib — importing it pulls in no ML module.
+
+    The eval scoring core (exact match, token F1, eval.json) must stay usable on
+    a machine with no ML stack at all, exactly like datasets/config/scope: it is
+    what lets a suite be scored and written without torch ever being imported.
+    """
+    code = (
+        "import sloth.tune.metrics; import sys; "
+        "heavy = [m for m in ('torch', 'unsloth', 'transformers', 'peft') "
+        "if m in sys.modules]; "
+        "assert not heavy, f'metrics pulled in {heavy}'; "
+        "print('PASS')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=_REPO_ROOT,
+    )
+    assert result.returncode == 0, (
+        f"Expected returncode 0, got {result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+
+
+def test_metrics_module_imports_only_stdlib():
+    """Every top-level import in metrics.py resolves to a stdlib module."""
+    code = (
+        "import ast, sys, pathlib; "
+        "import sloth.tune.metrics as m; "
+        "tree = ast.parse(pathlib.Path(m.__file__).read_text(encoding='utf-8')); "
+        "roots = set(); "
+        "[roots.update(a.name.split('.')[0] for a in n.names) "
+        "for n in ast.walk(tree) if isinstance(n, ast.Import)]; "
+        "[roots.add(n.module.split('.')[0]) for n in ast.walk(tree) "
+        "if isinstance(n, ast.ImportFrom) and n.level == 0 and n.module]; "
+        "extra = sorted(r for r in roots if r not in sys.stdlib_module_names); "
+        "assert not extra, f'non-stdlib imports in metrics.py: {extra}'; "
+        "print('PASS')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=_REPO_ROOT,
+    )
+    assert result.returncode == 0, (
+        f"Expected returncode 0, got {result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )

@@ -36,9 +36,11 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from sloth.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
+from sloth.cli._output import emit_diagnostic
+from sloth.tune import metrics
 from sloth.tune.config import RunConfig
 from sloth.tune.datasets import detect_schema, validate_dataset
 from sloth.tune.metadata import write_metadata
@@ -338,11 +340,173 @@ def _run_real(config: RunConfig, plan: dict[str, Any], backend: _Backend) -> dic
 
 
 # ---------------------------------------------------------------------------
+# Shared eval plumbing (suite resolution + batched generation)
+#
+# Both eval seams use these: ``run_eval`` below (``--adapter``) and
+# ``sloth.tune._exporter._predict_transformers`` (``--model``), which imports
+# them from here — the dependency runs _exporter → _trainer, never back.
+# ---------------------------------------------------------------------------
+
+#: Generation budget per suite item (mirrors ``_exporter.EVAL_MAX_NEW_TOKENS``).
+EVAL_MAX_NEW_TOKENS: int = 100
+
+#: Default number of prompts generated per ``generate()`` call.
+DEFAULT_EVAL_BATCH_SIZE: int = 8
+
+
+def resolve_suite_paths(
+    suite_path: str | Path | None,
+    suite_paths: Sequence[str | Path] | None,
+) -> list[Path]:
+    """Normalise the two suite arguments into an ordered list of files.
+
+    The eval seams accept **either** the historical single ``suite_path``
+    positional (kept so the old two-argument call site and any direct caller
+    stay green) **or** the newer ``suite_paths`` keyword the CLI passes once it
+    detects the richer signature. When both are given ``suite_paths`` wins; when
+    neither is given that is a caller bug, surfaced as ``CliError(code=1)``.
+    """
+    if suite_paths:
+        return [Path(p) for p in suite_paths]
+    if suite_path is not None:
+        return [Path(suite_path)]
+    raise CliError(
+        code=EXIT_USER_ERROR,
+        message="no eval suite given",
+        remediation="Pass --suite <file.jsonl> (or a directory of them) to `sloth eval`.",
+    )
+
+
+def _resolve_eval_batch_size(tokenizer: Any, batch_size: int) -> int:
+    """Return the batch size that *tokenizer* can actually pad for.
+
+    Batched generation needs a pad token. Three cases:
+
+    * ``pad_token`` set → use *batch_size* unchanged;
+    * ``pad_token is None`` but ``eos_token`` set → adopt EOS as the pad token
+      (the standard decoder-only workaround) and use *batch_size*;
+    * both ``None`` → padding is impossible, so fall back to **batch size 1**
+      after one stderr diagnostic (results stay correct, only slower).
+    """
+    if batch_size <= 1:
+        return 1
+    pad_token = getattr(tokenizer, "pad_token", None)
+    eos_token = getattr(tokenizer, "eos_token", None)
+    if pad_token is not None:
+        return batch_size
+    if eos_token is not None:
+        tokenizer.pad_token = eos_token
+        eos_id = getattr(tokenizer, "eos_token_id", None)
+        if eos_id is not None and getattr(tokenizer, "pad_token_id", None) is None:
+            tokenizer.pad_token_id = eos_id
+        return batch_size
+    emit_diagnostic(
+        "note: tokenizer has neither pad_token nor eos_token — batched generation "
+        "needs padding, so falling back to batch size 1 (slower, same scores)."
+    )
+    return 1
+
+
+def _padded_prompt_width(inputs: Any, row: int) -> int:
+    """Return the index where row *row*'s continuation starts in a ``generate()`` output.
+
+    ``generate()`` returns ``[batch, padded_prompt_width + new_tokens]``: every
+    row is ``pad * P_i`` + ``prompt * L_i`` + continuation, and under **left**
+    padding the pads come first, so ``P_i + L_i`` is the same shared padded width
+    for every row. Computing it per row from the attention mask —
+    ``L_i = attention_mask[i].sum()`` (the row's real token count) and
+    ``P_i = width - L_i`` (its left pad count) — therefore lands on that shared
+    width, which is exactly what must be sliced off.
+
+    Slicing at ``L_i`` alone would be **wrong**: for a short row the prompt sits
+    at indices ``[P_i, width)``, so ``sequence[L_i:]`` would still contain pad
+    tokens and the whole prompt whenever ``L_i < P_i``. The per-row arithmetic is
+    spelled out here rather than collapsed to ``width`` so the reasoning is
+    visible at the one place it matters.
+    """
+    ids = inputs["input_ids"] if isinstance(inputs, dict) else getattr(inputs, "input_ids", None)
+    shape = getattr(ids, "shape", None)
+    if shape is not None:
+        width = int(shape[-1])
+    elif ids is not None:
+        first = ids[0] if len(ids) and isinstance(ids[0], (list, tuple)) else ids
+        width = len(first)
+    else:
+        return 0
+    mask = inputs.get("attention_mask") if isinstance(inputs, dict) else None
+    if mask is None:
+        return width
+    try:
+        real_len = int(mask[row].sum())
+    except (AttributeError, IndexError, TypeError):
+        return width
+    pad_len = width - real_len  # left padding ⇒ the pads precede the prompt
+    return pad_len + real_len
+
+
+def _generate_predictions(
+    torch_mod: Any,
+    model: Any,
+    tokenizer: Any,
+    prompts: Sequence[str],
+    *,
+    batch_size: int,
+    max_new_tokens: int,
+    device: Any,
+) -> list[str]:
+    """Generate one continuation per prompt, in batches of *batch_size*.
+
+    Batched generation pads with ``padding_side="left"`` so every row's
+    continuation begins at the same offset (see :func:`_padded_prompt_width`);
+    the prompt is always sliced off before decoding, so a prediction never
+    contains its own ``Task:/Input:/Output:`` prefix. When padding is impossible
+    (no pad and no EOS token) or the caller asked for ``batch_size <= 1``, this
+    degrades to the historical one-prompt-at-a-time path, which needs no padding
+    at all.
+    """
+    effective = _resolve_eval_batch_size(tokenizer, batch_size)
+    predictions: list[str] = []
+
+    if effective == 1:
+        for prompt in prompts:
+            inputs = tokenizer(prompt, return_tensors="pt").to(device)
+            with torch_mod.no_grad():
+                outputs = model.generate(**inputs, max_new_tokens=max_new_tokens)
+            start = _padded_prompt_width(inputs, 0)
+            predictions.append(tokenizer.decode(outputs[0][start:], skip_special_tokens=True))
+        return predictions
+
+    tokenizer.padding_side = "left"
+    for offset in range(0, len(prompts), effective):
+        chunk = list(prompts[offset : offset + effective])
+        inputs = tokenizer(chunk, return_tensors="pt", padding=True).to(device)
+        with torch_mod.no_grad():
+            outputs = model.generate(**inputs, max_new_tokens=max_new_tokens)
+        for row in range(len(chunk)):
+            start = _padded_prompt_width(inputs, row)
+            predictions.append(tokenizer.decode(outputs[row][start:], skip_special_tokens=True))
+    return predictions
+
+
+def eval_prompt(record: dict[str, Any]) -> str:
+    """Render one task-schema record into the shared eval prompt shape."""
+    return f"Task: {record['task']}\nInput: {record['input']}\nOutput:"
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
 
-def run_eval(adapter_path: str, suite_path: str) -> dict[str, Any]:
+def run_eval(
+    adapter_path: str,
+    suite_path: str | None = None,
+    *,
+    suite_paths: Sequence[str | Path] | None = None,
+    quant: str | None = None,
+    batch_size: int = DEFAULT_EVAL_BATCH_SIZE,
+    max_new_tokens: int = EVAL_MAX_NEW_TOKENS,
+) -> dict[str, Any]:
     """Load a LoRA adapter and evaluate against a task-schema JSONL suite.
 
     This is the ML-seam entry point for ``sloth eval``.  Heavy imports
@@ -353,15 +517,32 @@ def run_eval(adapter_path: str, suite_path: str) -> dict[str, Any]:
     ----------
     adapter_path:
         Filesystem path to the adapter directory (must contain
-        ``adapter_config.json``).
+        ``adapter_config.json``). ``eval.json`` is written here.
     suite_path:
-        Path to a task-schema JSONL eval suite.
+        A single task-schema JSONL suite — the historical positional argument,
+        still honoured for direct/legacy callers.
+    suite_paths:
+        Every resolved suite file, in order (what ``sloth eval`` passes once it
+        detects this signature). Wins over *suite_path* when both are given.
+    quant:
+        Accepted and **ignored**: quant selection only means something for a
+        ``--model`` directory holding several GGUF files
+        (:func:`sloth.tune._exporter.run_eval_model`). The parameter exists so
+        the CLI can forward the same keyword set to either seam.
+    batch_size:
+        Prompts per ``generate()`` call (left-padded). Degrades to 1 when the
+        tokenizer cannot pad — see :func:`_resolve_eval_batch_size`.
+    max_new_tokens:
+        Generation budget per suite item.
 
     Returns
     -------
     dict
-        Summary with keys: ``total``, ``exact_match``, ``exact_match_pct``,
-        ``results``.
+        The **aggregate** over every suite file — ``total``, ``exact_match``,
+        ``exact_match_pct``, ``f1``, ``results`` — plus ``files``, one entry per
+        scored file (``{path, total, exact_match, exact_match_pct, f1,
+        results}``). The same payload, plus ``suite_paths`` / ``target`` /
+        ``written_at``, is written to ``<adapter_path>/eval.json``.
 
     Raises
     ------
@@ -371,6 +552,7 @@ def run_eval(adapter_path: str, suite_path: str) -> dict[str, Any]:
     CliError(code=2)
         When the ML stack (torch / transformers / peft) is not installed.
     """
+    resolved_suites = resolve_suite_paths(suite_path, suite_paths)
     try:
         import torch  # noqa: PLC0415 — intentional lazy import
         from peft import PeftModel  # noqa: PLC0415
@@ -429,47 +611,54 @@ def run_eval(adapter_path: str, suite_path: str) -> dict[str, Any]:
     model = PeftModel.from_pretrained(base_model, adapter_path, local_files_only=True)  # nosec B615
     model.eval()
 
-    # Load and validate the eval suite (pure stdlib, already validated by eval.py
-    # before the container launch, but re-validate inside the container).
-    records = validate_dataset(Path(suite_path), schema="task")
-
-    # Eval loop. Tokenized inputs must live on the same device as the (GPU-resident,
-    # 4-bit) model, else generate() raises "Expected all tensors to be on the same
+    # Eval loop, one suite file at a time so each file gets its own score entry.
+    # Tokenized inputs must live on the same device as the (GPU-resident, 4-bit)
+    # model, else generate() raises "Expected all tensors to be on the same
     # device" — index_select on a CPU index against CUDA weights.
     device = next(model.parameters()).device
-    eval_results: list[dict[str, Any]] = []
-    for i, record in enumerate(records):
-        prompt = f"Task: {record['task']}\nInput: {record['input']}\nOutput:"
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        with torch.no_grad():
-            outputs = model.generate(**inputs, max_new_tokens=100)
-        # generate() returns prompt + continuation; exact-match must score only the
-        # continuation, else every prediction is prefixed by the Task/Input/Output prompt.
-        ids = inputs["input_ids"]
-        prompt_len = int(ids.shape[-1]) if hasattr(ids, "shape") else len(ids[0])
-        prediction = tokenizer.decode(outputs[0][prompt_len:], skip_special_tokens=True)
-        expected = record["expected_output"]
-        exact_match = prediction.strip() == expected.strip()
-        eval_results.append(
-            {
-                "index": i,
-                "task": record["task"],
-                "input": record["input"],
-                "expected_output": expected,
-                "prediction": prediction,
-                "exact_match": exact_match,
-            }
+    files: list[dict[str, Any]] = []
+    next_index = 0
+    for suite_file in resolved_suites:
+        # Re-validate inside the container (eval.py already validated on the host).
+        records = validate_dataset(Path(suite_file), schema="task")
+        predictions = _generate_predictions(
+            torch,
+            model,
+            tokenizer,
+            [eval_prompt(record) for record in records],
+            batch_size=batch_size,
+            max_new_tokens=max_new_tokens,
+            device=device,
         )
+        scored = metrics.score_records(
+            records, predictions, start_index=next_index, source=str(suite_file)
+        )
+        next_index += len(scored)
+        files.append(metrics.file_entry(suite_file, scored))
 
-    total = len(eval_results)
-    exact = sum(1 for r in eval_results if r["exact_match"])
-    score_pct = round(exact / total * 100, 2) if total else 0.0
-    return {
-        "total": total,
-        "exact_match": exact,
-        "exact_match_pct": score_pct,
-        "results": eval_results,
-    }
+    summary = metrics.aggregate(files)
+    write_eval_json(Path(adapter_path), summary, resolved_suites, target="adapter")
+    return summary
+
+
+def write_eval_json(
+    directory: Path,
+    summary: dict[str, Any],
+    suite_paths: Sequence[str | Path],
+    *,
+    target: str,
+) -> Path | None:
+    """Write ``<directory>/eval.json``; warn (never fail) if the directory is read-only.
+
+    Losing an otherwise-complete eval because its artifact directory could not be
+    written would be worse than the missing file, so an :class:`OSError` becomes
+    a stderr diagnostic and the scores are still returned on stdout.
+    """
+    try:
+        return metrics.write_eval_json(directory, summary, suite_paths=suite_paths, target=target)
+    except OSError as exc:
+        emit_diagnostic(f"note: could not write {directory / metrics.EVAL_JSON_NAME}: {exc}")
+        return None
 
 
 def run_training(config: RunConfig, *, dry_run: bool = False) -> dict[str, Any]:
