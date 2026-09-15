@@ -2,7 +2,7 @@
   "plan_slug": "lfm2-5-target-modules-quantized-export",
   "schema_version": 2,
   "created": "2026-09-15T11:22:08Z",
-  "updated": "2026-09-15T14:31:15Z",
+  "updated": "2026-09-15T14:31:39Z",
   "deviations": [
     {
       "id": "d1",
@@ -455,7 +455,7 @@
         "commit": "445a490"
       },
       "origin": "llm",
-      "status": "proposed",
+      "status": "approved",
       "superseded": false,
       "seq": 25
     },
@@ -474,7 +474,7 @@
         "commit": "445a490"
       },
       "origin": "llm",
-      "status": "proposed",
+      "status": "approved",
       "superseded": false,
       "seq": 26
     },
@@ -493,7 +493,7 @@
         "commit": "445a490"
       },
       "origin": "llm",
-      "status": "proposed",
+      "status": "approved",
       "superseded": false,
       "seq": 27
     },
@@ -512,7 +512,7 @@
         "commit": "445a490"
       },
       "origin": "llm",
-      "status": "proposed",
+      "status": "approved",
       "superseded": false,
       "seq": 28
     },
@@ -531,7 +531,7 @@
         "commit": "445a490"
       },
       "origin": "llm",
-      "status": "proposed",
+      "status": "approved",
       "superseded": false,
       "seq": 29
     },
@@ -550,7 +550,7 @@
         "commit": "445a490"
       },
       "origin": "llm",
-      "status": "proposed",
+      "status": "approved",
       "superseded": false,
       "seq": 30
     },
@@ -569,7 +569,7 @@
         "commit": "445a490"
       },
       "origin": "llm",
-      "status": "proposed",
+      "status": "approved",
       "superseded": false,
       "seq": 31
     },
@@ -588,7 +588,7 @@
         "commit": "445a490"
       },
       "origin": "llm",
-      "status": "proposed",
+      "status": "approved",
       "superseded": false,
       "seq": 32
     },
@@ -645,7 +645,7 @@
         "commit": "445a490"
       },
       "origin": "llm",
-      "status": "proposed",
+      "status": "approved",
       "superseded": false,
       "seq": 35
     },
@@ -664,7 +664,7 @@
         "commit": "445a490"
       },
       "origin": "llm",
-      "status": "proposed",
+      "status": "approved",
       "superseded": false,
       "seq": 36
     },
@@ -702,7 +702,7 @@
         "commit": "445a490"
       },
       "origin": "llm",
-      "status": "proposed",
+      "status": "approved",
       "superseded": false,
       "seq": 38
     },
