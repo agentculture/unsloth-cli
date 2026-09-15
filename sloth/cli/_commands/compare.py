@@ -53,6 +53,32 @@ def _export_deltas(summary_a: dict[str, Any], summary_b: dict[str, Any]) -> dict
     return {} if same else {"exports": {"a": fp_a, "b": fp_b}}
 
 
+#: Aggregate eval fields compared between two runs' eval.json summaries.
+_EVAL_KEYS = ("exact_match_pct", "f1")
+
+
+def _eval_deltas(summary_a: dict[str, Any], summary_b: dict[str, Any]) -> dict[str, Any]:
+    """Return ``{"eval": {"a": {...}, "b": {...}}}`` (``exact_match_pct`` and
+    ``f1`` from each side's ``eval`` block) when BOTH runs have an
+    ``eval.json`` (i.e. ``summary["eval"]`` is not ``None`` on either side).
+
+    Read-only: never recomputes a metric, just re-shapes the two numbers
+    :func:`sloth.tune.summary.build_summary` already read. Returns ``{}``
+    when either side lacks an eval — nothing to compare, so nothing is shown,
+    exactly like the rest of this module's delta helpers degrade silently.
+    """
+    eval_a = summary_a.get("eval")
+    eval_b = summary_b.get("eval")
+    if eval_a is None or eval_b is None:
+        return {}
+    return {
+        "eval": {
+            "a": {key: eval_a.get(key) for key in _EVAL_KEYS},
+            "b": {key: eval_b.get(key) for key in _EVAL_KEYS},
+        }
+    }
+
+
 def _config_deltas(meta_a: dict[str, Any] | None, meta_b: dict[str, Any] | None) -> dict[str, Any]:
     """Return ``{key: {"a": val, "b": val}}`` for every top-level, dataset, or
     hyperparameter key that differs between the two metadata dicts.
@@ -91,6 +117,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
     summary_b = build_summary(dir_b)
     deltas = _config_deltas(summary_a.get("metadata"), summary_b.get("metadata"))
     deltas.update(_export_deltas(summary_a, summary_b))
+    deltas.update(_eval_deltas(summary_a, summary_b))
 
     report: dict[str, Any] = {"a": summary_a, "b": summary_b, "deltas": deltas}
 
