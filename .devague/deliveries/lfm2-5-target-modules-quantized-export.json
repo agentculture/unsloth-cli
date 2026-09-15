@@ -2,7 +2,7 @@
   "plan_slug": "lfm2-5-target-modules-quantized-export",
   "schema_version": 2,
   "created": "2026-09-15T11:22:08Z",
-  "updated": "2026-09-15T12:02:05Z",
+  "updated": "2026-09-15T13:33:33Z",
   "deviations": [
     {
       "id": "d1",
@@ -62,7 +62,500 @@
       "seq": 4
     }
   ],
-  "evidence": [],
-  "deltas": [],
+  "evidence": [
+    {
+      "id": "e1",
+      "obligation_ref": "o1",
+      "test_ref": "tests/test_cmd_train.py::test_lfm2_without_target_modules_emits_single_preset_hint",
+      "behavior_text": "dry-run with an LFM2 id and no target_modules writes exactly one note line to stderr and the stdout JSON still parses unchanged",
+      "contract_text": "the LFM2 hint is a single emit_diagnostic line on stderr; stdout carries only the plan/result payload",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "unit test ran green in the full suite at the named commit (573 passed)",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T13:32:14Z",
+        "commit": "8238f0a"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 5
+    },
+    {
+      "id": "e2",
+      "obligation_ref": "o1",
+      "test_ref": "live: /finetune run mode, LFM2.5-1.2B-Base, 2026-09-15 (scratchpad t13_skill.out)",
+      "behavior_text": "a REAL train run's stdout carries 125 non-JSON lines (NGC banner, trl progress dicts) around the 3 JSON results because the container's stdout streams through to the host",
+      "contract_text": "stdout carries only the plan/result payload, so a --json consumer never sees the hint in its JSON",
+      "evidence_type": "observation",
+      "strength": "fidelity",
+      "strength_basis": "measured on the live Spark run; the hint itself is on stderr, but the in-container trainer output is not",
+      "outcome": "fail",
+      "run": null,
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 6
+    },
+    {
+      "id": "e3",
+      "obligation_ref": "o2",
+      "test_ref": "tests/test_tune_config.py::test_target_modules_wrong_type_raises_cli_error_with_hint",
+      "behavior_text": "wrong type / empty / unknown preset exit 1 with a hint naming the accepted forms; list, regex and preset:lfm2 round-trip",
+      "contract_text": "accepts a list of names, a single regex string, or preset:<name>; any other type or an unknown preset exits 1 with a hint",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "unit tests ran green (10 cases in test_tune_config.py)",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T13:32:14Z",
+        "commit": "8238f0a"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 7
+    },
+    {
+      "id": "e4",
+      "obligation_ref": "o3",
+      "test_ref": "tests/test_tune_trainer.py::test_get_peft_model_receives_resolved_preset_target_modules",
+      "behavior_text": "fake backend receives the resolved regex as target_modules and training_metadata.json carries the same string",
+      "contract_text": "target_modules is stored exactly as resolved so vLLM, PEFT and sloth eval reload the same coverage",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "unit test ran green",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T13:32:14Z",
+        "commit": "8238f0a"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 8
+    },
+    {
+      "id": "e5",
+      "obligation_ref": "o3",
+      "test_ref": "live: runs/lfm2-lora/adapter_config.json + vllm/vllm-openai:nightly LoRARequest, 2026-09-15",
+      "behavior_text": "the real adapter's adapter_config target_modules is the lfm2 regex (r=16); vLLM loaded it with --enable-lora and ran its LoRA kernels",
+      "contract_text": "target_modules is stored exactly as resolved so vLLM, PEFT and sloth eval reload the same coverage",
+      "evidence_type": "integration",
+      "strength": "sensitivity",
+      "strength_basis": "real training via sloth train and a real vLLM load on the GB10 (docs/tested.md serve row)",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T13:32:14Z",
+        "commit": "8238f0a"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 9
+    },
+    {
+      "id": "e6",
+      "obligation_ref": "o4",
+      "test_ref": "tests/test_cmd_export.py::test_module_never_imports_container_at_module_level",
+      "behavior_text": "importing the export module never imports sloth.tune.container; safetensors export never calls launch (test_export_does_not_launch_container)",
+      "contract_text": "never imports sloth.tune.container and never touches docker; behaviour and output files are byte-identical to today's export",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "unit tests ran green",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T13:32:14Z",
+        "commit": "8238f0a"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 10
+    },
+    {
+      "id": "e7",
+      "obligation_ref": "o5",
+      "test_ref": "tests/test_cmd_export.py::test_invalid_quant_rejected_before_launch",
+      "behavior_text": "invalid --quant exits 1 with a hint before any launch; dry-run for every format exits 0 with no launch (test_dry_run_every_format)",
+      "contract_text": "validates --format, --quant, --calib and --output on the host and exits 1 with a hint before container.launch; --dry-run returns the plan with exit 0 and no docker call",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "unit tests ran green",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T13:32:14Z",
+        "commit": "8238f0a"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 11
+    },
+    {
+      "id": "e8",
+      "obligation_ref": "o6",
+      "test_ref": "tests/test_tune_container.py::TestExportLaunchKwargs::test_kwargs_shape_and_mount_target",
+      "behavior_text": "export_launch_kwargs sets HOME explicitly, mounts a host-owned home dir at EXPORT_HOME with .unsloth/llama.cpp pre-created, passes UNSLOTH_LLAMA_TAG",
+      "contract_text": "mounts a host-owned llama.cpp cache at the container HOME's .unsloth path, sets HOME explicitly, passes UNSLOTH_LLAMA_TAG, reuses the cache on the second run",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "unit tests ran green",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T13:32:14Z",
+        "commit": "8238f0a"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 12
+    },
+    {
+      "id": "e9",
+      "obligation_ref": "o6",
+      "test_ref": "live: two consecutive sloth export --format gguf runs, 2026-09-15 (t13_gguf / t13_gguf2 logs)",
+      "behavior_text": "first run fetched prebuilt llama.cpp b10909 (1 m 9 s); second run had no 'Installing prebuilt' line and finished in 48 s",
+      "contract_text": "reuses the cache on the second run (no re-download)",
+      "evidence_type": "integration",
+      "strength": "sensitivity",
+      "strength_basis": "measured on the Spark through the shipped host path",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T13:32:14Z",
+        "commit": "8238f0a"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 13
+    },
+    {
+      "id": "e10",
+      "obligation_ref": "o7",
+      "test_ref": "tests/test_cmd_export.py::test_killed_container_leaves_partial_only",
+      "behavior_text": "a launcher exiting 137 leaves <output>.partial and no <output>; success renames partial to output (test_container_writes_partial_and_host_renames); gguf moves quants out of the _gguf dir and drops intermediates",
+      "contract_text": "on exit 0 the requested files exist directly under --output with no _gguf suffix dir and no F16 intermediate; on failure only <output>.partial may remain",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "unit tests ran green",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T13:32:14Z",
+        "commit": "8238f0a"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 14
+    },
+    {
+      "id": "e11",
+      "obligation_ref": "o7",
+      "test_ref": "live: runs/lfm2-exports/gguf2 listing after sloth export --format gguf, 2026-09-15",
+      "behavior_text": "output dir holds LFM2.5-1.2B-Base.Q4_K_M.gguf + tokenizer/config files only: no _gguf dir, no F16 intermediate, no merged safetensors",
+      "contract_text": "final files land exactly under --output",
+      "evidence_type": "integration",
+      "strength": "sensitivity",
+      "strength_basis": "measured on the Spark (after the gguf weight-cleanup fix)",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T13:32:14Z",
+        "commit": "8238f0a"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 15
+    },
+    {
+      "id": "e12",
+      "obligation_ref": "o8",
+      "test_ref": "tests/test_cmd_export.py::test_non_empty_output_without_force_rejected",
+      "behavior_text": "a non-empty --output exits 1 with a hint naming --force; with --force it proceeds (test_non_empty_output_with_force_proceeds)",
+      "contract_text": "a non-empty --output without --force exits 1 with a hint and writes nothing; with --force the directory is replaced atomically",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "unit tests ran green",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T13:32:14Z",
+        "commit": "8238f0a"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 16
+    },
+    {
+      "id": "e13",
+      "obligation_ref": "o9",
+      "test_ref": "tests/test_tune_exporter.py::test_export_json_records_every_contract_field",
+      "behavior_text": "export.json carries format, output, quant, base, adapter, files, calibration, versions, timestamp and is appended to <adapter>/exports.json; summary discovers it (tests/test_tune_summary.py)",
+      "contract_text": "written next to the artifacts and appended to <adapter>/exports.json with the listed fields",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "unit tests ran green",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T13:32:14Z",
+        "commit": "8238f0a"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 17
+    },
+    {
+      "id": "e14",
+      "obligation_ref": "o9",
+      "test_ref": "live: runs/lfm2-exports/*/export.json + runs/lfm2-lora/exports.json, 2026-09-15",
+      "behavior_text": "real records carry unsloth 2026.9.4, transformers 4.57.1, peft 0.18.0, llmcompressor 0.11.0, compressed_tensors 0.16.0, llama_cpp_tag b10909 and calibration {source, count 10}",
+      "contract_text": "versions of unsloth, unsloth_zoo, transformers, llmcompressor, compressed_tensors, llama.cpp tag/prebuilt id",
+      "evidence_type": "integration",
+      "strength": "sensitivity",
+      "strength_basis": "read back from the artifacts the shipped path wrote",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T13:32:14Z",
+        "commit": "8238f0a"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 18
+    },
+    {
+      "id": "e15",
+      "obligation_ref": "o10",
+      "test_ref": "tests/test_cmd_eval.py::test_adapter_and_model_are_mutually_exclusive",
+      "behavior_text": "both or neither of --adapter/--model exit 1 with a hint; --model result carries model_dir, quant_method, quant_format (test_in_container_model_calls_run_eval_model)",
+      "contract_text": "mutually exclusive with --adapter; result JSON has the same score fields plus model_dir, quant_method, quant_format",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "unit tests ran green",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T13:32:14Z",
+        "commit": "8238f0a"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 19
+    },
+    {
+      "id": "e16",
+      "obligation_ref": "o10",
+      "test_ref": "live: sloth eval --model on merged16 / awq / nvfp4, 2026-09-15 (t13_eval_*.out)",
+      "behavior_text": "three real evals scored 0/4 each with quant_method compressed-tensors and formats pack-quantized / nvfp4-pack-quantized (null for bf16), identical to the --adapter score",
+      "contract_text": "result JSON has the same score fields as adapter eval plus model_dir, quant_method, quant_format",
+      "evidence_type": "integration",
+      "strength": "sensitivity",
+      "strength_basis": "measured on the Spark through the shipped host path",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T13:32:14Z",
+        "commit": "8238f0a"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 20
+    },
+    {
+      "id": "e17",
+      "obligation_ref": "o11",
+      "test_ref": "tests/test_tune_exporter.py::test_awq_lfm2_mappings_are_per_layer_and_drop_v_to_out_proj",
+      "behavior_text": "AWQ recipe uses pipeline=basic, per-layer LFM2 mappings from config.layer_types with no v_proj->out_proj pair; the shim applies only when the API is missing and compressed_tensors==0.16.0",
+      "contract_text": "uses pipeline=basic, per-layer mappings built from config.layer_types for lfm2 (no v_proj->out_proj pair); the guarded torch shim",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "unit tests ran green",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T13:32:14Z",
+        "commit": "8238f0a"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 21
+    },
+    {
+      "id": "e18",
+      "obligation_ref": "o11",
+      "test_ref": "live: sloth export --format awq / nvfp4 on LFM2.5-1.2B-Base, 2026-09-15",
+      "behavior_text": "awq produced a 1.08 GB pack-quantized model and nvfp4 a 1.12 GB nvfp4-pack-quantized model, both calibrated on the training dataset; both load and generate in vllm/vllm-openai:nightly on the GB10",
+      "contract_text": "llm-compressor invocation for awq (and nvfp4)",
+      "evidence_type": "integration",
+      "strength": "sensitivity",
+      "strength_basis": "measured on the Spark through the shipped host path after five live-found fixes",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T13:32:14Z",
+        "commit": "8238f0a"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 22
+    },
+    {
+      "id": "e19",
+      "obligation_ref": "o12",
+      "test_ref": "tests/test_cmd_train.py::test_lfm2_rank_above_32_warns_about_hand_lane",
+      "behavior_text": "lora_r 64 on an LFM2 id emits the hand-lane rank-cap note; rank 32 and non-LFM2 models are silent; preset never alters lora_r",
+      "contract_text": "preset:lfm2 does not change lora_r; when lora_r > 32 and the model id is an LFM2 the dry-run plan prints a stderr diagnostic",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "unit tests ran green; also observed live on the host dry-run (two note lines)",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T13:32:14Z",
+        "commit": "8238f0a"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 23
+    },
+    {
+      "id": "e20",
+      "obligation_ref": "o13",
+      "test_ref": "manual: docs/tested.md '2026-09-15' section review against the scratchpad run logs",
+      "behavior_text": "every 2026-09-15 row names its invocation and a measured result; the two unmet items (stdout chatter, unmeasured QLoRA/Qwen3/Jetson/accuracy) are stated as gaps, not claimed",
+      "contract_text": "rows are added only after the real Spark run, with the exact invocation; untested combinations stay listed under Not tested",
+      "evidence_type": "manual",
+      "strength": "fidelity",
+      "strength_basis": "author review of the rows against t6_*/t13_* logs; not machine-checked",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T13:32:14Z",
+        "commit": "8238f0a"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 24
+    }
+  ],
+  "deltas": [
+    {
+      "id": "b1",
+      "kind": "amended",
+      "behavior_text": "the container dep layer pins datasets==4.8.5 (was 4.3.0) so llmcompressor 0.11.0 resolves; the pinned set otherwise unchanged",
+      "caused_by": [
+        "d3"
+      ],
+      "evidence_refs": [
+        "e18"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false
+    },
+    {
+      "id": "b2",
+      "kind": "amended",
+      "behavior_text": "export HOME is a dedicated host-owned bind mount at /opt/sloth-home (default ~/.cache/unsloth-cli/home, SLOTH_EXPORT_HOME override) with .unsloth/llama.cpp pre-created host-side, instead of a llama.cpp-only mount under /workspace/.home (docker created that mount-point as root and HOME was unwritable)",
+      "caused_by": [
+        "c7"
+      ],
+      "evidence_refs": [
+        "e8",
+        "e9"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false
+    },
+    {
+      "id": "b3",
+      "kind": "added",
+      "behavior_text": "training_metadata.json records dataset.path; export resolves it to an absolute host path (cwd, adapter parent, adapter dir) and forwards it as the calibration source; a calibrated format with no source fails closed on the host with a hint",
+      "caused_by": [
+        "d1"
+      ],
+      "evidence_refs": [
+        "e14",
+        "e18"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false
+    },
+    {
+      "id": "b4",
+      "kind": "amended",
+      "behavior_text": "merged-4bit loads the base with load_in_4bit=True and saves with save_method=merged_4bit_forced (Unsloth refuses plain merged_4bit and requires a quantised base)",
+      "caused_by": [
+        "c6"
+      ],
+      "evidence_refs": [
+        "e10"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false
+    },
+    {
+      "id": "b5",
+      "kind": "amended",
+      "behavior_text": "gguf export also deletes the merged *.safetensors Unsloth writes into the output dir (unless --keep-intermediate); export.json and the result record the final output path, never the .partial name",
+      "caused_by": [
+        "c32"
+      ],
+      "evidence_refs": [
+        "e11"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false
+    },
+    {
+      "id": "b6",
+      "kind": "amended",
+      "behavior_text": "awq/nvfp4 calibration wraps rows in a datasets.Dataset, passes max_seq_length=512, imports AWQModifier from modifiers.transform.awq, and runs with Dynamo disabled \u2014 all four required by the live run",
+      "caused_by": [
+        "c24"
+      ],
+      "evidence_refs": [
+        "e18"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false
+    },
+    {
+      "id": "b7",
+      "kind": "added",
+      "behavior_text": "the /finetune skill run mode passes --output <adapter>-<format> for container formats (override --export-output)",
+      "caused_by": [
+        "c14"
+      ],
+      "evidence_refs": [
+        "e20"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false
+    },
+    {
+      "id": "b8",
+      "kind": "amended",
+      "behavior_text": "sloth train --json stdout is NOT pure JSON on a real run: the container's banner and trl progress dicts stream through around the result (pre-existing; plan risk r10)",
+      "caused_by": [
+        "c27"
+      ],
+      "evidence_refs": [
+        "e2"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false
+    }
+  ],
   "supersessions": []
 }
