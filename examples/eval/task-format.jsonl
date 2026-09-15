@@ -1,0 +1,16 @@
+{"task": "rewrite", "input": "Rewrite in the past tense: 'The CLI validates the dataset.'", "expected_output": "The CLI validated the dataset."}
+{"task": "rewrite", "input": "Rewrite as a question: 'The adapter is exported.'", "expected_output": "Is the adapter exported?"}
+{"task": "rewrite", "input": "Rewrite in lowercase: 'RESULTS GO TO STDOUT'", "expected_output": "results go to stdout"}
+{"task": "extract", "input": "Extract the verb from: 'sloth train --config run.toml'", "expected_output": "train"}
+{"task": "extract", "input": "Extract the flag name from: '--dry-run plans without a GPU'", "expected_output": "--dry-run"}
+{"task": "extract", "input": "Extract the exit code from: 'exit code 2 is an environment error'", "expected_output": "2"}
+{"task": "extract", "input": "Extract the file extension from: 'adapter_model.safetensors'", "expected_output": "safetensors"}
+{"task": "classify", "input": "Classify the schema of {\"messages\": [{\"role\": \"user\", \"content\": \"hi\"}]}", "expected_output": "chat"}
+{"task": "classify", "input": "Classify the schema of {\"task\": \"answer\", \"input\": \"x\", \"expected_output\": \"y\"}", "expected_output": "task"}
+{"task": "classify", "input": "Classify this exit code as success or failure: 0", "expected_output": "success"}
+{"task": "classify", "input": "Classify this exit code as success or failure: 1", "expected_output": "failure"}
+{"task": "classify", "input": "Classify --format gguf as host-only or container lane.", "expected_output": "container"}
+{"task": "classify", "input": "Classify --format safetensors as host-only or container lane.", "expected_output": "host-only"}
+{"task": "rewrite", "input": "Rewrite as an imperative command: 'The user runs sloth doctor.'", "expected_output": "Run sloth doctor."}
+{"task": "extract", "input": "Extract the base model name from: 'model = \"unsloth/Qwen3-1.7B\"'", "expected_output": "unsloth/Qwen3-1.7B"}
+{"task": "extract", "input": "Extract the method name from: 'method = \"qlora\"'", "expected_output": "qlora"}

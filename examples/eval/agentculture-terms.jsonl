@@ -1,0 +1,16 @@
+{"task": "answer", "input": "What is the PyPI dist name of this project?", "expected_output": "unsloth-cli"}
+{"task": "answer", "input": "What is the package directory and import name of this project?", "expected_output": "sloth"}
+{"task": "answer", "input": "What is the installed console-script name?", "expected_output": "sloth"}
+{"task": "answer", "input": "What command actually runs the whoami verb?", "expected_output": "uv run sloth whoami"}
+{"task": "answer", "input": "Does 'uv run unsloth-cli whoami' work?", "expected_output": "No, it fails because there is no such console script."}
+{"task": "define", "input": "What does the agentfront sibling own?", "expected_output": "The agent-first runtime and the rubric that cli doctor enforces."}
+{"task": "define", "input": "What does the steward sibling own?", "expected_output": "Agent alignment, the sibling-pattern baseline and steward doctor."}
+{"task": "define", "input": "What does the guildmaster sibling own?", "expected_output": "The skills supplier and manager."}
+{"task": "define", "input": "What does the devague sibling own?", "expected_output": "The eight-leg scope to think to challenge to spec-to-plan to assign-to-workforce to deviate to validate-delivery to summarize-delivery chain."}
+{"task": "define", "input": "What does the devex sibling own?", "expected_output": "The PR-lifecycle CLI, devex pr."}
+{"task": "define", "input": "What does the agtag sibling own?", "expected_output": "Issue I/O, agtag issue."}
+{"task": "define", "input": "What does the lobes sibling own?", "expected_output": "Runs, assesses, and switches the local OpenAI-compatible vLLM model the mesh consumes."}
+{"task": "define", "input": "What does the colleague sibling own?", "expected_output": "A swappable coder-agent harness: one runtime, many model backends."}
+{"task": "define", "input": "What does the culture / daria sibling own?", "expected_output": "The IRC agent mesh and the awareness agent."}
+{"task": "answer", "input": "How does this repo reach a sibling repo for a task outside itself?", "expected_output": "Use the communicate skill, issues via agtag, mesh messages."}
+{"task": "answer", "input": "What skill does colleague supply that steward's report recommends?", "expected_output": "The ask-colleague skill."}
