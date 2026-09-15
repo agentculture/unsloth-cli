@@ -213,3 +213,11 @@ so dataset/config/scope validation happens before any GPU spend:
 | `scope.py` | adapter-OK vs out-of-scope guard |
 | `container.py` | NGC `docker run` orchestration (pure stdlib; no torch) |
 | `_trainer.py` | the **only** module that imports torch/unsloth/trl — lazily, inside its run functions |
+
+### Allowed paths
+
+Every path `sloth export` receives (`--adapter`, `--output`, `--calib`, a local
+`--base`, the dataset recorded in `training_metadata.json`) is canonicalised and
+must live under the working directory, your home directory, the Hugging Face
+cache or the system temp dir. Anything else exits 1 with a hint. Extend the
+allow-list with `SLOTH_ALLOWED_ROOTS=<dir>[:<dir>]`.

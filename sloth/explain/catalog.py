@@ -370,7 +370,11 @@ adapter is normalised in place.
   of the adapter/output/calibration paths, forwarding the same args plus a
   hidden `--in-container` recursion guard.
 
-## Exit codes
+## Paths given to --adapter / --output / --calib / a local --base are canonicalised and
+must sit under the working directory, your home, the HF cache or the temp dir;
+extend the allow-list with `SLOTH_ALLOWED_ROOTS=<dir>[:<dir>]`.
+
+Exit codes
 
 - `0` success
 - `1` user-input error (missing/incomplete adapter dir, unsupported `--format`,

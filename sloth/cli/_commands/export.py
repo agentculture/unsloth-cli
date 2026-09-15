@@ -56,6 +56,7 @@ import json
 import os
 import shlex
 import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -221,14 +222,58 @@ def _training_dataset(adapter: Path) -> str | None:
         return None
     candidate = Path(raw).expanduser()
     if candidate.is_absolute():
-        # Passed through as recorded; the in-container calibration validation
-        # reports a missing file with a hint before any model load.
-        return str(candidate)
+        # Passed through as recorded (after the allow-list check); the in-container
+        # calibration validation reports a missing file with a hint before any load.
+        return str(_sanitize_path(str(candidate), "training dataset"))
     for root in (Path.cwd(), adapter.parent, adapter):
-        resolved = (root / candidate).resolve()
+        resolved = _sanitize_path(str(root / candidate), "training dataset")
         if resolved.is_file():
             return str(resolved)
     return None
+
+
+# ---------------------------------------------------------------------------
+# User-path sanitisation (S2083 / S6549)
+# ---------------------------------------------------------------------------
+
+#: ``os.pathsep``-separated extra roots a user may point --adapter/--output/--calib/
+#: --base at, on top of the working directory, the home directory, the HF cache and
+#: the system temp dir.
+ALLOWED_ROOTS_ENV: str = "SLOTH_ALLOWED_ROOTS"
+
+
+def _allowed_roots() -> list[str]:
+    """Canonical directories user-supplied paths must live under."""
+    roots = [os.getcwd(), str(Path.home()), str(_hf_hub_root()), tempfile.gettempdir()]
+    roots += [r for r in os.environ.get(ALLOWED_ROOTS_ENV, "").split(os.pathsep) if r]
+    return [os.path.realpath(os.path.expanduser(r)) for r in roots]
+
+
+def _sanitize_path(raw: str, what: str) -> Path:
+    """Canonicalise *raw* and require it to sit under an allowed root.
+
+    Every filesystem path the user hands this command flows into reads, directory
+    probes, mounts and renames, so it is validated once here: ``realpath`` resolves
+    ``..`` and symlinks, and the result must start with one of :func:`_allowed_roots`.
+    Anything else exits 1 with a hint naming :data:`ALLOWED_ROOTS_ENV`.
+    """
+    real = os.path.realpath(os.path.expanduser(raw))
+    for root in _allowed_roots():
+        if real == root or real.startswith(root.rstrip(os.sep) + os.sep):
+            return Path(real)
+    raise CliError(
+        code=EXIT_USER_ERROR,
+        message=f"{what} path is outside the allowed roots: {raw}",
+        remediation=(
+            "Use a path under the working directory, your home, the HF cache or the "
+            f"temp dir, or extend the allow-list with {ALLOWED_ROOTS_ENV}=<dir>[{os.pathsep}<dir>]."
+        ),
+    )
+
+
+def _looks_like_path(value: str) -> bool:
+    """A --base that names a local directory rather than a Hub model id."""
+    return value.startswith((".", "~", os.sep)) or os.sep in value and Path(value).is_dir()
 
 
 # ---------------------------------------------------------------------------
@@ -245,8 +290,8 @@ def _hf_hub_root() -> Path:
 
 def _cached_config(base: str) -> dict[str, Any] | None:
     """Return the base model's ``config.json`` when it is a local dir or HF-cached."""
-    local = Path(base)
-    if local.is_dir():
+    if _looks_like_path(base):
+        local = _sanitize_path(base, "--base")
         cfg = _read_json(local / "config.json")
         if cfg is not None:
             return cfg
@@ -418,7 +463,7 @@ def _validate_calib(raw_calib: str | None, samples: int | None, fmt: str) -> Pat
         )
     if raw_calib is None:
         return None
-    calib = Path(raw_calib)
+    calib = _sanitize_path(raw_calib, "--calib")
     if not calib.is_file():
         raise CliError(
             code=EXIT_USER_ERROR,
@@ -455,7 +500,7 @@ def _resolve_base(explicit: str | None, adapter: Path, fmt: str) -> str | None:
 def _resolve_output(raw_output: str | None, adapter: Path, fmt: str) -> Path:
     """Resolve ``--output``; container formats must name one explicitly."""
     if raw_output:
-        return Path(raw_output)
+        return _sanitize_path(raw_output, "--output")
     if fmt in CONTAINER_FORMATS:
         raise CliError(
             code=EXIT_USER_ERROR,
@@ -681,7 +726,7 @@ class _ExportRequest:
 
 def _resolve_request(args: argparse.Namespace) -> _ExportRequest:
     """Validate every input cheaply (exit 1 before anything is launched or written)."""
-    adapter = Path(args.adapter)
+    adapter = _sanitize_path(str(args.adapter), "--adapter")
     _validate_adapter(adapter)
     fmt = _validate_format(args.format)
     quant = _validate_quant(getattr(args, "quant", None), fmt)

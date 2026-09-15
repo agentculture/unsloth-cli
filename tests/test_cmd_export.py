@@ -1162,3 +1162,47 @@ def test_register_subparser_new_flags(tmp_path: Path) -> None:
     assert args.dry_run is True
     assert args.keep_intermediate is True
     assert args.in_container is True
+
+
+# ---------------------------------------------------------------------------
+# User-path sanitisation (allow-listed roots)
+# ---------------------------------------------------------------------------
+
+
+def test_adapter_outside_allowed_roots_is_rejected(tmp_path: Path, monkeypatch) -> None:
+    """A path outside cwd/home/HF cache/tmp exits 1 with a hint naming the env override."""
+    import sloth.cli._commands.export as export_mod
+
+    monkeypatch.delenv(export_mod.ALLOWED_ROOTS_ENV, raising=False)
+    monkeypatch.setattr(export_mod.tempfile, "gettempdir", lambda: str(tmp_path / "elsewhere"))
+    monkeypatch.setattr(export_mod.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    monkeypatch.chdir(tmp_path / "home")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    with pytest.raises(CliError) as exc_info:
+        export_mod._sanitize_path(str(outside), "--adapter")
+    assert exc_info.value.code == 1
+    assert export_mod.ALLOWED_ROOTS_ENV in (exc_info.value.remediation or "")
+
+
+def test_allowed_roots_env_extends_the_allow_list(tmp_path: Path, monkeypatch) -> None:
+    import sloth.cli._commands.export as export_mod
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setattr(export_mod.tempfile, "gettempdir", lambda: str(tmp_path / "elsewhere"))
+    monkeypatch.setattr(export_mod.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    monkeypatch.chdir(tmp_path / "home")
+    monkeypatch.setenv(export_mod.ALLOWED_ROOTS_ENV, str(outside))
+    assert export_mod._sanitize_path(str(outside / "x"), "--output") == (outside / "x").resolve()
+
+
+def test_sanitize_path_resolves_dotdot_and_symlinks(tmp_path: Path, monkeypatch) -> None:
+    import sloth.cli._commands.export as export_mod
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "a").mkdir()
+    real = export_mod._sanitize_path("a/../a", "--output")
+    assert real == (tmp_path / "a").resolve()
