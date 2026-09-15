@@ -28,6 +28,8 @@ from typing import Any
 import pytest
 
 import sloth.cli._commands.eval as eval_mod
+import sloth.tune._exporter as exporter_mod
+import sloth.tune.container as container_mod
 from sloth.cli._commands.eval import cmd_eval, register
 from sloth.cli._errors import CliError
 from sloth.cli._output import emit_error
@@ -615,3 +617,344 @@ def test_register_in_container_not_in_help() -> None:
     register(sub)
     help_text = sub.choices["eval"].format_help()
     assert "--in-container" not in help_text
+
+
+# ---------------------------------------------------------------------------
+# t11 — ``--model DIR`` (merged / quantized outputs)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def tmp_model(tmp_path: Path) -> Path:
+    """A merged-model directory carrying an AWQ compressed-tensors config.json."""
+    d = tmp_path / "model"
+    d.mkdir()
+    (d / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "lfm2",
+                "quantization_config": {
+                    "quant_method": "compressed-tensors",
+                    "format": "pack-quantized",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return d
+
+
+def _fake_run_eval_model(model_dir: str, suite_path: str) -> dict[str, Any]:
+    """A run_eval_model summary (adapter score fields + the model-specific ones)."""
+    summary = _fake_run_eval_perfect(model_dir, suite_path)
+    summary["model_dir"] = model_dir
+    summary["quant_method"] = "compressed-tensors"
+    summary["quant_format"] = "pack-quantized"
+    return summary
+
+
+def test_adapter_and_model_are_mutually_exclusive(
+    tmp_adapter: Path, tmp_model: Path, tmp_suite: Path
+) -> None:
+    """Passing both --adapter and --model is a user error (exit 1 + hint)."""
+    args = _make_args(adapter=str(tmp_adapter), model=str(tmp_model), suite=str(tmp_suite))
+    with pytest.raises(CliError) as exc_info:
+        cmd_eval(args)
+    err = exc_info.value
+    assert err.code == 1
+    assert "--adapter" in err.message and "--model" in err.message
+    assert err.remediation
+
+
+def test_neither_adapter_nor_model_is_an_error(tmp_suite: Path) -> None:
+    """Passing neither --adapter nor --model is a user error (exit 1 + hint)."""
+    args = _make_args(adapter=None, model=None, suite=str(tmp_suite))
+    with pytest.raises(CliError) as exc_info:
+        cmd_eval(args)
+    err = exc_info.value
+    assert err.code == 1
+    assert err.remediation
+    buf = io.StringIO()
+    emit_error(err, json_mode=False, stream=buf)
+    text = buf.getvalue()
+    assert text.startswith("error:")
+    assert "hint:" in text
+
+
+def test_missing_model_dir_raises_cli_error(tmp_suite: Path, tmp_path: Path) -> None:
+    """A non-existent --model directory raises CliError(code=1)."""
+    args = _make_args(adapter=None, model=str(tmp_path / "nope"), suite=str(tmp_suite))
+    with pytest.raises(CliError) as exc_info:
+        cmd_eval(args)
+    assert exc_info.value.code == 1
+    assert "model" in exc_info.value.message.lower()
+
+
+def test_host_routes_model_to_container(
+    tmp_model: Path, tmp_suite: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--model routes to the container like --adapter, with the llama.cpp cache mounted."""
+    captured: dict[str, Any] = {}
+
+    def _capture_launch(sloth_args: list[str], **kwargs: Any) -> int:
+        captured["sloth_args"] = list(sloth_args)
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
+
+    args = _make_args(adapter=None, model=str(tmp_model), suite=str(tmp_suite))
+    rc = cmd_eval(args)
+    assert rc in (None, 0)
+
+    forwarded = captured["sloth_args"]
+    assert forwarded[0] == "eval"
+    assert "--model" in forwarded
+    assert "--adapter" not in forwarded
+    assert "--in-container" in forwarded
+    assert str(tmp_model.resolve()) in forwarded
+
+    mounts = captured.get("extra_mounts") or []
+    targets = {target for _, target in mounts}
+    assert str(tmp_model.resolve().parent) in targets
+    assert str(tmp_suite.resolve().parent) in targets
+    # The llama.cpp cache mount (export_launch_kwargs) must be present for GGUF scoring.
+    llama_target = container_mod.EXPORT_HOME + "/.unsloth/llama.cpp"
+    assert llama_target in targets
+    env = dict(captured.get("env") or [])
+    assert env.get("HOME") == container_mod.EXPORT_HOME
+
+
+def test_in_container_model_calls_run_eval_model(
+    tmp_model: Path,
+    tmp_suite: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--model --in-container delegates to run_eval_model and emits the extra fields."""
+    calls: list[tuple[str, str]] = []
+
+    def _capture(model_dir: str, suite_path: str) -> dict[str, Any]:
+        calls.append((model_dir, suite_path))
+        return _fake_run_eval_model(model_dir, suite_path)
+
+    monkeypatch.setattr(eval_mod, "run_eval_model", _capture)
+    monkeypatch.setattr(
+        eval_mod.container,
+        "launch",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("recursion guard broken")),
+    )
+
+    args = _make_args(
+        adapter=None, model=str(tmp_model), suite=str(tmp_suite), json=True, in_container=True
+    )
+    rc = cmd_eval(args)
+    assert rc in (None, 0)
+    assert calls == [(str(tmp_model), str(tmp_suite))]
+
+    data = json.loads(capsys.readouterr().out)
+    assert data["total"] == 2
+    assert data["exact_match"] == 2
+    assert data["exact_match_pct"] == 100.0
+    assert data["model_dir"] == str(tmp_model)
+    assert data["quant_method"] == "compressed-tensors"
+    assert data["quant_format"] == "pack-quantized"
+
+
+def test_in_container_model_text_output(
+    tmp_model: Path,
+    tmp_suite: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Text mode names the model dir and its quantisation."""
+    monkeypatch.setattr(eval_mod, "run_eval_model", _fake_run_eval_model)
+    args = _make_args(adapter=None, model=str(tmp_model), suite=str(tmp_suite), in_container=True)
+    cmd_eval(args)
+    out = capsys.readouterr().out
+    assert str(tmp_model) in out
+    assert "compressed-tensors" in out
+    assert "pack-quantized" in out
+    assert "score" in out
+
+
+def test_register_model_flag() -> None:
+    """``--model`` parses and defaults to None; --adapter is no longer required."""
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command")
+    register(sub)
+    args = parser.parse_args(["eval", "--model", "/some/model", "--suite", "/b.jsonl"])
+    assert args.model == "/some/model"
+    assert args.adapter is None
+    args2 = parser.parse_args(["eval", "--adapter", "/a", "--suite", "/b.jsonl"])
+    assert args2.model is None
+    args3 = parser.parse_args(
+        ["eval", "--model", "/m", "--suite", "/b.jsonl", "--in-container", "--json"]
+    )
+    assert args3.in_container is True and args3.json is True
+
+
+# ---------------------------------------------------------------------------
+# t11 — run_eval_model (the in-container seam, fake backend only)
+# ---------------------------------------------------------------------------
+
+
+class _FakeNoGrad:
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *exc: Any) -> bool:
+        return False
+
+
+class _FakeTorch:
+    bfloat16 = "bfloat16"
+
+    @staticmethod
+    def no_grad() -> _FakeNoGrad:
+        return _FakeNoGrad()
+
+
+class _FakeTokenizer:
+    """Echoes the prompt through generate() so decode() can map it to an answer."""
+
+    def __init__(self, answers: dict[str, str]) -> None:
+        self.answers = answers
+
+    def __call__(self, prompt: str, return_tensors: str = "pt") -> Any:
+        class _Inputs(dict):
+            def to(self, _device: Any) -> dict:
+                return dict(self)
+
+        return _Inputs(input_ids=prompt)
+
+    def decode(self, token: str, skip_special_tokens: bool = True) -> str:
+        return self.answers.get(token, "UNKNOWN")
+
+
+class _FakeParam:
+    device = "cpu"
+
+
+class _FakeModel:
+    def __init__(self) -> None:
+        self.eval_called = False
+
+    def parameters(self) -> Any:
+        return iter([_FakeParam()])
+
+    def eval(self) -> None:
+        self.eval_called = True
+
+    def generate(self, input_ids: str, max_new_tokens: int = 0) -> list[str]:
+        return [input_ids]
+
+
+def _fake_backend(answers: dict[str, str]) -> Any:
+    tokenizer = _FakeTokenizer(answers)
+    model = _FakeModel()
+
+    class _Loader:
+        @staticmethod
+        def from_pretrained(*args: Any, **kwargs: Any) -> Any:
+            return model
+
+    class _TokLoader:
+        @staticmethod
+        def from_pretrained(*args: Any, **kwargs: Any) -> Any:
+            return tokenizer
+
+    return exporter_mod._EvalBackend(
+        torch=_FakeTorch(),
+        auto_model_for_causal_lm=_Loader(),
+        auto_tokenizer=_TokLoader(),
+    )
+
+
+def test_run_eval_model_transformers_path(
+    tmp_model: Path, tmp_suite: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fake transformers backend scores the suite and reports the quant fields."""
+    answers = {
+        "Task: reverse\nInput: abc\nOutput:": "cba",
+        "Task: upper\nInput: hello\nOutput:": "WRONG",
+    }
+    monkeypatch.setattr(exporter_mod, "_load_eval_backend", lambda: _fake_backend(answers))
+
+    summary = exporter_mod.run_eval_model(str(tmp_model), str(tmp_suite))
+
+    assert summary["total"] == 2
+    assert summary["exact_match"] == 1
+    assert summary["exact_match_pct"] == 50.0
+    assert summary["model_dir"] == str(tmp_model)
+    assert summary["quant_method"] == "compressed-tensors"
+    assert summary["quant_format"] == "pack-quantized"
+    assert summary["results"][0]["exact_match"] is True
+    assert summary["results"][1]["prediction"] == "WRONG"
+
+
+def test_run_eval_model_bf16_has_null_quant(
+    tmp_path: Path, tmp_suite: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plain bf16 merged dir (no quantization_config) reports null quant fields."""
+    model_dir = tmp_path / "merged"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps({"model_type": "lfm2"}), encoding="utf-8")
+    monkeypatch.setattr(exporter_mod, "_load_eval_backend", lambda: _fake_backend({}))
+
+    summary = exporter_mod.run_eval_model(str(model_dir), str(tmp_suite))
+    assert summary["quant_method"] is None
+    assert summary["quant_format"] is None
+    assert summary["exact_match"] == 0
+
+
+def test_run_eval_model_gguf_path(
+    tmp_path: Path, tmp_suite: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dir holding a .gguf is scored via llama-completion, never via transformers."""
+    model_dir = tmp_path / "gguf-out"
+    model_dir.mkdir()
+    (model_dir / "Model.Q4_K_M.gguf").write_bytes(b"\x00")
+
+    seen: list[tuple[str, str, int]] = []
+
+    def _fake_completion(gguf: Path, prompt: str, max_tokens: int) -> str:
+        seen.append((str(gguf), prompt, max_tokens))
+        return "cba" if "reverse" in prompt else "HELLO"
+
+    monkeypatch.setattr(exporter_mod, "_run_llama_completion", _fake_completion)
+    monkeypatch.setattr(
+        exporter_mod,
+        "_load_eval_backend",
+        lambda: (_ for _ in ()).throw(AssertionError("transformers used for a GGUF dir")),
+    )
+
+    summary = exporter_mod.run_eval_model(str(model_dir), str(tmp_suite))
+    assert summary["total"] == 2
+    assert summary["exact_match"] == 2
+    assert summary["quant_method"] is None
+    assert summary["quant_format"] is None
+    assert len(seen) == 2
+    assert seen[0][0].endswith("Model.Q4_K_M.gguf")
+
+
+def test_run_eval_model_missing_dir(tmp_path: Path, tmp_suite: Path) -> None:
+    """A non-existent model dir raises CliError(code=1)."""
+    with pytest.raises(CliError) as exc_info:
+        exporter_mod.run_eval_model(str(tmp_path / "gone"), str(tmp_suite))
+    assert exc_info.value.code == 1
+
+
+def test_run_eval_model_without_ml_stack(
+    tmp_model: Path, tmp_suite: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unavailable ML stack surfaces as CliError(code=2) with the NGC hint."""
+
+    def _boom() -> Any:
+        raise ImportError("No module named 'torch'")
+
+    monkeypatch.setattr(exporter_mod, "_load_eval_backend", _boom)
+    with pytest.raises(CliError) as exc_info:
+        exporter_mod.run_eval_model(str(tmp_model), str(tmp_suite))
+    assert exc_info.value.code == 2
+    assert "NGC" in exc_info.value.remediation or "container" in exc_info.value.remediation
