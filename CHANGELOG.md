@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] - 2026-09-15
+
+### Added
+
+- Per-format eval scores for LFM2.5-1.2B (adapter, merged-16bit, gguf Q4_K_M, awq,
+  nvfp4) on the 46-item `examples/eval/` suite, batched-vs-serial timing, and the
+  first Jetson-side rows: `awq` and `nvfp4` exports load and generate with vLLM
+  0.29 on a Thor (JetPack R38.2.2). Deployment table updated; closes #22.
+
+## [0.8.0] - 2026-09-15
+
+### Added
+
+- `sloth eval --suite` accepts a directory of task-schema JSONL files (scored per
+  file and in aggregate), plus `--quant <name>` to pick one GGUF in a multi-quant
+  export dir and `--batch-size N` (default 8) for batched generation; results now
+  carry a stdlib token-level `f1` next to exact-match and are written to
+  `eval.json` inside the evaluated directory. `sloth validate --suite <file|dir>`
+  validates suites before any GPU spend (#22).
+- `sloth summarize` / `sloth compare` render `eval.json` scores per run and per
+  export (#22).
+- Starter eval suite under `examples/eval/` (46 task-schema items in three domain
+  files) (#22).
+- `/finetune` skill resolves `sloth` as `SLOTH_BIN` → own checkout via
+  `uv run --project` → PATH, so a checkout never runs another worktree's install (#22).
+
+### Changed
+
+- `sloth train` / `eval` / `export --json` are **stdout-pure on real runs**:
+  `container.launch()` now tees the container's stdout to the host's stderr line by
+  line and returns only the in-container JSON result; a container that prints no
+  result fails closed with exit 2 (#22, h14 of the LFM2.5 spec).
+- The in-container dep layer pins `unsloth==2026.9.4 unsloth_zoo==2026.9.3
+  bitsandbytes==0.50.2` (measured live); bump procedure in `docs/dgx-spark.md` (#22).
+
+### Fixed
+
+- Every real `sloth export` had exited 1 since #20: the `--adapter`/`--output`
+  path sanitizer also ran inside the container, where cwd is `/workspace`. The host
+  now forwards `SLOTH_ALLOWED_ROOTS` (the identity-mounted parents) into the
+  container env (#22, deviation d2).
+- Continuation-only scoring in `sloth eval` is asserted by the fake tokenizer
+  (it now decodes its real token slice) and live-verified on the Spark (#22).
+
 ## [0.7.2] - 2026-09-15
 
 ### Added

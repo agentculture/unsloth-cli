@@ -3,17 +3,25 @@
 Joins ``training_metadata.json`` (:func:`sloth.tune.metadata.read_metadata`)
 with the loss/step history from the run's newest ``checkpoint-N/``
 ``trainer_state.json`` (written by the HF ``Trainer``/``SFTTrainer`` used in
-:mod:`sloth.tune._trainer`) into one JSON-able summary dict.
+:mod:`sloth.tune._trainer`), any discovered exports, and the aggregate
+``eval.json`` scores (written by ``sloth eval`` via
+:func:`sloth.tune.metrics.write_eval_json`) into one JSON-able summary dict.
 
-Both halves are OPTIONAL — a run that never checkpointed, or whose metadata
-file is missing/unreadable, still gets a best-effort summary rather than an
-error; :func:`build_summary` records what was skipped (and why) in its
-``notes`` list.
+All of these are OPTIONAL — a run that never checkpointed, was never
+evaluated, or whose metadata file is missing/unreadable, still gets a
+best-effort summary rather than an error; :func:`build_summary` records what
+was skipped (and why) in its ``notes`` list (a missing ``eval.json`` is the
+one exception — it degrades silently, with no note, exactly like a
+still-empty ``exports`` list).
+
+This module is read-only: it never computes or recomputes a metric, it only
+reads the numbers ``sloth eval`` already wrote to disk.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +97,47 @@ def _training_progress(state: dict[str, Any]) -> dict[str, Any]:
         "final_loss": final_loss,
         "best_metric": state.get("best_metric"),
         "best_model_checkpoint": state.get("best_model_checkpoint"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Eval discovery
+# ---------------------------------------------------------------------------
+
+_EVAL_JSON_NAME = "eval.json"
+
+
+def read_eval(output_dir: str | Path) -> dict[str, Any] | None:
+    """Read+parse ``eval.json`` directly inside *output_dir* (the file
+    :func:`sloth.tune.metrics.write_eval_json` writes for ``sloth eval``).
+
+    Returns ``None`` on absence, a decode failure, or a parse failure —
+    tolerated, never raised, exactly like :func:`read_trainer_state`.
+    Read-only: this module never computes or recomputes a metric, it only
+    reads the numbers ``sloth eval`` already wrote.
+    """
+    eval_path = Path(output_dir) / _EVAL_JSON_NAME
+    try:
+        raw = eval_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _eval_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    """Reduce a parsed ``eval.json`` payload to the aggregate fields a
+    summary cares about: ``exact_match_pct``, ``f1``, and the suite file
+    count (``len(payload["files"])``)."""
+    files = payload.get("files")
+    file_count = len(files) if isinstance(files, list) else 0
+    return {
+        "exact_match_pct": payload.get("exact_match_pct"),
+        "f1": payload.get("f1"),
+        "file_count": file_count,
     }
 
 
@@ -231,7 +280,17 @@ def build_summary(output_dir: str | Path) -> dict[str, Any]:
                 "best_metric": float | None,
                 "best_model_checkpoint": str | None,
             } | None,
-            "exports": list[dict],    # discover_exports() — [] when none found
+            "exports": list[dict],    # discover_exports() — [] when none found;
+                                       # each entry additionally carries an
+                                       # "eval" key (see below) when that
+                                       # export's own output dir has an
+                                       # eval.json
+            "eval": {
+                "exact_match_pct": float | None,
+                "f1": float | None,
+                "file_count": int,
+            } | None,                 # read_eval(output_dir) — None, silently,
+                                       # when no eval.json is present
             "notes": list[str],       # what was skipped/degraded, and why
         }
 
@@ -239,7 +298,11 @@ def build_summary(output_dir: str | Path) -> dict[str, Any]:
     ``trainer_state.json`` degrades that half to ``None`` plus a note in
     ``notes`` — the other half (and the overall summary) is still returned.
     Likewise a missing/corrupt export index or record degrades ``exports`` to
-    ``[]`` (or a partial list) plus a note, never an exception.
+    ``[]`` (or a partial list) plus a note, never an exception. A missing
+    ``eval.json`` (at *output_dir* or at any export's own output dir) is not
+    an error and adds no note — it degrades to ``None`` (or an absent
+    ``"eval"`` key on an export entry) silently, exactly like an export-free
+    run's empty ``exports`` list.
     """
     output_path = Path(output_dir)
     notes: list[str] = []
@@ -266,10 +329,22 @@ def build_summary(output_dir: str | Path) -> dict[str, Any]:
     exports, export_notes = discover_exports(output_path)
     notes.extend(export_notes)
 
+    eval_payload = read_eval(output_path)
+    eval_summary = _eval_summary(eval_payload) if eval_payload is not None else None
+
+    for export in exports:
+        export_output = export.get("output")
+        if not export_output or not isinstance(export_output, (str, os.PathLike)):
+            continue
+        export_eval_payload = read_eval(export_output)
+        if export_eval_payload is not None:
+            export["eval"] = _eval_summary(export_eval_payload)
+
     return {
         "output_dir": str(output_path),
         "metadata": metadata,
         "training": training,
         "exports": exports,
+        "eval": eval_summary,
         "notes": notes,
     }

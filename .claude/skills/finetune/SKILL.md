@@ -26,7 +26,9 @@ then export. The loop stops at the first non-zero exit and surfaces the CLI's
 `error:`/`hint:` contract verbatim.
 
 The entry point is `scripts/finetune.sh`. Run it from anywhere; CLI resolution
-is portable (installed `sloth` on `PATH`, else `uv run sloth` from a checkout).
+is portable and resolves in order: `SLOTH_BIN` (if set, used verbatim as the
+CLI command) → `uv run --project <dir> sloth` from a walked-up unsloth-cli
+checkout → installed `sloth` on `PATH`.
 
 ## Modes
 
@@ -35,7 +37,7 @@ is portable (installed `sloth` on `PATH`, else `uv run sloth` from a checkout).
 ```bash
 bash .claude/skills/finetune/scripts/finetune.sh run \
     --config <run.toml> \
-    --suite <suite.jsonl> \
+    --suite <suite.jsonl | dir> \
     [--dry-run] \
     [--json] \
     [--export-format <fmt>] \
@@ -95,7 +97,7 @@ bash .claude/skills/finetune/scripts/finetune.sh help
 | Flag | Required | Description |
 |------|----------|-------------|
 | `--config <run.toml>` | yes | Path to the TOML describing model, dataset, output, and method. |
-| `--suite <suite.jsonl>` | yes | Path to a task-schema JSONL eval suite (`{"task","input","expected_output"}`). |
+| `--suite <suite.jsonl \| dir>` | yes | Path to a task-schema JSONL eval suite (`{"task","input","expected_output"}`). |
 | `--dry-run` | no | Run step 1 only (validate + plan, GPU-free). |
 | `--json` | no | Forward `--json` to every `sloth` call for machine-readable output. |
 | `--export-format <fmt>` | no | Format for step 4: `safetensors` (default), `merged-16bit`, `merged-4bit`, `gguf`, `awq`, `nvfp4`. Forwarded to `sloth export --format <fmt>`. |
@@ -175,8 +177,9 @@ The script propagates the exit code of the first failing `sloth` call verbatim:
 
 ## Requirements
 
-- **Dry-run**: stdlib Python 3.11+ (no torch, no GPU). `sloth` must be installed
-  or the repo must be on PATH with `uv` available.
+- **Dry-run**: stdlib Python 3.11+ (no torch, no GPU). CLI resolution order:
+  `SLOTH_BIN` (if set) → `uv run --project <dir> sloth` from a walked-up
+  unsloth-cli checkout → installed `sloth` on `PATH`.
 - **Real run**: the tuning stack (ships with `unsloth-cli` — `uv tool install
   unsloth-cli`) and a CUDA-capable GPU. See `sloth explain train` for the annotated TOML
   template.

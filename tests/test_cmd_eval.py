@@ -46,7 +46,25 @@ def _make_args(**kwargs: Any) -> argparse.Namespace:
     return argparse.Namespace(**defaults)
 
 
-def _fake_run_eval_perfect(adapter_path: str, suite_path: str) -> dict[str, Any]:
+#: A minimal, well-formed eval summary standing in for the dict
+#: ``sloth.tune.container.launch`` now returns (t1/t2: launch never returns an
+#: int). Host-path launch fakes below return this so the host's own text-mode
+#: rendering (``_render_text``, which indexes ``total``/``exact_match``/
+#: ``exact_match_pct``) has real keys to render, exactly mirroring what the
+#: in-container run would have printed.
+_FAKE_EVAL_SUMMARY: dict[str, Any] = {
+    "total": 1,
+    "exact_match": 1,
+    "exact_match_pct": 100.0,
+    "results": [],
+}
+
+
+def _fake_run_eval_perfect(
+    adapter_path: str, suite_path: str | None = None, *, suite_paths=None, quant=None, batch_size=8
+) -> dict[str, Any]:
+    if suite_path is None:
+        suite_path = str(suite_paths[0])
     """Return a perfect-score eval summary without touching torch/peft."""
     return {
         "total": 2,
@@ -78,7 +96,7 @@ def _fake_run_eval_perfect(adapter_path: str, suite_path: str) -> dict[str, Any]
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture()
+@pytest.fixture
 def tmp_adapter(tmp_path: Path) -> Path:
     """A minimal adapter directory (just needs to exist as a directory)."""
     d = tmp_path / "adapter"
@@ -86,7 +104,7 @@ def tmp_adapter(tmp_path: Path) -> Path:
     return d
 
 
-@pytest.fixture()
+@pytest.fixture
 def tmp_adapter_with_config(tmp_path: Path) -> tuple[Path, str]:
     """An adapter directory with a valid adapter_config.json.
 
@@ -100,7 +118,7 @@ def tmp_adapter_with_config(tmp_path: Path) -> tuple[Path, str]:
     return d, base_model_name
 
 
-@pytest.fixture()
+@pytest.fixture
 def tmp_suite(tmp_path: Path) -> Path:
     """A two-record task-schema JSONL eval suite."""
     f = tmp_path / "suite.jsonl"
@@ -294,7 +312,14 @@ def test_eval_json_partial_score(
         encoding="utf-8",
     )
 
-    def _zero_score(adapter_path: str, suite_path: str) -> dict[str, Any]:
+    def _zero_score(
+        adapter_path: str,
+        suite_path: str | None = None,
+        *,
+        suite_paths=None,
+        quant=None,
+        batch_size=8,
+    ) -> dict[str, Any]:
         return {
             "total": 1,
             "exact_match": 0,
@@ -368,9 +393,16 @@ def test_in_container_calls_run_eval(
     """
     calls: list[tuple[str, str]] = []
 
-    def _capture_run_eval(adapter_path: str, suite_path: str) -> dict[str, Any]:
-        calls.append((adapter_path, suite_path))
-        return _fake_run_eval_perfect(adapter_path, suite_path)
+    def _capture_run_eval(
+        adapter_path: str,
+        suite_path: str | None = None,
+        *,
+        suite_paths=None,
+        quant=None,
+        batch_size=8,
+    ) -> dict[str, Any]:
+        calls.append((adapter_path, suite_path or str(suite_paths[0])))
+        return _fake_run_eval_perfect(adapter_path, suite_path, suite_paths=suite_paths)
 
     monkeypatch.setattr(eval_mod, "run_eval", _capture_run_eval)
 
@@ -414,7 +446,7 @@ def test_host_routes_to_container_launch(
         launch_calls.append(
             {"sloth_args": list(sloth_args), "workdir": workdir, "checkout": checkout, **kwargs}
         )
-        return 0
+        return dict(_FAKE_EVAL_SUMMARY)
 
     monkeypatch.setattr(eval_mod.container, "launch", _fake_launch)
 
@@ -445,7 +477,7 @@ def test_host_routes_json_flag_when_set(
 
     def _fake_launch(sloth_args: list[str], **kwargs: Any) -> int:
         forwarded_args.append(list(sloth_args))
-        return 0
+        return dict(_FAKE_EVAL_SUMMARY)
 
     monkeypatch.setattr(eval_mod.container, "launch", _fake_launch)
 
@@ -455,6 +487,87 @@ def test_host_routes_json_flag_when_set(
     assert forwarded_args, "launch must be called"
     assert "--json" in forwarded_args[0], "--json must be forwarded to the container"
     assert "--in-container" in forwarded_args[0]
+
+
+# ---------------------------------------------------------------------------
+# t2 acceptance — --json always forwarded into the container; the host emits
+# the dict container.launch() returns via emit_result, honouring the HOST's
+# own --json flag (independent of what was forwarded into the container).
+# ---------------------------------------------------------------------------
+
+
+def test_host_json_forwarded_even_without_host_json(
+    tmp_adapter: Path,
+    tmp_suite: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--json is forwarded into the container argv UNCONDITIONALLY, even when
+    the host itself was not invoked with --json."""
+    forwarded_args: list[list[str]] = []
+
+    def _fake_launch(sloth_args: list[str], **kwargs: Any) -> dict[str, Any]:
+        forwarded_args.append(list(sloth_args))
+        return dict(_FAKE_EVAL_SUMMARY)
+
+    monkeypatch.setattr(eval_mod.container, "launch", _fake_launch)
+
+    args = _make_args(
+        adapter=str(tmp_adapter), suite=str(tmp_suite), json=False, in_container=False
+    )
+    cmd_eval(args)
+
+    assert forwarded_args, "launch must be called"
+    assert "--json" in forwarded_args[0], "--json must be forwarded to the container"
+
+
+def test_host_emits_launch_result_as_json(
+    tmp_adapter: Path,
+    tmp_suite: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The dict container.launch() returns is emitted verbatim as JSON on stdout
+    when the host's own --json flag is set."""
+    fake_result = {
+        "total": 2,
+        "exact_match": 2,
+        "exact_match_pct": 100.0,
+        "results": [{"index": 0, "task": "reverse", "exact_match": True}],
+    }
+    monkeypatch.setattr(eval_mod.container, "launch", lambda *a, **kw: dict(fake_result))
+
+    args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), json=True, in_container=False)
+    cmd_eval(args)
+
+    out = capsys.readouterr().out
+    assert json.loads(out) == fake_result
+
+
+def test_host_emits_launch_result_as_text(
+    tmp_adapter: Path,
+    tmp_suite: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """In text mode, the launch() result is rendered with the same renderer the
+    in-container path uses (_render_text) — host stdout is exactly that."""
+    fake_result = {
+        "total": 2,
+        "exact_match": 2,
+        "exact_match_pct": 100.0,
+        "results": [{"index": 0, "task": "reverse", "exact_match": True}],
+    }
+    monkeypatch.setattr(eval_mod.container, "launch", lambda *a, **kw: dict(fake_result))
+
+    args = _make_args(
+        adapter=str(tmp_adapter), suite=str(tmp_suite), json=False, in_container=False
+    )
+    cmd_eval(args)
+
+    out = capsys.readouterr().out
+    target = eval_mod._resolve_target(args)
+    expected = eval_mod._render_text(target, eval_mod._render_suite_label([tmp_suite]), fake_result)
+    assert out == expected + "\n"
 
 
 def test_host_returns_0_on_launch_success(
@@ -467,7 +580,7 @@ def test_host_returns_0_on_launch_success(
     FIX 1+2: launch() raises on failure; on success the handler falls through
     (implicit None return) — no explicit return value.
     """
-    monkeypatch.setattr(eval_mod.container, "launch", lambda *a, **kw: 0)
+    monkeypatch.setattr(eval_mod.container, "launch", lambda *a, **kw: dict(_FAKE_EVAL_SUMMARY))
     args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), in_container=False)
     rc = cmd_eval(args)
     assert rc in (None, 0)
@@ -522,7 +635,7 @@ def test_host_extra_mounts_cover_adapter_and_suite_parents(
     def _capture_launch(sloth_args: list[str], **kwargs: Any) -> int:
         captured["sloth_args"] = list(sloth_args)
         captured.update(kwargs)
-        return 0
+        return dict(_FAKE_EVAL_SUMMARY)
 
     monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
 
@@ -580,7 +693,7 @@ def test_register_adds_eval_subparser() -> None:
     register(sub)
     args = parser.parse_args(["eval", "--adapter", "/some/dir", "--suite", "/some/file.jsonl"])
     assert args.adapter == "/some/dir"
-    assert args.suite == "/some/file.jsonl"
+    assert args.suite == ["/some/file.jsonl"]  # --suite is repeatable (action="append")
     assert args.json is False
     assert callable(args.func)
 
@@ -644,9 +757,11 @@ def tmp_model(tmp_path: Path) -> Path:
     return d
 
 
-def _fake_run_eval_model(model_dir: str, suite_path: str) -> dict[str, Any]:
+def _fake_run_eval_model(
+    model_dir: str, suite_path: str | None = None, *, suite_paths=None, quant=None, batch_size=8
+) -> dict[str, Any]:
     """A run_eval_model summary (adapter score fields + the model-specific ones)."""
-    summary = _fake_run_eval_perfect(model_dir, suite_path)
+    summary = _fake_run_eval_perfect(model_dir, suite_path, suite_paths=suite_paths)
     summary["model_dir"] = model_dir
     summary["quant_method"] = "compressed-tensors"
     summary["quant_format"] = "pack-quantized"
@@ -700,7 +815,7 @@ def test_host_routes_model_to_container(
     def _capture_launch(sloth_args: list[str], **kwargs: Any) -> int:
         captured["sloth_args"] = list(sloth_args)
         captured.update(kwargs)
-        return 0
+        return dict(_FAKE_EVAL_SUMMARY)
 
     monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
 
@@ -746,9 +861,11 @@ def test_in_container_model_calls_run_eval_model(
     """--model --in-container delegates to run_eval_model and emits the extra fields."""
     calls: list[tuple[str, str]] = []
 
-    def _capture(model_dir: str, suite_path: str) -> dict[str, Any]:
-        calls.append((model_dir, suite_path))
-        return _fake_run_eval_model(model_dir, suite_path)
+    def _capture(
+        model_dir: str, suite_path: str | None = None, *, suite_paths=None, quant=None, batch_size=8
+    ) -> dict[str, Any]:
+        calls.append((model_dir, suite_path or str(suite_paths[0])))
+        return _fake_run_eval_model(model_dir, suite_path, suite_paths=suite_paths)
 
     monkeypatch.setattr(eval_mod, "run_eval_model", _capture)
     monkeypatch.setattr(
@@ -973,3 +1090,345 @@ def test_run_eval_model_without_ml_stack(
         exporter_mod.run_eval_model(str(tmp_model), str(tmp_suite))
     assert exc_info.value.code == 2
     assert "NGC" in exc_info.value.remediation or "container" in exc_info.value.remediation
+
+
+# ---------------------------------------------------------------------------
+# t4 — --suite accepts a directory, validated before any container launch
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tmp_suite_dir_valid(tmp_path: Path) -> Path:
+    """A suite directory with two valid task-schema *.jsonl files."""
+    d = tmp_path / "suite_dir"
+    d.mkdir()
+    (d / "a.jsonl").write_text(
+        '{"task": "reverse", "input": "abc", "expected_output": "cba"}\n',
+        encoding="utf-8",
+    )
+    (d / "b.jsonl").write_text(
+        '{"task": "upper", "input": "hello", "expected_output": "HELLO"}\n',
+        encoding="utf-8",
+    )
+    return d
+
+
+@pytest.fixture
+def tmp_suite_dir_malformed(tmp_path: Path) -> Path:
+    """A suite directory whose second file has a malformed line 2."""
+    d = tmp_path / "suite_dir_bad"
+    d.mkdir()
+    (d / "a.jsonl").write_text(
+        '{"task": "reverse", "input": "abc", "expected_output": "cba"}\n',
+        encoding="utf-8",
+    )
+    (d / "z_bad.jsonl").write_text(
+        '{"task": "ok", "input": "x", "expected_output": "y"}\n' "not valid json\n",
+        encoding="utf-8",
+    )
+    return d
+
+
+def test_directory_suite_validated_before_launch_on_malformed_file(
+    tmp_adapter: Path,
+    tmp_suite_dir_malformed: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed file inside a --suite directory exits 1 naming file + line,
+    and the container launcher is never called (fails fast, before any launch)."""
+
+    def _must_not_launch(*args: Any, **kwargs: Any) -> int:
+        raise AssertionError("container.launch called despite a malformed suite file")
+
+    monkeypatch.setattr(eval_mod.container, "launch", _must_not_launch)
+
+    args = _make_args(
+        adapter=str(tmp_adapter), suite=[str(tmp_suite_dir_malformed)], in_container=False
+    )
+    with pytest.raises(CliError) as exc_info:
+        cmd_eval(args)
+
+    err = exc_info.value
+    assert err.code == 1
+    assert "z_bad.jsonl" in err.message
+    assert "line 2" in err.message
+
+
+def test_directory_suite_all_valid_expands_and_launches(
+    tmp_adapter: Path,
+    tmp_suite_dir_valid: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A directory of valid *.jsonl files expands to one --suite flag per file,
+    sorted, and launches the container."""
+    captured: dict[str, Any] = {}
+
+    def _capture_launch(sloth_args: list[str], **kwargs: Any) -> int:
+        captured["sloth_args"] = list(sloth_args)
+        return dict(_FAKE_EVAL_SUMMARY)
+
+    monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
+
+    args = _make_args(
+        adapter=str(tmp_adapter), suite=[str(tmp_suite_dir_valid)], in_container=False
+    )
+    rc = cmd_eval(args)
+    assert rc in (None, 0)
+
+    forwarded = captured["sloth_args"]
+    suite_flags_idx = [i for i, tok in enumerate(forwarded) if tok == "--suite"]
+    assert len(suite_flags_idx) == 2, f"expected 2 --suite flags, forwarded={forwarded}"
+    suite_values = [forwarded[i + 1] for i in suite_flags_idx]
+    assert suite_values == sorted(suite_values), "directory files must be forwarded sorted"
+    assert str((tmp_suite_dir_valid / "a.jsonl").resolve()) in suite_values
+    assert str((tmp_suite_dir_valid / "b.jsonl").resolve()) in suite_values
+
+
+def test_single_jsonl_suite_still_works_unchanged(
+    tmp_adapter: Path,
+    tmp_suite: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single .jsonl --suite path still works exactly as before (one --suite flag)."""
+    captured: dict[str, Any] = {}
+
+    def _capture_launch(sloth_args: list[str], **kwargs: Any) -> int:
+        captured["sloth_args"] = list(sloth_args)
+        return dict(_FAKE_EVAL_SUMMARY)
+
+    monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
+
+    args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), in_container=False)
+    rc = cmd_eval(args)
+    assert rc in (None, 0)
+
+    forwarded = captured["sloth_args"]
+    assert forwarded.count("--suite") == 1
+    idx = forwarded.index("--suite")
+    assert forwarded[idx + 1] == str(tmp_suite.resolve())
+
+
+def test_missing_suite_directory_raises_before_launch(
+    tmp_adapter: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A --suite path that does not exist at all raises CliError(code=1); no launch."""
+
+    def _must_not_launch(*args: Any, **kwargs: Any) -> int:
+        raise AssertionError("container.launch called for a missing suite path")
+
+    monkeypatch.setattr(eval_mod.container, "launch", _must_not_launch)
+    args = _make_args(
+        adapter=str(tmp_adapter), suite=[str(tmp_path / "does_not_exist")], in_container=False
+    )
+    with pytest.raises(CliError) as exc_info:
+        cmd_eval(args)
+    assert exc_info.value.code == 1
+
+
+def test_empty_suite_directory_raises_before_launch(
+    tmp_adapter: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A --suite directory holding no *.jsonl files raises CliError(code=1); no launch."""
+    empty_dir = tmp_path / "empty_suite"
+    empty_dir.mkdir()
+
+    def _must_not_launch(*args: Any, **kwargs: Any) -> int:
+        raise AssertionError("container.launch called for an empty suite directory")
+
+    monkeypatch.setattr(eval_mod.container, "launch", _must_not_launch)
+    args = _make_args(adapter=str(tmp_adapter), suite=[str(empty_dir)], in_container=False)
+    with pytest.raises(CliError) as exc_info:
+        cmd_eval(args)
+    assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# t4 — --quant / --batch-size flags
+# ---------------------------------------------------------------------------
+
+
+def test_register_quant_and_batch_size_flags() -> None:
+    """--quant and --batch-size parse; --batch-size defaults to 8."""
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command")
+    register(sub)
+    args = parser.parse_args(["eval", "--adapter", "/a", "--suite", "/b.jsonl"])
+    assert args.quant is None
+    assert args.batch_size == 8
+
+    args2 = parser.parse_args(
+        [
+            "eval",
+            "--adapter",
+            "/a",
+            "--suite",
+            "/b.jsonl",
+            "--quant",
+            "q4_k_m",
+            "--batch-size",
+            "16",
+        ]
+    )
+    assert args2.quant == "q4_k_m"
+    assert args2.batch_size == 16
+
+
+def test_host_forwards_quant_and_batch_size_to_container(
+    tmp_adapter: Path,
+    tmp_suite: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--quant and --batch-size are forwarded into the in-container argv."""
+    captured: dict[str, Any] = {}
+
+    def _capture_launch(sloth_args: list[str], **kwargs: Any) -> int:
+        captured["sloth_args"] = list(sloth_args)
+        return dict(_FAKE_EVAL_SUMMARY)
+
+    monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
+
+    args = _make_args(
+        adapter=str(tmp_adapter),
+        suite=str(tmp_suite),
+        quant="q4_k_m",
+        batch_size=16,
+        in_container=False,
+    )
+    rc = cmd_eval(args)
+    assert rc in (None, 0)
+
+    forwarded = captured["sloth_args"]
+    assert "--quant" in forwarded
+    assert forwarded[forwarded.index("--quant") + 1] == "q4_k_m"
+    assert "--batch-size" in forwarded
+    assert forwarded[forwarded.index("--batch-size") + 1] == "16"
+
+
+def test_host_forwards_default_batch_size_when_not_set(
+    tmp_adapter: Path,
+    tmp_suite: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--batch-size still reaches the container argv with its default (8) and
+    --quant is omitted entirely when not passed."""
+    captured: dict[str, Any] = {}
+
+    def _capture_launch(sloth_args: list[str], **kwargs: Any) -> int:
+        captured["sloth_args"] = list(sloth_args)
+        return dict(_FAKE_EVAL_SUMMARY)
+
+    monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
+
+    args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), in_container=False)
+    cmd_eval(args)
+
+    forwarded = captured["sloth_args"]
+    assert "--quant" not in forwarded
+    assert "--batch-size" in forwarded
+    assert forwarded[forwarded.index("--batch-size") + 1] == "8"
+
+
+def test_in_container_forwards_quant_and_batch_size_when_seam_accepts_them(
+    tmp_adapter: Path,
+    tmp_suite: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When run_eval's signature accepts suite_paths/quant/batch_size, cmd_eval
+    passes them through (the richer signature t5, a sibling task, is adding)."""
+    calls: list[dict[str, Any]] = []
+
+    def _fake_rich_run_eval(
+        adapter_path: str,
+        *,
+        suite_paths: list[Path],
+        quant: str | None = None,
+        batch_size: int = 8,
+    ) -> dict[str, Any]:
+        calls.append(
+            {
+                "adapter_path": adapter_path,
+                "suite_paths": list(suite_paths),
+                "quant": quant,
+                "batch_size": batch_size,
+            }
+        )
+        return _fake_run_eval_perfect(adapter_path, str(suite_paths[0]))
+
+    monkeypatch.setattr(eval_mod, "run_eval", _fake_rich_run_eval)
+
+    args = _make_args(
+        adapter=str(tmp_adapter),
+        suite=str(tmp_suite),
+        quant="q4_k_m",
+        batch_size=4,
+        in_container=True,
+    )
+    rc = cmd_eval(args)
+    assert rc in (None, 0)
+    assert len(calls) == 1
+    assert calls[0]["adapter_path"] == str(tmp_adapter)
+    assert calls[0]["suite_paths"] == [tmp_suite]
+    assert calls[0]["quant"] == "q4_k_m"
+    assert calls[0]["batch_size"] == 4
+
+
+# ---------------------------------------------------------------------------
+# qodo — --batch-size must be validated on the host before suite validation
+# or container launch; 0 and negative values are user errors, not silent 1s.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad_batch_size", [0, -3])
+def test_batch_size_below_one_raises_cli_error(
+    tmp_adapter: Path,
+    tmp_suite: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bad_batch_size: int,
+) -> None:
+    """--batch-size 0 or negative raises CliError(code=1) before the container
+    is ever launched — batch-size validation happens before suite validation
+    and before any launch() call."""
+    launched: list[Any] = []
+
+    def _fail_if_launched(sloth_args: list[str], **kwargs: Any) -> int:
+        launched.append(sloth_args)
+        raise AssertionError("container.launch must not be called for a bad --batch-size")
+
+    monkeypatch.setattr(eval_mod.container, "launch", _fail_if_launched)
+
+    args = _make_args(
+        adapter=str(tmp_adapter),
+        suite=str(tmp_suite),
+        batch_size=bad_batch_size,
+        in_container=False,
+    )
+    with pytest.raises(CliError) as exc_info:
+        cmd_eval(args)
+    assert exc_info.value.code == 1
+    assert not launched
+
+
+def test_batch_size_one_is_accepted(
+    tmp_adapter: Path,
+    tmp_suite: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--batch-size 1 stays the explicit unbatched mode — it is not rejected."""
+    captured: dict[str, Any] = {}
+
+    def _capture_launch(sloth_args: list[str], **kwargs: Any) -> dict[str, Any]:
+        captured["sloth_args"] = list(sloth_args)
+        return dict(_FAKE_EVAL_SUMMARY)
+
+    monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
+
+    args = _make_args(
+        adapter=str(tmp_adapter),
+        suite=str(tmp_suite),
+        batch_size=1,
+        in_container=False,
+    )
+    rc = cmd_eval(args)
+    assert rc in (None, 0)
+    forwarded = captured["sloth_args"]
+    assert forwarded[forwarded.index("--batch-size") + 1] == "1"

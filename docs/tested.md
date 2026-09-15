@@ -9,7 +9,7 @@ Companion pages: [`benchmarks.md`](benchmarks.md) (the numbers),
 [`dgx-spark.md`](dgx-spark.md) (how/why), [`fine-tuning.md`](fine-tuning.md) (the
 feature reference).
 
-## Common environment (every run below)
+## Common environment (the Spark runs; every run below unless a row names another device)
 
 | Component | Value |
 |-----------|-------|
@@ -25,6 +25,9 @@ feature reference).
 | Train hyperparameters | `batch_size=1`, `grad_accum=4`, `max_seq_len=1024`, `lora_r=8`, `lora_alpha=16`, `max_steps=10`, `seed=3407` |
 | Train dataset | `examples/chat-smoke.jsonl` (10 lines, **chat** schema) |
 | Eval suite | `examples/eval-suite.jsonl` (4 items, **task** schema) |
+
+Rows below inherit this Spark environment except where a row's own columns name
+a different device — e.g. the Thor serving row in the follow-ups #22 section.
 
 ## ✅ Tested — passed
 
@@ -72,13 +75,54 @@ layer now pins `datasets==4.8.5`, `llmcompressor==0.11.0`,
 
 | `/finetune` skill `run` | train → eval → export `--export-format gguf --quant q4_k_m --json` | LFM2.5-1.2B-Base | `bash .claude/skills/finetune/scripts/finetune.sh run --config <lfm2 toml> --suite examples/eval-suite.jsonl --export-format gguf --quant q4_k_m --json` (with this checkout's `sloth` first on PATH) | ✅ exit 0 in 5 m 28 s; adapter + `runs/lfm2-skill-gguf/LFM2.5-1.2B-Base.Q4_K_M.gguf`. **Known gap:** stdout carries the 3 JSON results interleaved with the container's banner and trainer progress lines (pre-existing stream-through, plan risk r10) — not stdout-only yet |
 
-Not measured in this batch: QLoRA-trained adapters through the export formats, Qwen3
+Not measured in the 2026-09-15 LFM2.5 batch (closed by the follow-ups #22 section below): QLoRA-trained adapters through the export formats, Qwen3
 through awq/nvfp4/gguf, any Jetson-side load, any accuracy metric beyond the 4-item
 smoke suite (plan risks r3, r4, r8).
 
 Before-state evidence (deviation record, main at `39a3f93`): the same TOML
 dry-run on `main` ignored the `target_modules` key silently — the plan's
 `hyperparameters` had no such key.
+
+## ✅ Tested — passed (2026-09-15, follow-ups #22: stdout purity, QLoRA + Qwen3 through export)
+
+Same box and container as above, on the `feat/follow-ups-22-a` integration branch
+(plan `lfm2-5-delivery-follow-ups-22`, task t9). The dep layer now **pins**
+`unsloth==2026.9.4 unsloth_zoo==2026.9.3 bitsandbytes==0.50.2` (measured in-container
+by t8 with `uv pip list` after the CLI's own install line; bump procedure in
+`docs/dgx-spark.md`). Every `--json` run below was captured as
+`> out.json 2> err.log` and checked with `wc -l out.json` and
+`python -c 'import json,sys; json.load(open("out.json"))'`. Memory note: the box held
+lobes' vLLM (~90 GB of the 121 GB UMA); the first `train` attempt died with CUDA OOM at
+backend init until page cache was reclaimed (touch + free a 20 GiB anonymous mmap,
+no sudo needed).
+
+| Verb | Method / mode | Model | Invocation | Result |
+|------|---------------|-------|------------|--------|
+| NGC banner probe | no sloth, no GPU | — | `docker run --rm nvcr.io/nvidia/pytorch:25.11-py3 python -c pass > out 2> err` | ✅ `wc -l out` = **36**, `wc -l err` = 0 — the banner is the image entrypoint's and lands on **stdout**, so only host-side capture can strip it (assumption c40 holds) |
+| `train --json` | LoRA, `preset:lfm2`, 10 steps | LFM2.5-1.2B-Base | `uv run sloth train --config <lfm2-lora.toml, output runs/lfm2-lora-t9> --json > out.json 2> err.log` | ✅ 144 s; **`wc -l out.json` = 1**, `json.loads` ok (`status: trained`); `wc -l err.log` = 219 carrying the banner, the uv layer install and all 10 trl `{'loss': …}` dicts |
+| `eval --adapter --json` | LoRA adapter, 4-item smoke suite | LFM2.5-1.2B-Base | `uv run sloth eval --adapter runs/lfm2-lora --suite examples/eval-suite.jsonl --json > out.json 2> err.log` | ✅ 122 s; **`wc -l out.json` = 1**, `json.loads` ok; `wc -l err.log` = 191; exact_match **0/4**, token-F1 0.087; every `prediction` starts after the prompt (continuation-only scoring live-verified — the model echoes the `Input:` template but the prompt itself is excluded); `runs/lfm2-lora/eval.json` written |
+| `export --base <id> --json` | merged-16bit onto a **different** base (staged adapter copy) | LFM2.5-1.2B-Base adapter → `LiquidAI/LFM2.5-1.2B-Instruct` | `uv run sloth export --adapter runs/lfm2-lora --base LiquidAI/LFM2.5-1.2B-Instruct --format merged-16bit --output runs/lfm2-exports/base-override-instruct --json` | ✅ 108 s; **`wc -l out.json` = 1**; `export.json` records `base: LiquidAI/LFM2.5-1.2B-Instruct`; `model.safetensors` 2.34 GB — the staged `_adapter-override` copy loads |
+| `export --format merged-16bit` | **QLoRA (4-bit-trained) adapter** → bf16 merged (risk r3) | `unsloth/qwen3-1.7b-unsloth-bnb-4bit` + `runs/qlora-smoke` | `uv run sloth export --adapter runs/qlora-smoke --format merged-16bit --output runs/qlora-smoke-exports/merged16 --json` | ✅ 150 s; `model.safetensors` 3.44 GB, `config.json` has `torch_dtype: bfloat16` and **no** `quantization_config` — Unsloth dequantises then merges implicitly; no exporter change needed |
+| `export --format awq --calib examples/chat-smoke.jsonl` | W4A16 via llm-compressor 0.11.0, **default (inferred) mappings** — no LFM2-style custom list | `unsloth/Qwen3-1.7B` + `runs/lora-smoke` (June LoRA) | `uv run sloth export --adapter runs/lora-smoke --format awq --calib examples/chat-smoke.jsonl --output runs/lora-smoke-exports/awq --json` | ✅ 84 s; `model.safetensors` 1.98 GB, `compressed-tensors` `pack-quantized` 4-bit; llm-compressor logged `28 mappings were skipped due to incompatible shapes` (the GQA v_proj→o_proj pair, one per layer) and carried on — **no custom mapping needed** (risk r4 of the shipped plan). `--calib` was required because the June adapter's `training_metadata.json` predates the `dataset.path` field |
+| `export --format nvfp4 --calib examples/chat-smoke.jsonl` | NVFP4 via llm-compressor 0.11.0 (torch-2.11 shim active) | same | `… --format nvfp4 --calib examples/chat-smoke.jsonl --output runs/lora-smoke-exports/nvfp4 --json` | ✅ 82 s; `model.safetensors` 2.04 GB, `nvfp4-pack-quantized` |
+| `export --format gguf --quant q4_k_m` | Q4_K_M via prebuilt llama.cpp b10909 (cache reuse) | same | `… --format gguf --quant q4_k_m --output runs/lora-smoke-exports/gguf --json` | ✅ 67 s; `Qwen3-1.7B.Q4_K_M.gguf` 1.11 GB; no F16 intermediate left behind |
+
+Every `export --json` row above: **`wc -l out.json` = 1**, `json.loads` ok; the
+container's banner, uv layer install and Unsloth/llm-compressor progress all on
+stderr (62–186 lines). No new row names a model larger than Qwen3-1.7B / LFM2.5-1.2B.
+
+| `eval --suite examples/eval/` (dir) | adapter baseline, **batch 8 vs batch 1** timing | LFM2.5-1.2B-Base + `runs/lfm2-lora` | `uv run sloth eval --adapter runs/lfm2-lora --suite examples/eval/ --batch-size 8 --json` and the same with `--batch-size 1` | ✅ 46 items in 3 files; **220 s (batch 8) vs 524 s (batch 1)**; exact_match 0/46 both; token-F1 0.038 vs 0.060 — batched decoding is not bit-identical (plan risk r8); per-file + aggregate scores and `runs/lfm2-lora/eval.json` written |
+| `eval --model` per export format | merged-16bit / gguf Q4_K_M / awq / nvfp4 on the 46-item suite | LFM2.5-1.2B-Base exports (2026-09-15 batch) | `uv run sloth eval --model runs/lfm2-exports/<fmt> --suite examples/eval/ --batch-size 8 --json` | ✅ four runs (276 s / 130 s / 283 s / 387 s), every one 1 stdout line; exact_match **0/46 on every format** (smoke adapter — not an accuracy claim; h15 treats an all-zero set as a failed condition until a trained adapter exists); token-F1 0.036 / 0.092 / 0.060 / 0.040; full table in `docs/benchmarks.md` |
+| serve (vLLM) on **Thor** | `awq` and `nvfp4` LFM2.5 exports loaded off-box | NVIDIA Thor, JetPack R38.2.2 (L4T 6.8.12-tegra, driver 580.00), `vllm/vllm-openai:v0.29.0-aarch64` | `docker run --rm --gpus all -v ~/lfm2-exports:/exports --entrypoint /usr/bin/python3 vllm/vllm-openai:v0.29.0-aarch64 /exports/thor_load.py /exports/<fmt> <fmt>` (`LLM(gpu_memory_utilization=0.12, max_model_len=512, enforce_eager=True)`, one greedy 24-token completion) | ✅ both load with `quantization=compressed-tensors` auto-detected (`pack-quantized` / `nvfp4-pack-quantized`) and generate coherent text; 134 s / 124 s incl. engine init, with lobes' vLLM workers resident on the Thor. The Thor is an operator-local host (`ssh thor`), not referenced by shipped code |
+
+**Before-state of this batch (why the `export` rows needed a fix first):** the first
+chain of exports all exited 1 inside the container with
+`--adapter path is outside the allowed roots: /home/spark/git/unsloth-cli/runs/…` —
+the path sanitizer added to `export.py` in #20's review batch (after that PR's live
+rows) also runs in-container, where cwd is `/workspace` and `HOME` is the export
+home. Fixed by forwarding `SLOTH_ALLOWED_ROOTS` (the identity-mounted parents) into
+the container env (deviation d2). Every real `sloth export` on `main` between #20 and
+this fix was broken.
 
 ## ❌ Not tested (explicit gaps)
 
@@ -113,10 +157,14 @@ identical, but they have **not** been run on hardware.
 
 ### Platform
 
-- Only **GB10 (Blackwell, aarch64)** + **NGC 25.11 / torch 2.10**. No other GPU,
-  arch, driver, or container image was tested. `--gpus all` worked via **CDI**
-  (Docker default runtime `runc`); a host requiring the `nvidia` runtime was not
-  tested.
+- Training and eval ran only on **GB10 (Blackwell, aarch64)** + **NGC 25.11 /
+  torch 2.10**. `--gpus all` worked via **CDI** (Docker default runtime `runc`);
+  a host requiring the `nvidia` runtime was not tested.
+- The only *other* device tested is **NVIDIA Thor** (JetPack R38.2.2, L4T
+  6.8.12-tegra, driver 580.00, `vllm/vllm-openai:v0.29.0-aarch64`), and only for
+  **serving** the LFM2.5 `awq`/`nvfp4` exports (follow-ups #22) — not for
+  training or eval. **Orin Nano is still untested** — tracked in
+  [#23](https://github.com/agentculture/unsloth-cli/issues/23).
 
 ## How to extend this matrix
 

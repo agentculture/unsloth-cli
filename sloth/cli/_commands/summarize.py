@@ -42,6 +42,12 @@ def _summary_text_lines(summary: dict[str, Any]) -> list[str]:
         lines.append(f"final_loss:  {training.get('final_loss')}")
         if training.get("best_metric") is not None:
             lines.append(f"best_metric: {training.get('best_metric')}")
+    eval_summary = summary.get("eval")
+    if eval_summary:
+        lines.append("eval:")
+        lines.append(f"  exact_match_pct: {eval_summary.get('exact_match_pct')}")
+        lines.append(f"  f1:              {eval_summary.get('f1')}")
+        lines.append(f"  files:           {eval_summary.get('file_count')}")
     exports = summary.get("exports") or []
     if exports:
         lines.append("exports:")
@@ -53,14 +59,24 @@ def _summary_text_lines(summary: dict[str, Any]) -> list[str]:
 
 
 def _export_line(export: dict[str, Any]) -> str:
-    """Render one export record as ``<format> quant=<a,b> files=<n> bytes=<n>``."""
+    """Render one export record as ``<format> quant=<a,b> files=<n> bytes=<n>``,
+    appended with an ``eval(...)`` suffix when that export's own output dir
+    has an ``eval.json`` (see :func:`sloth.tune.summary.build_summary`)."""
     raw_quant = export.get("quant")
     quant_items = [str(q) for q in raw_quant] if isinstance(raw_quant, list) else []
     quant = ",".join(quant_items) or "-"
     files = export.get("files")
     files = files if isinstance(files, dict) else {}
     total_bytes = sum(v for v in files.values() if isinstance(v, (int, float)))
-    return f"{export.get('format')} quant={quant} files={len(files)} bytes={int(total_bytes)}"
+    line = f"{export.get('format')} quant={quant} files={len(files)} bytes={int(total_bytes)}"
+    export_eval = export.get("eval")
+    if export_eval:
+        line += (
+            f" eval(exact_match_pct={export_eval.get('exact_match_pct')}"
+            f" f1={export_eval.get('f1')}"
+            f" files={export_eval.get('file_count')})"
+        )
+    return line
 
 
 def cmd_summarize(args: argparse.Namespace) -> int:

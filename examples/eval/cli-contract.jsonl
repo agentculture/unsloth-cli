@@ -1,0 +1,14 @@
+{"task": "answer", "input": "Where do results go?", "expected_output": "Results go to stdout; errors and diagnostics go to stderr."}
+{"task": "answer", "input": "How are errors formatted in text mode?", "expected_output": "As two lines: 'error: <message>' then 'hint: <remediation>'."}
+{"task": "answer", "input": "What does exit code 1 mean?", "expected_output": "Exit code 1 is a user-input error."}
+{"task": "answer", "input": "What does exit code 2 mean?", "expected_output": "Exit code 2 is an environment or setup error, such as a missing GPU stack or unavailable container runtime."}
+{"task": "answer", "input": "How do I get machine-readable output?", "expected_output": "The same payloads are routed as structured JSON to the same streams: results to stdout, errors to stderr."}
+{"task": "answer", "input": "Which fine-tuning methods are supported?", "expected_output": "Only LoRA and QLoRA adapter tuning."}
+{"task": "answer", "input": "Where does the GPU stack run?", "expected_output": "Inside NVIDIA's official NGC PyTorch container."}
+{"task": "answer", "input": "What belongs in fine-tuning versus memory?", "expected_output": "Fine-tuning stores stable behavior and reflexes."}
+{"task": "answer", "input": "How do I see docs for a verb?", "expected_output": "Run 'explain <path>'."}
+{"task": "answer", "input": "What format are exported adapters in?", "expected_output": "Standard PEFT safetensors layout, so lobes can serve them and colleague can run them as a model backend."}
+{"task": "answer", "input": "What is exit code 0?", "expected_output": "Exit code 0 means success."}
+{"task": "answer", "input": "What is exit code 3 and above reserved for?", "expected_output": "Exit codes 3 and above are reserved."}
+{"task": "define", "input": "Define the hint requirement on a CliError.", "expected_output": "Every CliError must supply a remediation, rendered as the 'hint:' line."}
+{"task": "classify", "input": "Classify this line for its stream: 'error: missing --config'", "expected_output": "stderr"}

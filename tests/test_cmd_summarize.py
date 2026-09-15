@@ -7,6 +7,10 @@ Covers:
 * --json shape; unresolvable target -> CliError(code=1)
 * register() wiring + main()-level end-to-end (regression pattern from
   test_cmd_validate.py's test_main_validate_end_to_end)
+
+Also covers (t6): an ``eval`` block (aggregate exact_match_pct/f1 + suite
+file count) rendered from ``<run>/eval.json`` when present, omitted silently
+when absent — both for the run itself and for each export dir it lists.
 """
 
 from __future__ import annotations
@@ -298,6 +302,137 @@ def test_summary_text_mode_no_exports_no_export_lines(
     assert rc == 0
     out = capsys.readouterr().out
     assert "export" not in out.lower()
+
+
+# ---------------------------------------------------------------------------
+# Eval block (t6)
+# ---------------------------------------------------------------------------
+
+_EVAL_PAYLOAD = {
+    "total": 4,
+    "exact_match": 3,
+    "exact_match_pct": 75.0,
+    "f1": 0.82,
+    "results": [],
+    "files": [
+        {"path": "a.jsonl", "total": 2, "exact_match": 2, "exact_match_pct": 100.0, "f1": 1.0},
+        {"path": "b.jsonl", "total": 2, "exact_match": 1, "exact_match_pct": 50.0, "f1": 0.64},
+    ],
+    "suite_paths": ["a.jsonl", "b.jsonl"],
+    "target": "adapter",
+    "written_at": "2026-07-06T02:00:00+00:00",
+}
+
+
+def _write_eval_json(directory: Path, payload: dict = _EVAL_PAYLOAD) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "eval.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_summary_json_includes_eval_block_when_present(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output_dir = tmp_path / "adapter"
+    _write_eval_json(output_dir)
+
+    rc = cmd_summarize(_args(str(output_dir), json_mode=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["eval"] == {"exact_match_pct": 75.0, "f1": 0.82, "file_count": 2}
+
+
+def test_summary_text_mode_shows_eval_block(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output_dir = tmp_path / "adapter"
+    _write_eval_json(output_dir)
+
+    rc = cmd_summarize(_args(str(output_dir)))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "eval:" in out
+    assert "75.0" in out
+    assert "0.82" in out
+    assert "files:" in out
+
+
+def test_summary_omits_eval_block_silently_when_absent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output_dir = tmp_path / "adapter"
+    output_dir.mkdir()
+
+    rc = cmd_summarize(_args(str(output_dir)))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "eval:" not in out
+    assert "exact_match_pct" not in out
+
+
+def test_summary_json_eval_none_when_absent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output_dir = tmp_path / "adapter"
+    output_dir.mkdir()
+
+    rc = cmd_summarize(_args(str(output_dir), json_mode=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["eval"] is None
+
+
+def test_summary_export_line_shows_eval_when_export_has_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output_dir = tmp_path / "adapter"
+    output_dir.mkdir()
+    export_dir = output_dir / "gguf-export"
+    export_dir.mkdir()
+    export_record = {
+        "format": "gguf",
+        "quant": ["q4_k_m"],
+        "base": "m",
+        "adapter": str(output_dir),
+        "files": {"model.gguf": 100},
+        "calibration": None,
+        "versions": {},
+        "timestamp": "2026-07-06T00:00:00+00:00",
+    }
+    (export_dir / "export.json").write_text(json.dumps(export_record), encoding="utf-8")
+    _write_eval_json(export_dir)
+
+    rc = cmd_summarize(_args(str(output_dir)))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "gguf" in out
+    assert "eval(" in out
+    assert "75.0" in out
+
+
+def test_summary_export_line_no_eval_suffix_when_export_lacks_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output_dir = tmp_path / "adapter"
+    output_dir.mkdir()
+    export_dir = output_dir / "gguf-export"
+    export_dir.mkdir()
+    export_record = {
+        "format": "gguf",
+        "quant": ["q4_k_m"],
+        "base": "m",
+        "adapter": str(output_dir),
+        "files": {"model.gguf": 100},
+        "calibration": None,
+        "versions": {},
+        "timestamp": "2026-07-06T00:00:00+00:00",
+    }
+    (export_dir / "export.json").write_text(json.dumps(export_record), encoding="utf-8")
+
+    rc = cmd_summarize(_args(str(output_dir)))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "gguf" in out
+    assert "eval(" not in out
 
 
 def test_main_summarize_end_to_end(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

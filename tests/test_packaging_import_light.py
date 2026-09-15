@@ -73,3 +73,20 @@ def test_exporter_imports_without_torch() -> None:
     assert "torch" not in sys.modules, "torch was imported when importing sloth.tune._exporter"
     assert "unsloth" not in sys.modules, "unsloth was imported when importing sloth.tune._exporter"
     assert "llmcompressor" not in sys.modules, "llmcompressor was imported by sloth.tune._exporter"
+
+
+def test_metrics_imports_without_torch() -> None:
+    """Assert that importing sloth.tune.metrics does not import torch.
+
+    The eval scoring core is pure stdlib by contract (see
+    ``tests/test_lazy_import.py``): dataset-independent scoring, token F1, and
+    the ``eval.json`` writer must all work on a machine with no ML stack.
+    """
+    assert "torch" not in sys.modules, "torch is already in sys.modules"
+
+    import sloth.tune.metrics  # noqa: F401
+
+    assert "torch" not in sys.modules, "torch was imported when importing sloth.tune.metrics"
+    assert (
+        "transformers" not in sys.modules
+    ), "transformers was imported when importing sloth.tune.metrics"

@@ -95,7 +95,7 @@ def _write_toml(
     return f
 
 
-@pytest.fixture()
+@pytest.fixture
 def good_config(tmp_path: Path) -> Path:
     """A valid run.toml + valid chat dataset; returns the toml path."""
     dataset = _write_dataset(tmp_path)
@@ -446,7 +446,7 @@ def test_host_real_run_calls_container_launch(
     good_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """On the host (not in-container, not dry-run), cmd_train calls container.launch."""
-    mock_launch = Mock(return_value=0)
+    mock_launch = Mock(return_value={})
     monkeypatch.setattr(container_mod, "launch", mock_launch)
 
     rc = cmd_train(_make_args(good_config, dry_run=False))
@@ -464,7 +464,7 @@ def test_host_real_run_returns_0_on_launch_success(
     good_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """cmd_train returns None when container.launch succeeds."""
-    monkeypatch.setattr(container_mod, "launch", Mock(return_value=0))
+    monkeypatch.setattr(container_mod, "launch", Mock(return_value={}))
     rc = cmd_train(_make_args(good_config, dry_run=False))
     assert rc in (None, 0)
 
@@ -498,12 +498,74 @@ def test_host_real_run_json_forwarded_to_container(
     good_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """When --json is set, --json is included in the forwarded container args."""
-    mock_launch = Mock(return_value=0)
+    mock_launch = Mock(return_value={})
     monkeypatch.setattr(container_mod, "launch", mock_launch)
 
     cmd_train(_make_args(good_config, dry_run=False, json_mode=True))
     sloth_args = mock_launch.call_args[0][0]
     assert "--json" in sloth_args
+
+
+# ---------------------------------------------------------------------------
+# t2 acceptance — --json always forwarded into the container; the host emits
+# the dict container.launch() returns via emit_result, honouring the HOST's
+# own --json flag (independent of what was forwarded into the container).
+# ---------------------------------------------------------------------------
+
+
+def test_host_real_run_json_forwarded_even_without_host_json(
+    good_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--json is forwarded into the container argv UNCONDITIONALLY, even when
+    the host itself was not invoked with --json."""
+    mock_launch = Mock(return_value={})
+    monkeypatch.setattr(container_mod, "launch", mock_launch)
+
+    cmd_train(_make_args(good_config, dry_run=False, json_mode=False))
+    sloth_args = mock_launch.call_args[0][0]
+    assert "--json" in sloth_args
+
+
+def test_host_real_run_emits_launch_result_as_json(
+    good_config: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The dict container.launch() returns is emitted verbatim as JSON on stdout
+    when the host's own --json flag is set."""
+    fake_result = {
+        "status": "ok",
+        "model": "unsloth/Qwen3-4B",
+        "method": "qlora",
+        "dataset": "d.jsonl",
+        "output": "out",
+        "hyperparameters": {"lora_r": 16},
+        "adapter_dir": "out/adapter",
+    }
+    monkeypatch.setattr(container_mod, "launch", Mock(return_value=fake_result))
+
+    cmd_train(_make_args(good_config, dry_run=False, json_mode=True))
+    out = capsys.readouterr().out
+    assert json.loads(out) == fake_result
+
+
+def test_host_real_run_emits_launch_result_as_text(
+    good_config: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """In text mode, the launch() result is rendered with the same renderer the
+    in-container path uses (_render_plan_text) — host stdout is exactly that."""
+    fake_result = {
+        "status": "ok",
+        "model": "unsloth/Qwen3-4B",
+        "method": "qlora",
+        "dataset": "d.jsonl",
+        "output": "out",
+        "hyperparameters": {"lora_r": 16},
+        "adapter_dir": "out/adapter",
+    }
+    monkeypatch.setattr(container_mod, "launch", Mock(return_value=fake_result))
+
+    cmd_train(_make_args(good_config, dry_run=False, json_mode=False))
+    out = capsys.readouterr().out
+    assert out == train_mod._render_plan_text(fake_result) + "\n"
 
 
 def test_host_real_run_extra_mounts_cover_config_dataset_output(
@@ -538,7 +600,7 @@ def test_host_real_run_extra_mounts_cover_config_dataset_output(
     def _capture_launch(sloth_args: list[str], **kwargs: Any) -> int:
         captured.update(kwargs)
         captured["sloth_args"] = list(sloth_args)
-        return 0
+        return {}
 
     monkeypatch.setattr(container_mod, "launch", _capture_launch)
 
@@ -599,7 +661,7 @@ def test_host_real_run_does_not_identity_mount_cwd(
 
     def _capture_launch(sloth_args: list[str], **kwargs: Any) -> int:
         captured.update(kwargs)
-        return 0
+        return {}
 
     monkeypatch.setattr(container_mod, "launch", _capture_launch)
 
@@ -816,7 +878,7 @@ def test_host_real_run_does_not_append_registry_line_itself(
     """The host branch (4c) only launches docker — the *container's* recursive
     --in-container invocation is what appends, so calling cmd_train on the
     host with container.launch mocked must not create runs.jsonl itself."""
-    monkeypatch.setattr(container_mod, "launch", Mock(return_value=0))
+    monkeypatch.setattr(container_mod, "launch", Mock(return_value={}))
     rc = cmd_train(_make_args(good_config, dry_run=False))
     assert rc in (None, 0)
     assert not (Path(good_config).parent / "adapters" / "runs.jsonl").exists()
@@ -949,7 +1011,7 @@ def test_lfm2_hint_on_real_host_run(
     )
     dataset = _write_dataset(tmp_path)
     cfg = _write_toml(tmp_path, dataset=dataset, model=_LFM2_MODEL, method="lora")
-    mock_launch = Mock()
+    mock_launch = Mock(return_value={})
     monkeypatch.setattr(container_mod, "launch", mock_launch)
 
     cmd_train(_make_args(cfg))

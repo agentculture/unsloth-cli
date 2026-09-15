@@ -1,8 +1,12 @@
 """``sloth eval`` — score an adapter or a merged/quantized model on an eval suite.
 
-Evaluates against a JSONL file whose records conform to the **task** schema
-(``{"task": …, "input": …, "expected_output": …}``).  All inference is local and
-offline.
+Evaluates against one or more JSONL files whose records conform to the **task**
+schema (``{"task": …, "input": …, "expected_output": …}``).  ``--suite`` accepts a
+single file or a directory — a directory is expanded to its sorted ``*.jsonl``
+children — and is repeatable (``--suite a.jsonl --suite dir/``).  Every resolved
+file is validated against the task schema *before any container is launched*
+(see :func:`_resolve_and_validate_suite`), so a malformed suite costs no
+docker/GPU spend.  All inference is local and offline.
 
 **Two mutually-exclusive targets.** ``--adapter DIR`` scores a LoRA/QLoRA adapter
 against its base model (via :func:`~sloth.tune._trainer.run_eval`, which wraps the
@@ -47,7 +51,10 @@ from sloth.cli._output import emit_result
 from sloth.tune import container
 from sloth.tune._exporter import run_eval_model
 from sloth.tune._trainer import run_eval
-from sloth.tune.datasets import validate_dataset
+from sloth.tune.datasets import validate_suite
+
+#: Default generation batch size for the eval loop (forwarded to the in-container seam).
+DEFAULT_BATCH_SIZE = 8
 
 # ---------------------------------------------------------------------------
 # Checkout locator (repo root for container bind-mount)
@@ -141,6 +148,60 @@ def _resolve_target(args: argparse.Namespace) -> _EvalTarget:
 
 
 # ---------------------------------------------------------------------------
+# Suite resolution + validation (host AND in-container: both call this before
+# doing anything expensive)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_and_validate_suite(raw_entries: list[str]) -> list[Path]:
+    """Expand and task-schema-validate every ``--suite`` entry, in order given.
+
+    Each entry may be a single ``.jsonl`` file or a directory (expanded to its
+    sorted ``*.jsonl`` children by :func:`~sloth.tune.datasets.validate_suite`).
+    Validation happens here — before any container launch or ML seam call — so
+    a malformed suite (anywhere in a directory) costs no docker/GPU spend and
+    names the offending file *and* line.
+
+    Raises
+    ------
+    CliError(code=1)
+        On the first invalid file/line, or when an entry resolves to no files.
+    """
+    resolved: list[Path] = []
+    for raw in raw_entries:
+        report = validate_suite(raw, schema="task")
+        resolved.extend(Path(str(f["path"])) for f in report["files"])
+    return resolved
+
+
+def _validate_batch_size(batch_size: int) -> None:
+    """Raise ``CliError(code=1)`` unless *batch_size* is a positive integer.
+
+    Called before suite validation or any container launch so a bogus
+    ``--batch-size`` (0 or negative) never reaches the ML seam or spends a
+    docker/GPU cycle. ``1`` is a legitimate value — it is the explicit
+    unbatched (one prompt per ``generate()`` call) mode.
+    """
+    if batch_size < 1:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"--batch-size must be >= 1, got {batch_size}",
+            remediation=(
+                "Pass a positive integer with --batch-size (1 for the explicit "
+                "unbatched mode, the default is "
+                f"{DEFAULT_BATCH_SIZE})."
+            ),
+        )
+
+
+def _render_suite_label(suite_paths: list[Path]) -> str:
+    """A short display label for the resolved suite: the single path, or a count."""
+    if len(suite_paths) == 1:
+        return str(suite_paths[0])
+    return f"{len(suite_paths)} files"
+
+
+# ---------------------------------------------------------------------------
 # Container routing
 # ---------------------------------------------------------------------------
 
@@ -166,24 +227,51 @@ def _needs_llama_cpp(path: Path) -> bool:
     return any(path.glob("*.gguf"))
 
 
-def _launch_container(target: _EvalTarget, suite_abs: Path, *, json_mode: bool) -> None:
+def _launch_container(
+    target: _EvalTarget,
+    suite_paths: list[Path],
+    *,
+    quant: str | None,
+    batch_size: int,
+) -> dict[str, Any]:
     """Re-run this eval inside the NGC container with ``--in-container``.
 
-    Identity mounts (``host == container``) for the target's and the suite's parent
-    dirs make the host-absolute paths in *sloth_args* resolve unchanged inside the
-    container; ``sorted`` keeps the docker argv deterministic. A ``--model`` run also
-    takes everything :func:`container.export_launch_kwargs` contributes (the
-    llama.cpp cache mount plus the ``HOME`` / ``UNSLOTH_LLAMA_TAG`` env), because a
-    GGUF directory is scored with ``llama-completion`` from that cache — exactly how
-    ``export.py`` sets up its own run.
+    Every resolved suite file is forwarded as its own ``--suite <abs path>`` flag
+    (a directory is already expanded to individual files by
+    :func:`_resolve_and_validate_suite` before this is called), matching the
+    in-container argv contract: ``eval --in-container --json --suite <p> [--suite
+    <p> ...] [--quant q] [--batch-size n]`` plus ``--adapter``/``--model``.
+    ``--json`` is always forwarded to the container (unconditionally, regardless
+    of the host's own ``--json`` flag) so the container always prints a
+    structured result line for :func:`~sloth.tune.container.launch` to parse and
+    return; the caller re-renders that dict for the host's own ``--json`` flag.
+
+    Identity mounts (``host == container``) for the target's and every suite file's
+    parent dirs make the host-absolute paths in *sloth_args* resolve unchanged
+    inside the container; ``sorted`` keeps the docker argv deterministic. A
+    ``--model`` run also takes everything :func:`container.export_launch_kwargs`
+    contributes (the llama.cpp cache mount plus the ``HOME`` / ``UNSLOTH_LLAMA_TAG``
+    env), because a GGUF directory is scored with ``llama-completion`` from that
+    cache — exactly how ``export.py`` sets up its own run.
+
+    Returns the dict :func:`~sloth.tune.container.launch` returns (the parsed
+    JSON result line the container printed); raises :class:`CliError` on any
+    container failure.
     """
     target_abs = target.path.resolve()
-    sloth_args = ["eval", target.flag, str(target_abs), "--suite", str(suite_abs)]
-    if json_mode:
-        sloth_args.append("--json")
+    suite_abs = [p.resolve() for p in suite_paths]
+    sloth_args = ["eval", target.flag, str(target_abs)]
+    for suite_file in suite_abs:
+        sloth_args += ["--suite", str(suite_file)]
+    if quant:
+        sloth_args += ["--quant", str(quant)]
+    sloth_args += ["--batch-size", str(batch_size)]
+    sloth_args.append("--json")
     sloth_args.append("--in-container")
 
-    own_mounts = [(str(p), str(p)) for p in sorted({target_abs.parent, suite_abs.parent})]
+    own_mounts = [
+        (str(p), str(p)) for p in sorted({target_abs.parent, *(s.parent for s in suite_abs)})
+    ]
     kwargs: dict[str, Any] = {
         "workdir": str(target_abs.parent),
         "checkout": str(_repo_root()),
@@ -197,7 +285,7 @@ def _launch_container(target: _EvalTarget, suite_abs: Path, *, json_mode: bool) 
     for key, value in supplied.items():
         if key != "extra_mounts":
             kwargs[key] = value
-    container.launch(sloth_args, **kwargs)
+    return container.launch(sloth_args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -205,10 +293,10 @@ def _launch_container(target: _EvalTarget, suite_abs: Path, *, json_mode: bool) 
 # ---------------------------------------------------------------------------
 
 
-def _render_text(target: _EvalTarget, suite: Path, summary: dict[str, Any]) -> str:
+def _render_text(target: _EvalTarget, suite_label: str, summary: dict[str, Any]) -> str:
     """Render the eval summary for stdout in text mode."""
     lines = [
-        f"eval suite: {suite}",
+        f"eval suite: {suite_label}",
         f"{target.kind + ':':<11} {target.path}",
     ]
     if target.flag == "--model":
@@ -223,6 +311,29 @@ def _render_text(target: _EvalTarget, suite: Path, summary: dict[str, Any]) -> s
         mark = "[ok]" if r["exact_match"] else "[fail]"
         lines.append(f"  {mark} #{r['index']} {r['task']!r}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# ML-seam call — bridges the CURRENT run_eval/run_eval_model signature and the
+# richer one t5 (a sibling task) is adding
+# ---------------------------------------------------------------------------
+
+
+def _call_eval_seam(
+    func: Any,
+    target_path: Path,
+    suite_paths: list[Path],
+    *,
+    quant: str | None,
+    batch_size: int,
+) -> dict[str, Any]:
+    """Call *func* (``run_eval`` or ``run_eval_model``) with the full suite contract.
+
+    Both seams accept ``suite_paths`` (every resolved file, scored per file and in
+    aggregate), ``quant`` (GGUF selector; ignored by the adapter path) and
+    ``batch_size`` as keyword arguments.
+    """
+    return func(str(target_path), suite_paths=suite_paths, quant=quant, batch_size=batch_size)
 
 
 # ---------------------------------------------------------------------------
@@ -252,8 +363,10 @@ def cmd_eval(args: argparse.Namespace) -> int | None:
     Parameters
     ----------
     args:
-        Parsed namespace with ``adapter``, ``model``, ``suite``, ``json``, and
-        ``in_container`` attributes.
+        Parsed namespace with ``adapter``, ``model``, ``suite`` (a list — one
+        entry per ``--suite`` flag; a bare string is also accepted for direct
+        callers), ``quant``, ``batch_size``, ``json``, and ``in_container``
+        attributes.
 
     Returns
     -------
@@ -262,42 +375,68 @@ def cmd_eval(args: argparse.Namespace) -> int | None:
     """
     json_mode = bool(getattr(args, "json", False))
     in_container = bool(getattr(args, "in_container", False))
+    quant = getattr(args, "quant", None)
+    _raw_batch_size = getattr(args, "batch_size", None)
+    batch_size = DEFAULT_BATCH_SIZE if _raw_batch_size is None else int(_raw_batch_size)
+
+    # --- validate --batch-size BEFORE suite validation or container launch ---
+    _validate_batch_size(batch_size)
 
     # --- resolve the target: exactly one of --adapter / --model --------------
     target = _resolve_target(args)
 
-    # --- validate suite file -------------------------------------------------
-    suite = Path(args.suite)
-    if not suite.is_file():
-        raise CliError(
-            code=EXIT_USER_ERROR,
-            message=f"suite file not found: {suite}",
-            remediation=(
-                "Pass an existing JSONL file with --suite <path>. "
-                "Each line must be a task-schema record: "
-                '{"task": "…", "input": "…", "expected_output": "…"}.'
-            ),
-        )
+    # --- resolve + validate the suite (file(s) or directory(ies)) -------------
+    # A directory is expanded to its sorted *.jsonl children and every file is
+    # task-schema-validated BEFORE any container launch — a malformed suite
+    # anywhere in a directory costs no docker/GPU spend (fails fast, names the
+    # file and line). ``args.suite`` is normally a list (argparse
+    # ``action="append"``); a bare string is accepted too so direct callers
+    # (and existing single-suite tests) keep working unchanged.
+    raw_suite = args.suite
+    if isinstance(raw_suite, str):
+        raw_suite = [raw_suite]
+    suite_paths = _resolve_and_validate_suite(list(raw_suite))
 
     # --- HOST PATH: route GPU/ML work through the NGC container --------------
     if not in_container:
-        _launch_container(target, suite.resolve(), json_mode=json_mode)
+        # launch() raises CliError on any container/docker failure and otherwise
+        # returns the parsed JSON result the container printed (the same summary
+        # dict the in-container branch below builds). Emit it through the HOST's
+        # own output contract so a host caller sees the same shape the
+        # in-container path would have printed.
+        summary = _launch_container(
+            target,
+            [p.resolve() for p in suite_paths],
+            quant=quant,
+            batch_size=batch_size,
+        )
+        if json_mode:
+            emit_result(summary, json_mode=True)
+        else:
+            emit_result(
+                _render_text(target, _render_suite_label(suite_paths), summary), json_mode=False
+            )
         return
 
     # --- IN-CONTAINER PATH: delegate to the ML seam -------------------------
     # Both seams lazy-import torch/transformers/peft inside their bodies; this
-    # module stays ML-free.
-    validate_dataset(suite, schema="task")  # fast pre-check before heavy ML load
+    # module stays ML-free. The suite was already task-schema-validated above.
     if target.flag == "--model":
-        summary: dict[str, Any] = run_eval_model(str(target.path), str(suite))
+        summary: dict[str, Any] = _call_eval_seam(
+            run_eval_model, target.path, suite_paths, quant=quant, batch_size=batch_size
+        )
     else:
-        summary = run_eval(str(target.path), str(suite))
+        summary = _call_eval_seam(
+            run_eval, target.path, suite_paths, quant=quant, batch_size=batch_size
+        )
 
     # --- emit results --------------------------------------------------------
     if json_mode:
         emit_result(summary, json_mode=True)
     else:
-        emit_result(_render_text(target, suite, summary), json_mode=False)
+        emit_result(
+            _render_text(target, _render_suite_label(suite_paths), summary), json_mode=False
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +464,31 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--suite",
         required=True,
-        help="Path to a task-schema JSONL eval suite.",
+        action="append",
+        metavar="PATH",
+        help=(
+            "Path to a task-schema JSONL eval suite, or a directory of them "
+            "(every *.jsonl child is scored). Repeatable: pass --suite more than "
+            "once to combine several files/directories."
+        ),
+    )
+    p.add_argument(
+        "--quant",
+        default=None,
+        metavar="NAME",
+        help=(
+            "When --model holds several GGUF files, the quant tag to score "
+            "(case-insensitive, e.g. q4_k_m); ignored for a single-GGUF or "
+            "non-GGUF --model directory, and for --adapter."
+        ),
+    )
+    p.add_argument(
+        "--batch-size",
+        dest="batch_size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        metavar="N",
+        help=f"Generation batch size for the eval loop (default: {DEFAULT_BATCH_SIZE}).",
     )
     p.add_argument("--json", action="store_true", help="Emit structured JSON.")
     p.add_argument(

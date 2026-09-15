@@ -599,7 +599,6 @@ def _sloth_args(
     calib: Path | None,
     calib_samples: int | None,
     keep_intermediate: bool,
-    json_mode: bool,
 ) -> list[str]:
     """Build the ``python -m sloth export …`` argv forwarded into the container.
 
@@ -625,8 +624,11 @@ def _sloth_args(
         args += ["--calib-samples", str(calib_samples)]
     if keep_intermediate:
         args.append("--keep-intermediate")
-    if json_mode:
-        args.append("--json")
+    # --json is always forwarded to the container (unconditionally, regardless of
+    # the host's own --json flag) so the container always prints a structured
+    # result line for container.launch() to parse and return; the host re-renders
+    # that dict according to its OWN --json flag.
+    args.append("--json")
     args.append("--in-container")
     return args
 
@@ -645,27 +647,48 @@ def _merge_mounts(
     return merged
 
 
+def _base_local_path(base: str | None) -> Path | None:
+    """Return the sanitized local directory *base* names, or ``None`` for a Hub id.
+
+    ``--base`` may be a Hub model id (``org/name``, left untouched — never mounted,
+    never sanitized) or a LOCAL directory. A value is treated as local when it is
+    syntactically a path (:func:`_looks_like_path` — absolute, or starting with
+    ``.``/``~``) or when it already exists on disk. Anything local is run through
+    :func:`_sanitize_path` so it is subject to the same allow-list as
+    ``--adapter``/``--output``/``--calib``.
+    """
+    if not base:
+        return None
+    if _looks_like_path(base) or Path(os.path.expanduser(base)).exists():
+        return _sanitize_path(base, "--base")
+    return None
+
+
 def _container_kwargs(
     container: Any,
     adapter: Path,
     output: Path,
     calib: Path | None,
     dataset: Path | None = None,
+    base: str | None = None,
 ) -> dict[str, Any]:
     """Return the keyword arguments shared by ``build_command`` and ``launch``.
 
-    Identity mounts (``host == container``) for the adapter, output and calibration
-    parents mirror ``eval.py``; ``sorted`` keeps the docker argv deterministic.
-    Anything :func:`container.export_launch_kwargs` contributes (the llama.cpp
-    cache mount and the ``HOME`` / ``UNSLOTH_LLAMA_TAG`` env, added by t8) is
-    merged in — the ``getattr`` fallback keeps this working against a container
-    module that does not have it yet.
+    Identity mounts (``host == container``) for the adapter, output, calibration
+    and (when local) base-model parents mirror ``eval.py``; ``sorted`` keeps the
+    docker argv deterministic. Anything :func:`container.export_launch_kwargs`
+    contributes (the llama.cpp cache mount and the ``HOME`` / ``UNSLOTH_LLAMA_TAG``
+    env, added by t8) is merged in — the ``getattr`` fallback keeps this working
+    against a container module that does not have it yet.
     """
     parents = {adapter.parent, output.parent}
     if calib is not None:
         parents.add(calib.parent)
     if dataset is not None:
         parents.add(dataset.parent)
+    base_path = _base_local_path(base)
+    if base_path is not None:
+        parents.add(base_path.parent)
     own_mounts = [(str(p), str(p)) for p in sorted(parents)]
 
     supplied = getattr(container, "export_launch_kwargs", lambda: {})() or {}
@@ -679,6 +702,13 @@ def _container_kwargs(
     for key, value in supplied.items():
         if key != "extra_mounts":
             kwargs[key] = value
+    # The in-container ``sloth export --in-container`` re-runs :func:`_sanitize_path`
+    # on the same absolute host paths, but there cwd is the workspace mount and
+    # ``HOME`` is the export home, so none of the default roots contain them. Forward
+    # the identity-mounted parents as the allow-list (deviation d2, follow-ups #22).
+    env = list(kwargs.get("env") or [])
+    env.append((ALLOWED_ROOTS_ENV, os.pathsep.join(str(p) for p in sorted(parents))))
+    kwargs["env"] = env
     return kwargs
 
 
@@ -750,12 +780,16 @@ class _ExportRequest:
             calib=self.calibration_source,
             calib_samples=self.calib_samples,
             keep_intermediate=self.keep_intermediate,
-            json_mode=self.json_mode,
         )
 
     def container_kwargs(self, container: Any) -> dict[str, Any]:
         return _container_kwargs(
-            container, self.adapter_abs, self.output_abs, self.calib, self.dataset_path
+            container,
+            self.adapter_abs,
+            self.output_abs,
+            self.calib,
+            self.dataset_path,
+            base=self.base,
         )
 
 
@@ -829,6 +863,24 @@ def _run_safetensors(req: _ExportRequest) -> None:
     )
 
 
+def _emit_export_summary(output: Path, fmt: str, result: dict[str, Any], json_mode: bool) -> None:
+    """Emit a container-produced export result via ``emit_result``, honouring *json_mode*.
+
+    Shared by :func:`_run_in_container` (the summary comes straight from
+    :func:`~sloth.tune._exporter.run_export`) and :func:`_run_host` (the same
+    shaped dict, but round-tripped through :func:`~sloth.tune.container.launch`,
+    which parses it back out of the container's own ``--json`` stdout) so both
+    lanes print the same shape for the same result.
+    """
+    if json_mode:
+        emit_result(result, json_mode=True)
+        return
+    files = result.get("files") or {}
+    lines = [f"exported {fmt} model to {output}"]
+    lines += [f"  {name}: {size} bytes" for name, size in sorted(files.items())]
+    emit_result("\n".join(lines), json_mode=False)
+
+
 def _run_in_container(req: _ExportRequest) -> None:
     """The ML seam (lazy import; never reached on the host)."""
     from sloth.tune._exporter import run_export  # lazy: imports the heavy stack
@@ -850,13 +902,8 @@ def _run_in_container(req: _ExportRequest) -> None:
             "final_output": final_output,
         }
     )
-    if req.json_mode:
-        emit_result({"output": final_output, "format": req.fmt, **summary}, json_mode=True)
-        return
-    files = summary.get("files") or {}
-    lines = [f"exported {req.fmt} model to {req.output_abs}"]
-    lines += [f"  {name}: {size} bytes" for name, size in sorted(files.items())]
-    emit_result("\n".join(lines), json_mode=False)
+    result = {"output": final_output, "format": req.fmt, **summary}
+    _emit_export_summary(Path(final_output), req.fmt, result, req.json_mode)
 
 
 def _require_calibration_source(req: _ExportRequest) -> None:
@@ -895,28 +942,19 @@ def _run_host(req: _ExportRequest, force: bool) -> None:
     partial = req.partial
     _prepare_partial(partial)
 
-    # launch() raises CliError on any non-zero container exit; a non-zero return is
-    # treated the same way. Either way the staging dir is LEFT IN PLACE and <output>
-    # is never created, so a killed/OOM run cannot be mistaken for a finished export.
-    code = container.launch(req.sloth_args(), **req.container_kwargs(container))
-    if code:
-        raise CliError(
-            code=EXIT_ENV_ERROR,
-            message=(
-                f"the {req.fmt} export container exited with status {code}; "
-                f"the partial output was left at {partial}"
-            ),
-            remediation=(
-                "Review the container output above, then re-run the export "
-                f"(the staging directory {partial} is cleared automatically)."
-            ),
-        )
+    # launch() raises CliError on any non-zero container exit or docker-infrastructure
+    # failure (it never returns a non-zero int) — the staging dir is LEFT IN PLACE and
+    # <output> is never created in that case, so a killed/OOM run cannot be mistaken
+    # for a finished export. On success it returns the parsed JSON result the
+    # container printed (its own --json result — see _emit_export_summary).
+    result = container.launch(req.sloth_args(), **req.container_kwargs(container))
 
     if req.output_abs.exists():  # only reachable with --force (no-clobber checked above)
         shutil.rmtree(req.output_abs)
     req.output_abs.parent.mkdir(parents=True, exist_ok=True)
     partial.rename(req.output_abs)
     emit_diagnostic(f"export complete: {req.output_abs}")
+    _emit_export_summary(req.output_abs, req.fmt, result, req.json_mode)
 
 
 def cmd_export(args: argparse.Namespace) -> int:

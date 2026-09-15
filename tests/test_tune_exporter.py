@@ -25,6 +25,7 @@ the single ``_load_backend`` seam is monkeypatched with fakes, exactly as
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 import subprocess
 import sys
@@ -36,6 +37,8 @@ import pytest
 from sloth.cli._errors import CliError
 from sloth.tune import _exporter
 from sloth.tune._exporter import DEFAULT_GGUF_QUANT, _append_index, _find_gguf, run_export
+from tests.test_tune_trainer import _FakeEvalModel as _EvalModelStub
+from tests.test_tune_trainer import _FakeTokenizer as _TokenizerStub
 
 _REPO_ROOT = str(Path(__file__).parent.parent)
 _HEAVY = {"torch", "unsloth", "llmcompressor", "compressed_tensors", "transformers", "peft"}
@@ -690,3 +693,264 @@ def test_append_index_takes_a_lock_file(tmp_path):
         "gguf",
         "awq",
     ]
+
+
+# ---------------------------------------------------------------------------
+# 8. run_eval_model — quant selection, batched generation, per-file scoring
+# ---------------------------------------------------------------------------
+
+
+def _eval_suite(path: Path, rows: list[tuple[str, str, str]]) -> Path:
+    """Write a task-schema JSONL eval suite from ``(task, input, expected)`` rows."""
+    path.write_text(
+        "".join(
+            json.dumps({"task": t, "input": i, "expected_output": e}) + "\n" for t, i, e in rows
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _model_dir(tmp_path: Path, name: str = "exported", *, quantized: bool = True) -> Path:
+    directory = tmp_path / name
+    directory.mkdir()
+    config: dict = {"model_type": "lfm2"}
+    if quantized:
+        config["quantization_config"] = {
+            "quant_method": "compressed-tensors",
+            "format": "pack-quantized",
+        }
+    (directory / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    return directory
+
+
+def _eval_backend(tokenizer: _TokenizerStub, model: _EvalModelStub):
+    """An ``_EvalBackend`` wired to the shared fake tokenizer/model kit."""
+
+    class _NoGrad:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *exc):
+            return False
+
+    class _Loader:
+        @staticmethod
+        def from_pretrained(*a, **kw):
+            return model
+
+    class _TokLoader:
+        @staticmethod
+        def from_pretrained(*a, **kw):
+            return tokenizer
+
+    return _exporter._EvalBackend(
+        torch=SimpleNamespace(no_grad=_NoGrad, bfloat16="bfloat16"),
+        auto_model_for_causal_lm=_Loader(),
+        auto_tokenizer=_TokLoader(),
+    )
+
+
+class TestFindGgufQuant:
+    """``--quant`` disambiguates a multi-GGUF export directory."""
+
+    def _two_quants(self, tmp_path: Path) -> tuple[Path, Path]:
+        q4 = tmp_path / "Model-Q4_K_M.gguf"
+        q8 = tmp_path / "Model-Q8_0.gguf"
+        q4.write_bytes(b"GGUF")
+        q8.write_bytes(b"GGUF")
+        return q4, q8
+
+    def test_quant_selects_the_matching_file_case_insensitively(self, tmp_path: Path) -> None:
+        q4, _q8 = self._two_quants(tmp_path)
+        assert _find_gguf(tmp_path, "q4_k_m") == q4
+        assert _find_gguf(tmp_path, "Q4_K_M") == q4
+
+    def test_quant_can_select_the_other_file(self, tmp_path: Path) -> None:
+        _q4, q8 = self._two_quants(tmp_path)
+        assert _find_gguf(tmp_path, "q8_0") == q8
+
+    def test_missing_quant_is_a_user_error_listing_the_present_names(self, tmp_path: Path) -> None:
+        self._two_quants(tmp_path)
+        with pytest.raises(CliError) as exc_info:
+            _find_gguf(tmp_path, "q5_k_s")
+        err = exc_info.value
+        assert err.code == 1
+        assert "q5_k_s" in err.message
+        assert "Model-Q4_K_M.gguf" in err.remediation
+        assert "Model-Q8_0.gguf" in err.remediation
+
+    def test_no_quant_with_several_files_still_raises_the_existing_error(
+        self, tmp_path: Path
+    ) -> None:
+        self._two_quants(tmp_path)
+        with pytest.raises(CliError) as exc_info:
+            _find_gguf(tmp_path)
+        assert exc_info.value.code == 1
+        assert "several GGUF files" in exc_info.value.message
+        assert "--model" in exc_info.value.remediation
+
+    def test_quant_is_ignored_for_a_single_gguf_directory(self, tmp_path: Path) -> None:
+        only = tmp_path / "Model-Q8_0.gguf"
+        only.write_bytes(b"GGUF")
+        assert _find_gguf(tmp_path, "q4_k_m") == only
+
+
+class TestRunEvalModel:
+    """The ``--model`` seam reports the same per-file + aggregate shape as ``--adapter``."""
+
+    def test_signature_accepts_the_cli_keywords(self) -> None:
+        params = inspect.signature(_exporter.run_eval_model).parameters
+        assert "suite_paths" in params
+        assert "quant" in params
+        assert "batch_size" in params
+        assert list(params)[0] == "model_dir"
+
+    def test_per_file_entries_aggregate_and_eval_json(self, tmp_path: Path, monkeypatch) -> None:
+        directory = _model_dir(tmp_path)
+        good = _eval_suite(tmp_path / "good.jsonl", [("reverse", "abc", "cba")])
+        bad = _eval_suite(tmp_path / "bad.jsonl", [("reverse", "xyz", "nope")])
+        tokenizer = _TokenizerStub(pad_token="<pad>")
+        model = _EvalModelStub(tokenizer, {"abc": "cba", "xyz": "zyx"})
+        monkeypatch.setattr(
+            _exporter, "_load_eval_backend", lambda: _eval_backend(tokenizer, model)
+        )
+
+        summary = _exporter.run_eval_model(str(directory), suite_paths=[good, bad])
+
+        assert [f["path"] for f in summary["files"]] == [str(good), str(bad)]
+        assert summary["files"][0]["exact_match"] == 1
+        assert summary["files"][1]["exact_match"] == 0
+        assert summary["total"] == 2
+        assert summary["exact_match_pct"] == 50.0
+        assert summary["f1"] == 0.5
+        assert summary["model_dir"] == str(directory)
+        assert summary["quant_method"] == "compressed-tensors"
+        assert summary["quant_format"] == "pack-quantized"
+
+        written = json.loads((directory / "eval.json").read_text(encoding="utf-8"))
+        assert written["target"] == "model"
+        assert written["suite_paths"] == [str(good), str(bad)]
+        assert written["written_at"].startswith("20")
+        assert written["quant_method"] == "compressed-tensors"
+        for key, value in summary.items():
+            assert written[key] == value
+
+    def test_eval_json_is_overwritten_on_re_run(self, tmp_path: Path, monkeypatch) -> None:
+        directory = _model_dir(tmp_path)
+        suite = _eval_suite(tmp_path / "s.jsonl", [("reverse", "abc", "cba")])
+        tokenizer = _TokenizerStub(pad_token="<pad>")
+        model = _EvalModelStub(tokenizer, {"abc": "cba"})
+        monkeypatch.setattr(
+            _exporter, "_load_eval_backend", lambda: _eval_backend(tokenizer, model)
+        )
+        _exporter.run_eval_model(str(directory), suite_paths=[suite])
+        bigger = _eval_suite(
+            tmp_path / "two.jsonl", [("reverse", "abc", "cba"), ("reverse", "abc", "cba")]
+        )
+        _exporter.run_eval_model(str(directory), suite_paths=[bigger])
+
+        written = json.loads((directory / "eval.json").read_text(encoding="utf-8"))
+        assert written["suite_paths"] == [str(bigger)]
+        assert written["total"] == 2
+
+    def test_batched_predictions_exclude_their_own_prompt(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Three prompts of different lengths in one left-padded batch."""
+        directory = _model_dir(tmp_path)
+        suite = _eval_suite(
+            tmp_path / "s.jsonl",
+            [
+                ("reverse", "abc", "cba"),
+                ("reverse", "a much longer input here", "erehtupni"),
+                ("reverse", "mid length input", "tupnidim"),
+            ],
+        )
+        tokenizer = _TokenizerStub(pad_token="<pad>")
+        model = _EvalModelStub(
+            tokenizer,
+            {
+                "abc": "cba",
+                "a much longer input here": "erehtupni",
+                "mid length input": "tupnidim",
+            },
+        )
+        monkeypatch.setattr(
+            _exporter, "_load_eval_backend", lambda: _eval_backend(tokenizer, model)
+        )
+
+        summary = _exporter.run_eval_model(str(directory), suite_paths=[suite], batch_size=8)
+
+        assert model.batch_widths == [3]
+        assert tokenizer.padding_side == "left"
+        assert [r["prediction"] for r in summary["results"]] == [
+            "cba",
+            "erehtupni",
+            "tupnidim",
+        ]
+        for entry in summary["results"]:
+            prompt = f"Task: {entry['task']}\nInput: {entry['input']}\nOutput:"
+            assert not entry["prediction"].startswith(prompt)
+        assert summary["exact_match"] == 3
+
+    def test_gguf_quant_selection_picks_the_scored_file(self, tmp_path: Path, monkeypatch) -> None:
+        directory = _model_dir(tmp_path, "gguf-out", quantized=False)
+        (directory / "Model-Q4_K_M.gguf").write_bytes(b"GGUF")
+        (directory / "Model-Q8_0.gguf").write_bytes(b"GGUF")
+        suite = _eval_suite(tmp_path / "s.jsonl", [("reverse", "abc", "cba")])
+        seen: list[str] = []
+
+        def _fake_completion(gguf: Path, prompt: str, max_tokens: int) -> str:
+            seen.append(str(gguf))
+            return "cba"
+
+        monkeypatch.setattr(_exporter, "_run_llama_completion", _fake_completion)
+        summary = _exporter.run_eval_model(str(directory), suite_paths=[suite], quant="q8_0")
+
+        assert [Path(s).name for s in seen] == ["Model-Q8_0.gguf"]
+        assert summary["exact_match"] == 1
+        assert summary["f1"] == 1.0
+
+    def test_direct_gguf_file_writes_eval_json_next_to_the_file(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """``--model <file>.gguf`` (the supported direct-file form) must still persist
+        ``eval.json`` — next to the file, i.e. inside its *parent* directory, since a
+        file itself cannot hold a child ``eval.json``. ``model_dir`` in the returned
+        summary reports that same parent, matching what ``sloth summarize`` looks for.
+        """
+        directory = tmp_path / "gguf-file-out"
+        directory.mkdir()
+        gguf_file = directory / "Model-Q4_K_M.gguf"
+        gguf_file.write_bytes(b"GGUF")
+        suite = _eval_suite(tmp_path / "s.jsonl", [("reverse", "abc", "cba")])
+        monkeypatch.setattr(
+            _exporter, "_run_llama_completion", lambda gguf, prompt, max_tokens: "cba"
+        )
+
+        summary = _exporter.run_eval_model(str(gguf_file), suite_paths=[suite])
+
+        assert summary["model_dir"] == str(directory)
+        assert (directory / "eval.json").exists()
+        written = json.loads((directory / "eval.json").read_text(encoding="utf-8"))
+        assert written["target"] == "model"
+        assert written["total"] == 1
+
+    def test_directory_form_still_writes_eval_json_inside_the_directory(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Companion to the direct-file test above: the historical directory form's
+        ``model_dir``/``eval.json`` placement is unchanged.
+        """
+        directory = _model_dir(tmp_path, "gguf-dir-out", quantized=False)
+        (directory / "Model-Q4_K_M.gguf").write_bytes(b"GGUF")
+        suite = _eval_suite(tmp_path / "s.jsonl", [("reverse", "abc", "cba")])
+        monkeypatch.setattr(
+            _exporter, "_run_llama_completion", lambda gguf, prompt, max_tokens: "cba"
+        )
+
+        summary = _exporter.run_eval_model(str(directory), suite_paths=[suite])
+
+        assert summary["model_dir"] == str(directory)
+        assert (directory / "eval.json").exists()

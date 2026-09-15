@@ -32,7 +32,7 @@ import sloth.cli._commands.validate as validate_mod
 from sloth.cli._commands.validate import cmd_validate, register
 from sloth.cli._errors import CliError
 from sloth.cli._output import emit_error
-from sloth.tune.datasets import validate_dataset
+from sloth.tune.datasets import validate_dataset, validate_suite
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -47,14 +47,16 @@ _VALID_TASK = '{"task": "reverse", "input": "abc", "expected_output": "cba"}\n'
 
 
 def _make_args(
-    dataset: Path,
+    dataset: Path | None = None,
     *,
+    suite: Path | str | None = None,
     schema: str | None = None,
     json_mode: bool = False,
 ) -> argparse.Namespace:
     """Build the Namespace argparse would produce for ``sloth validate``."""
     return argparse.Namespace(
-        dataset=str(dataset),
+        dataset=str(dataset) if dataset is not None else None,
+        suite=str(suite) if suite is not None else None,
         schema=schema,
         json=json_mode,
     )
@@ -66,12 +68,12 @@ def _write_dataset(tmp_path: Path, body: str, name: str = "data.jsonl") -> Path:
     return f
 
 
-@pytest.fixture()
+@pytest.fixture
 def valid_chat_dataset(tmp_path: Path) -> Path:
     return _write_dataset(tmp_path, _VALID_CHAT, name="chat.jsonl")
 
 
-@pytest.fixture()
+@pytest.fixture
 def valid_task_dataset(tmp_path: Path) -> Path:
     return _write_dataset(tmp_path, _VALID_TASK, name="task.jsonl")
 
@@ -299,7 +301,7 @@ def test_calls_shared_validate_dataset(
 
 
 def test_register_adds_validate_subparser(tmp_path: Path) -> None:
-    """register() adds a ``validate`` subparser with --dataset/--schema/--json."""
+    """register() adds a ``validate`` subparser with --dataset/--suite/--schema/--json."""
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command")
     register(sub)
@@ -307,6 +309,7 @@ def test_register_adds_validate_subparser(tmp_path: Path) -> None:
     args = parser.parse_args(["validate", "--dataset", ds])
     assert args.command == "validate"
     assert args.dataset == ds
+    assert args.suite is None
     assert args.schema is None
     assert args.json is False
     assert callable(args.func)
@@ -335,13 +338,34 @@ def test_register_json_flag(tmp_path: Path) -> None:
     assert args.json is True
 
 
-def test_register_dataset_required() -> None:
-    """--dataset is a required flag."""
+def test_register_neither_dataset_nor_suite_parses_but_handler_rejects() -> None:
+    """Neither --dataset nor --suite is enforced by argparse (checked in code,
+    like eval.py's --adapter/--model, so direct callers get the same contract);
+    parsing succeeds with both None, and cmd_validate raises CliError(code=1)."""
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command")
     register(sub)
-    with pytest.raises(SystemExit):
-        parser.parse_args(["validate"])
+    args = parser.parse_args(["validate"])
+    assert args.dataset is None
+    assert args.suite is None
+    with pytest.raises(CliError) as exc_info:
+        cmd_validate(args)
+    assert exc_info.value.code == 1
+    assert exc_info.value.remediation
+
+
+def test_dataset_and_suite_are_mutually_exclusive(tmp_path: Path) -> None:
+    """Passing both --dataset and --suite is a user error (exit 1 + hint)."""
+    ds = tmp_path / "data.jsonl"
+    ds.write_text('{"messages": [{"role": "user", "content": "hi"}]}\n', encoding="utf-8")
+    args = _make_args(dataset=ds, suite=str(tmp_path))
+    with pytest.raises(CliError) as exc_info:
+        cmd_validate(args)
+    err = exc_info.value
+    assert err.code == 1
+    assert "--dataset" in err.message
+    assert "--suite" in err.message
+    assert err.remediation
 
 
 # ---------------------------------------------------------------------------
@@ -372,3 +396,175 @@ def test_main_validate_unknown_command_would_have_caught_missing_registration(
     with pytest.raises(SystemExit) as exc:
         main(["totally-bogus-verb"])
     assert exc.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# t4 — --suite (single file or directory), via the shared validate_suite()
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def suite_file(tmp_path: Path) -> Path:
+    """A single valid task-schema suite file."""
+    f = tmp_path / "suite.jsonl"
+    f.write_text(
+        '{"task": "reverse", "input": "abc", "expected_output": "cba"}\n'
+        '{"task": "upper", "input": "hello", "expected_output": "HELLO"}\n',
+        encoding="utf-8",
+    )
+    return f
+
+
+@pytest.fixture
+def suite_dir(tmp_path: Path) -> Path:
+    """A suite directory with two valid task-schema files."""
+    d = tmp_path / "suite_dir"
+    d.mkdir()
+    (d / "a.jsonl").write_text(
+        '{"task": "reverse", "input": "abc", "expected_output": "cba"}\n',
+        encoding="utf-8",
+    )
+    (d / "b.jsonl").write_text(
+        '{"task": "x", "input": "1", "expected_output": "1"}\n'
+        '{"task": "y", "input": "2", "expected_output": "2"}\n',
+        encoding="utf-8",
+    )
+    return d
+
+
+def test_suite_single_file_valid_json_shape(
+    suite_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--suite <file> emits {valid, schema, files, total_records}."""
+    rc = cmd_validate(_make_args(suite=suite_file, json_mode=True))
+    assert rc in (None, 0)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["valid"] is True
+    assert payload["schema"] == "task"
+    assert payload["total_records"] == 2
+    assert payload["files"] == [{"path": str(suite_file), "line_count": 2}]
+
+
+def test_suite_directory_reports_per_file_counts(
+    suite_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--suite <dir> reports one entry per *.jsonl file plus the aggregate total."""
+    rc = cmd_validate(_make_args(suite=suite_dir, json_mode=True))
+    assert rc in (None, 0)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["valid"] is True
+    assert payload["total_records"] == 3
+    files_by_name = {Path(f["path"]).name: f["line_count"] for f in payload["files"]}
+    assert files_by_name == {"a.jsonl": 1, "b.jsonl": 2}
+
+
+def test_suite_text_mode_lists_each_file(
+    suite_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Text mode names the suite, each file's count, and the aggregate total."""
+    rc = cmd_validate(_make_args(suite=suite_dir))
+    assert rc in (None, 0)
+    out = capsys.readouterr().out
+    assert "a.jsonl" in out
+    assert "b.jsonl" in out
+    assert "3 records" in out
+    assert "valid" in out.lower()
+
+
+def test_suite_directory_with_malformed_file_names_file_and_line(tmp_path: Path) -> None:
+    """A malformed file inside --suite <dir> raises CliError naming file + line —
+    the exact same rule sloth eval's pre-launch check enforces."""
+    d = tmp_path / "suite_bad"
+    d.mkdir()
+    (d / "a.jsonl").write_text(
+        '{"task": "ok", "input": "x", "expected_output": "y"}\n', encoding="utf-8"
+    )
+    (d / "z_bad.jsonl").write_text("not valid json\n", encoding="utf-8")
+
+    args = _make_args(suite=d)
+    with pytest.raises(CliError) as exc_info:
+        cmd_validate(args)
+    err = exc_info.value
+    assert err.code == 1
+    assert "z_bad.jsonl" in err.message
+    assert "line 1" in err.message
+
+
+def test_suite_missing_path_raises_cli_error(tmp_path: Path) -> None:
+    """A --suite path that does not exist raises CliError(code=1)."""
+    args = _make_args(suite=tmp_path / "nope")
+    with pytest.raises(CliError) as exc_info:
+        cmd_validate(args)
+    assert exc_info.value.code == 1
+
+
+def test_suite_empty_directory_raises_cli_error(tmp_path: Path) -> None:
+    """A --suite directory with no *.jsonl files raises CliError(code=1)."""
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    args = _make_args(suite=empty)
+    with pytest.raises(CliError) as exc_info:
+        cmd_validate(args)
+    assert exc_info.value.code == 1
+
+
+def test_suite_uses_same_validate_suite_function_as_eval(
+    suite_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cmd_validate --suite calls the SAME validate_suite() that sloth eval's
+    host-side pre-launch check uses — no duplicated rules."""
+    calls: list[tuple[str, str]] = []
+
+    def _spy(path: object, schema: str = "task") -> dict[str, object]:
+        calls.append((str(path), schema))
+        return validate_suite(path, schema)
+
+    monkeypatch.setattr(validate_mod, "validate_suite", _spy)
+    rc = cmd_validate(_make_args(suite=suite_dir))
+    assert rc in (None, 0)
+    assert calls == [(str(suite_dir), "task")]
+
+
+def test_suite_with_non_task_schema_raises_cli_error(tmp_path: Path) -> None:
+    """qodo: a --suite validated against a non-task --schema must NOT be
+    reported valid — sloth eval always enforces the task schema for suites,
+    so a chat-schema file that "passes" here with --schema chat would fail
+    sloth eval anyway. --suite always validates against task; an explicit
+    non-task --schema is a user error."""
+    chat_suite = tmp_path / "chat_suite.jsonl"
+    chat_suite.write_text('{"messages": [{"role": "user", "content": "hi"}]}\n', encoding="utf-8")
+    args = _make_args(suite=chat_suite, schema="chat", json_mode=True)
+    with pytest.raises(CliError) as exc_info:
+        cmd_validate(args)
+    err = exc_info.value
+    assert err.code == 1
+    assert err.remediation
+
+
+def test_suite_with_explicit_task_schema_is_accepted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--suite --schema task (the suite default, passed explicitly) still works."""
+    task_suite = tmp_path / "task_suite.jsonl"
+    task_suite.write_text(
+        '{"task": "reverse", "input": "abc", "expected_output": "cba"}\n', encoding="utf-8"
+    )
+    rc = cmd_validate(_make_args(suite=task_suite, schema="task", json_mode=True))
+    assert rc in (None, 0)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema"] == "task"
+    assert payload["total_records"] == 1
+
+
+def test_register_suite_flag(tmp_path: Path) -> None:
+    """--suite parses and defaults to None; --dataset is no longer required."""
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command")
+    register(sub)
+    suite_path = str(tmp_path / "suite_dir")
+    args = parser.parse_args(["validate", "--suite", suite_path])
+    assert args.suite == suite_path
+    assert args.dataset is None
+
+    args2 = parser.parse_args(["validate", "--suite", suite_path, "--json"])
+    assert args2.json is True

@@ -45,6 +45,18 @@ adapter, runs each **task-schema** item through `generate()`, and reports
 exact-match. Fully local — no network. Returns
 `{total, exact_match, exact_match_pct, results}`.
 
+**Starter suite:** [`examples/eval/`](../examples/eval/) holds the starter eval
+suite — three task-schema JSONL files (`cli-contract.jsonl`,
+`agentculture-terms.jsonl`, `task-format.jsonl`, ~40+ items total) covering the
+CLI output contract, AgentCulture sibling/naming terminology, and short
+instruction-following items (rewrite/extract/classify). Each line is
+`{"task", "input", "expected_output"}` with a short, one-sentence-or-shorter
+`expected_output` so exact-match has a chance. [`examples/eval-suite.jsonl`](../examples/eval-suite.jsonl)
+remains the original 4-item smoke suite for quick sanity checks. To add a new
+domain, drop another `<domain>.jsonl` file into `examples/eval/` with the same
+three-key schema and validate it with
+`sloth validate --dataset examples/eval/<domain>.jsonl --schema task`.
+
 ### `sloth export --adapter DIR --output OUT`
 
 Exports a trained adapter to one of **six formats** (`--format FMT`, default
@@ -151,13 +163,15 @@ Ready-to-run configs: [`examples/qlora-smoke.toml`](../examples/qlora-smoke.toml
 ## Deployment targets
 
 Target formats per deployment platform. Coverage is honest — see
-[`tested.md`](tested.md): the only formats live-tested on hardware so far are
-QLoRA bnb-4bit and bf16 LoRA on Qwen3-1.7B on GB10/Spark (2026-06-26).
+[`tested.md`](tested.md): the formats live-tested on hardware so far are QLoRA
+bnb-4bit and bf16 LoRA on Qwen3-1.7B on GB10/Spark (2026-06-26), plus LFM2.5-1.2B
+`awq`/`nvfp4` **serving** (not training) on Thor (JetPack R38.2.2,
+follow-ups #22, 2026-09-15).
 
 | Platform | Target format(s) | Live-tested |
 |----------|------------------|-------------|
-| Orin | `gguf`, `awq W4A16` | not yet — an explicit gap in [`tested.md`](tested.md) |
-| Thor | `nvfp4` | not yet — an explicit gap in [`tested.md`](tested.md) |
+| Orin | `gguf`, `awq W4A16` | not yet — tracked in [#23](https://github.com/agentculture/unsloth-cli/issues/23) (needs lobes down on the Spark) |
+| Thor | `nvfp4`, `awq W4A16` | **2026-09-15**: LFM2.5-1.2B `nvfp4` and `awq` exports load and generate with `vllm/vllm-openai:v0.29.0-aarch64` on JetPack R38.2.2 (follow-ups #22, [`tested.md`](tested.md)) |
 | Spark | `nvfp4`; `bf16 + LoRA via lobes hand` | `bf16` LoRA on Qwen3-1.7B (2026-06-26, [`tested.md`](tested.md)) |
 
 Every target format above is produced by `sloth export --format <fmt>` (see

@@ -1,0 +1,65 @@
+{
+  "plan_slug": "lfm2-5-delivery-follow-ups-22",
+  "schema_version": 2,
+  "created": "2026-09-15T16:51:55Z",
+  "updated": "2026-09-15T18:34:41Z",
+  "deviations": [
+    {
+      "id": "d1",
+      "what": "t5 slices each prediction at the shared padded prompt width (derived per row from attention_mask: pad_len + real_len), not at the row's own token count as the t5 instruction said; under left padding the instruction's literal reading would have kept pads + prompt in every short row and failed the acceptance criterion 'each prediction excludes its own prompt'. Also deleted _exporter._continuation/_eval_prompt/_score_predictions (named as owned symbols) because their logic moved into _trainer/metrics and nothing else referenced them.",
+      "task_ref": "t5",
+      "reason": "plan instruction contained a wrong offset rule; acceptance criteria are the contract and are met (3 load-bearing tests)",
+      "affects": [
+        "c36"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "classification": "acceptable",
+      "seq": 1
+    },
+    {
+      "id": "d2",
+      "what": "Live t9 run found that sloth export's --adapter/--output/--calib path sanitizer (_sanitize_path, export.py:246-273, landed in the #20 squash after its live validation) also runs INSIDE the container, where cwd is /workspace and HOME is the export home, so every real export exits 1 with 'path is outside the allowed roots' for the identity-mounted host path. Every export on main is broken. Proposed fix (not in any plan task): _container_kwargs forwards SLOTH_ALLOWED_ROOTS into the container env, set to the identity-mounted parents (adapter, output, calib, dataset), plus a unit test asserting the env reaches the docker argv and a fake in-container request under /workspace passes the sanitizer.",
+      "task_ref": "t9",
+      "reason": "blocking: t9's export rows (c10, c12, c21) cannot run until real exports work again",
+      "affects": [
+        "c10",
+        "c12",
+        "c21"
+      ],
+      "origin": "llm",
+      "status": "approved",
+      "classification": "needs-follow-up",
+      "seq": 2
+    },
+    {
+      "id": "d3",
+      "what": "t9's docs/tested.md rows were committed on the same integration branch as the PR-A code (feat/follow-ups-22-a) instead of being held for PR B; PR A therefore ships with its own live evidence, and PR B carries t10 (benchmarks, Thor) + t11 (closeout) only.",
+      "task_ref": "t11",
+      "reason": "the live rows are the proof that PR A's stdout/export changes work; splitting them off would ship PR A unverified",
+      "affects": [
+        "c4"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "classification": "acceptable",
+      "seq": 3
+    },
+    {
+      "id": "d4",
+      "what": "qodo #2 on PR #25: t1's fail-closed CliError embedded the last 20 container lines in the message, which renders as ~22 lines and breaks the repo's two-line error:/hint: text contract (rubric). Fix: single-line message stating how many lines were captured and that they are on stderr (the tee already put them there); honesty condition h36's literal 'message contains the 40th line' is replaced by 'stderr contains the 40th line and the message is one line'.",
+      "task_ref": "t1",
+      "reason": "the rubric's two-line error contract outranks the literal h36 wording; the diagnostic content is preserved on stderr",
+      "affects": [
+        "h36"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "classification": "acceptable",
+      "seq": 3
+    }
+  ],
+  "evidence": [],
+  "deltas": [],
+  "supersessions": []
+}

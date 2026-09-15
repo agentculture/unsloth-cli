@@ -26,10 +26,12 @@ buildable/deployable package baseline. Clone it, rename the package, edit
 - `unsloth-cli overview` — descriptive snapshot of the agent.
 - `unsloth-cli doctor` — check the agent-identity invariants.
 - `unsloth-cli cli overview` — describe the CLI surface.
-- `unsloth-cli validate` — validate a JSONL dataset file standalone.
+- `unsloth-cli validate` — validate a JSONL dataset file, or an eval suite
+  (file or directory), standalone.
 - `unsloth-cli config init` — write a starting `run.toml` with validated defaults.
 - `unsloth-cli train` — validate a dataset and run/plan a LoRA/QLoRA adapter job.
-- `unsloth-cli eval` — score an adapter against a local task-schema eval suite.
+- `unsloth-cli eval` — score an adapter against a local task-schema eval suite
+  (a file or a directory of them).
 - `unsloth-cli export` — export an adapter to a PEFT/safetensors layout.
 - `unsloth-cli runs list` / `runs show <run_id>` — enumerate/inspect past runs
   from the run registry (`<runs-root>/runs.jsonl`) — no directory walking.
@@ -129,35 +131,62 @@ itself (distinct from the global `overview`, which describes the agent).
 _VALIDATE = """\
 # unsloth-cli validate
 
-Validate a JSONL dataset file standalone — without loading a `run.toml` or
-running `sloth train`. Calls the *same*
-`sloth.tune.datasets.validate_dataset` function that `sloth train` uses
-internally, so the accepted rules never drift between the two verbs.
+Validate a JSONL dataset file or eval suite standalone — without loading a
+`run.toml`, running `sloth train`, or launching a container. Exactly one of
+`--dataset` / `--suite` is required (both/neither exits `1` with a `hint:`,
+the same pattern `sloth eval`'s `--adapter`/`--model` uses):
 
-The dataset schema is inferred from the first record when `--schema` is
-omitted: `chat` (`{"messages": [{role, content}, ...]}`) or `task`
-(`{"task", "input", "expected_output"}`); the auto-detected schema is echoed
-to stderr as a diagnostic. This module is pure stdlib — no torch/unsloth
-import, so it stays usable on a machine with no GPU stack installed.
+- `--dataset PATH` calls the *same* `sloth.tune.datasets.validate_dataset`
+  function that `sloth train` uses internally, so the accepted rules never
+  drift between the two verbs. The schema is inferred from the first record
+  when `--schema` is omitted: `chat` (`{"messages": [{role, content}, ...]}`)
+  or `task` (`{"task", "input", "expected_output"}`); the auto-detected schema
+  is echoed to stderr as a diagnostic.
+- `--suite PATH` calls the *same* `sloth.tune.datasets.validate_suite`
+  function that `sloth eval` uses for its pre-launch check, so a suite that
+  passes here is guaranteed to pass `sloth eval`'s host-side validation too.
+  `PATH` may be a single `.jsonl` file or a directory — a directory is
+  expanded to its sorted `*.jsonl` children and every one is validated
+  **always against the task schema** (eval suites are task-schema only, the
+  same rule `sloth eval` enforces), reporting a per-file record count plus
+  the aggregate total. Passing an explicit `--schema` other than `task`
+  together with `--suite` exits `1` with a `hint:` — it would otherwise
+  report a suite as valid against a schema `sloth eval` will not accept.
+
+This module is pure stdlib — no torch/unsloth import, so it stays usable on a
+machine with no GPU stack installed.
 
 ## Usage
 
     unsloth-cli validate --dataset data/train.jsonl
     unsloth-cli validate --dataset data/train.jsonl --schema task
     unsloth-cli validate --dataset data/train.jsonl --json
+    unsloth-cli validate --suite data/eval.jsonl
+    unsloth-cli validate --suite examples/eval/ --json
 
 ## Key flags
 
-- `--dataset PATH` (required) — path to the JSONL dataset file.
-- `--schema {chat,task}` — schema to validate against (default: auto-detect
-  from the first record).
-- `--json` — emit `{valid, schema, line_count}` as structured JSON to stdout.
+- `--dataset PATH` — path to a JSONL training dataset file. Mutually
+  exclusive with `--suite`.
+- `--suite PATH` — path to a task-schema JSONL eval suite, or a directory of
+  them (every `*.jsonl` child is validated). Mutually exclusive with
+  `--dataset`.
+- `--schema {chat,task}` — schema to validate against. With `--dataset`:
+  default auto-detect from the first record. With `--suite`: always `task`
+  (eval suites are task-schema only); passing `--schema chat` (or any value
+  other than `task`) together with `--suite` exits `1` with a `hint:`.
+- `--json` — emit the result as structured JSON: `{valid, schema, line_count}`
+  for `--dataset`, or `{valid, schema, files, total_records}` for `--suite`
+  (`files` is a list of `{path, line_count}`, one per resolved file).
 
 ## Exit codes
 
-- `0` success — dataset is valid.
-- `1` user-input error — missing file, invalid JSON, or a record that fails
-  schema validation (the validator's own `CliError` propagates verbatim).
+- `0` success — dataset/suite is valid.
+- `1` user-input error — missing file, invalid JSON, a record that fails
+  schema validation (the validator's own `CliError` propagates verbatim,
+  naming the file and line for a `--suite` directory), an empty `--suite`
+  directory, an explicit non-`task` `--schema` passed with `--suite`, or
+  both/neither of `--dataset`/`--suite` passed.
 - `2` environment error — the dataset file exists but cannot be opened
   (e.g. a permission error).
 """
@@ -250,11 +279,22 @@ inference is local and offline (`local_files_only=True`); the heavy ML stack is
 imported lazily inside the inference backend, so importing the verb stays
 torch-free.
 
-The suite is a JSONL file whose records conform to the **task** schema
-(`{"task", "input", "expected_output"}`), validated before inference. Each
-record's prediction is compared to its `expected_output` for an exact match, and
-a summary (`total`, `exact_match`, `exact_match_pct`) plus per-record results is
-emitted.
+The suite is one or more JSONL files whose records conform to the **task**
+schema (`{"task", "input", "expected_output"}`). `--suite` accepts a single file
+or a directory — a directory is expanded to its sorted `*.jsonl` children — and
+is repeatable (`--suite a.jsonl --suite dir/`). Every resolved file is validated
+against the task schema **before any container is launched**: a malformed file
+anywhere in a `--suite` directory exits `1` naming the file and line, and costs
+no docker/GPU spend. `--batch-size` is validated on the host too — a value
+below `1` exits `1` before the suite is even checked. Each record's prediction
+is compared to its `expected_output` for an exact match and scored with a
+stdlib token-level F1 (`f1`, no external scoring dependency). The result is an
+aggregate summary (`total`, `exact_match`, `exact_match_pct`, `f1`) at the top
+level, plus a per-file `files` list (the same fields, scoped to each resolved
+suite file) and per-record `results`. `eval.json` (the summary plus
+`suite_paths` / `target` / `written_at`) is written into the directory that
+was evaluated: the adapter directory for `--adapter`, or the export directory
+for `--model` — the parent directory when a single `.gguf` file is passed.
 
 ## Two targets: `--adapter` or `--model`
 
@@ -274,22 +314,34 @@ for a plain bf16 merged directory or a GGUF).
 ## Usage
 
     unsloth-cli eval --adapter adapters/qwen3-4b-qlora --suite data/eval.jsonl
-    unsloth-cli eval --model exports/qwen3-4b-awq --suite data/eval.jsonl
-    unsloth-cli eval --model exports/qwen3-4b-gguf --suite data/eval.jsonl --json
+    unsloth-cli eval --model exports/qwen3-4b-awq --suite examples/eval/
+    unsloth-cli eval --model exports/qwen3-4b-gguf --suite data/eval.jsonl --quant q4_k_m
+    unsloth-cli eval --adapter adapters/qwen3-4b-qlora --suite examples/eval/ \\
+        --batch-size 16 --json
 
 ## Key flags
 
 - `--adapter DIR` — adapter directory produced by `unsloth-cli train`.
 - `--model DIR` — merged / quantized / GGUF directory produced by
   `unsloth-cli export` (mutually exclusive with `--adapter`).
-- `--suite PATH` (required) — task-schema JSONL eval suite.
+- `--suite PATH` (required, repeatable) — a task-schema JSONL eval suite file,
+  or a directory of them (every `*.jsonl` child is scored, sorted). Pass
+  `--suite` more than once to combine several files/directories.
+- `--quant NAME` — when `--model` holds several GGUF files, the quant tag to
+  score (case-insensitive, e.g. `q4_k_m`); ignored for a single-GGUF or
+  non-GGUF `--model` directory, and for `--adapter`.
+- `--batch-size N` — generation batch size for the eval loop (default: `8`);
+  must be `>= 1` (`1` is the explicit unbatched mode) or the run exits `1`
+  before any suite validation or container launch.
 - `--json` — emit the scored summary and per-record results as structured JSON.
 
 ## Exit codes
 
 - `0` success
 - `1` user-input error (both/neither target, missing adapter or model dir,
-  missing/malformed suite)
+  a `--batch-size` below `1`, a missing `--suite` path, an empty `--suite`
+  directory, or a malformed record anywhere in the suite — named by file and
+  line, before any container launch)
 - `2` environment / setup error (ML stack not installed, llama.cpp missing, OOM)
 """
 
