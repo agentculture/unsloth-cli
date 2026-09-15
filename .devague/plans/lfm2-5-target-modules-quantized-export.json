@@ -5,7 +5,7 @@
   "schema_version": 5,
   "status": "exported",
   "created": "2026-09-15T10:02:14Z",
-  "updated": "2026-09-15T10:28:15Z",
+  "updated": "2026-09-15T11:33:07Z",
   "targets": [
     {
       "id": "c1",
@@ -700,6 +700,14 @@
     {
       "id": "r7",
       "text": "t9 encoded four call-signature inferences that no probe measured: llmcompressor.oneshot(dataset=<list of dicts>) vs a datasets.Dataset (the probe used Dataset.from_list); AWQMapping positional (smooth_layer, balance_layers); FastModel.from_pretrained(model_name=<adapter dir>) as the base+adapter loader for merging; and the exact 're:' regex flavour of the per-layer LFM2 mapping strings. t13's first live run must confirm or correct each; a correction is a /deviate record, not a silent edit",
+      "kind": "unknown_nonblocking",
+      "task_id": "t13",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r8",
+      "text": "t11 inferences unverified until t13: llama-completion may or may not echo the prompt (a startswith strip guards it); eval --model picks the first *.gguf alphabetically when a dir holds several (a kept F16 intermediate would win over Q4_K_M) \u2014 t13 must evaluate a clean gguf dir or add a selector",
       "kind": "unknown_nonblocking",
       "task_id": "t13",
       "resolved": false,

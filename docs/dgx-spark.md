@@ -54,7 +54,7 @@ NGC 25.11's torch 2.10:
 | `transformers` | `4.57.1` | The window unsloth 2026.6.9 + peft 0.18 agree on. |
 | `peft` | `0.18.0` | ≥ unsloth's floor, < the `torchao>0.16` demand of peft 0.19+. |
 | `trl` | `0.24.0` | unsloth requires `trl<=0.24.0` (the old `0.26.1` was out of range). |
-| `datasets` | `4.3.0` | Validated against transformers 4.57.1. |
+| `datasets` | `4.8.5` | Validated against transformers 4.57.1. |
 | `hf_transfer` | unpinned | Download accelerator only; no API surface. |
 | `llmcompressor` | `0.11.0` | Quantized export (NVFP4 / AWQ). See the note below. |
 | `compressed-tensors` | `0.16.0` | Must match llmcompressor 0.11.0. Needs a torch-2.11 shim. |

@@ -94,7 +94,9 @@ DEP_LAYER_PACKAGES: tuple[str, ...] = (
     "transformers==4.57.1",
     "peft==0.18.0",
     "hf_transfer",
-    "datasets==4.3.0",
+    # datasets 4.8.5 (was 4.3.0): llmcompressor==0.11.0 requires datasets>=4.8.4,<=4.8.5;
+    # trl 0.24 only needs >=3.0 (deviation d3, live-verified 2026-09-15).
+    "datasets==4.8.5",
     "trl==0.24.0",
     "llmcompressor==0.11.0",
     "compressed-tensors==0.16.0",

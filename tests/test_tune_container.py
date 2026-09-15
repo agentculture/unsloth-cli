@@ -158,7 +158,7 @@ class TestBuildCommand:
             assert pkg in joined, f"missing dep-layer package: {pkg}"
         assert "transformers==4.57.1" in joined
         assert "peft==0.18.0" in joined
-        assert "datasets==4.3.0" in joined
+        assert "datasets==4.8.5" in joined
         assert "trl==0.24.0" in joined
         # --no-deps layer
         assert "uv pip install --no-deps unsloth unsloth_zoo bitsandbytes" in joined

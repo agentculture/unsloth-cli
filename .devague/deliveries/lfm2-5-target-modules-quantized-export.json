@@ -2,7 +2,7 @@
   "plan_slug": "lfm2-5-target-modules-quantized-export",
   "schema_version": 2,
   "created": "2026-09-15T11:22:08Z",
-  "updated": "2026-09-15T11:22:08Z",
+  "updated": "2026-09-15T12:01:31Z",
   "deviations": [
     {
       "id": "d1",
@@ -31,6 +31,21 @@
       "status": "approved",
       "classification": "acceptable",
       "seq": 2
+    },
+    {
+      "id": "d3",
+      "what": "datasets pin bumped 4.3.0 -> 4.8.5 in DEP_LAYER_PACKAGES (+ docs/dgx-spark.md pin table, CLAUDE.md pin sentence)",
+      "task_ref": "t8",
+      "reason": "llmcompressor==0.11.0 requires datasets>=4.8.4,<=4.8.5, so the pinned dep layer became unsatisfiable and sloth train exited 1 before touching the GPU (found by t6's first live run); the full set resolves with 4.8.5 on aarch64, trl 0.24 only needs datasets>=3, and the probe's successful LFM2.5 training already ran on a venv upgraded to 4.8.x",
+      "affects": [
+        "t8",
+        "t6",
+        "t13"
+      ],
+      "origin": "llm",
+      "status": "approved",
+      "classification": "acceptable",
+      "seq": 3
     }
   ],
   "evidence": [],

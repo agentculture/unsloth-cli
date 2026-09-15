@@ -106,7 +106,7 @@ fine-tuning dep layer with uv (never pip):
 # Installed into a --system-site-packages venv (inherits the container's nv torch);
 # pins are validated against NGC 25.11's torch 2.10 (see docs/dgx-spark.md).
 uv venv --system-site-packages "$HOME/.unsloth-cli-venv" && . "$HOME/.unsloth-cli-venv/bin/activate"
-uv pip install transformers==4.57.1 peft==0.18.0 hf_transfer 'datasets==4.3.0' trl==0.24.0
+uv pip install transformers==4.57.1 peft==0.18.0 hf_transfer 'datasets==4.8.5' trl==0.24.0
 uv pip uninstall torch torchvision        # drop venv-pulled torch so the nv torch shows through
 uv pip install --no-deps unsloth unsloth_zoo bitsandbytes
 ```
