@@ -4,7 +4,7 @@
   "schema_version": 6,
   "status": "exported",
   "created": "2026-09-15T06:00:34Z",
-  "updated": "2026-09-15T07:28:21Z",
+  "updated": "2026-09-15T07:46:59Z",
   "claims": [
     {
       "id": "c1",
@@ -34,13 +34,19 @@
     {
       "id": "c2",
       "kind": "requirement",
-      "text": "RunConfig in sloth/tune/config.py:91-118 gains an optional [hyperparameters].target_modules (list[str] | None) with a new _require_str_list validator following the _require_int/_require_float idiom at config.py:126-189, plus an lfm2 preset resolved from the model id; unknown TOML keys are silently ignored today (config.py:232,260) so there is no schema-rejection code to update",
+      "text": "RunConfig in sloth/tune/config.py:91-118 gains an optional [hyperparameters].target_modules typed list[str] | str | None \u2014 a list of module names, a single regex string, or preset:<name> (resolved to its regex before use) \u2014 with a new _require_target_modules validator following the _require_int/_require_float idiom at config.py:126-189; unknown TOML keys are silently ignored today (config.py:232,260) so there is no schema-rejection code to update",
       "origin": "llm",
       "status": "confirmed",
       "honesty_conditions": [
         {
           "id": "h2",
           "text": "load_config rejects a non-list / non-string-element target_modules with exit 1 + hint, and round-trips an explicit list unchanged into the dry-run plan",
+          "status": "rejected",
+          "instruction": ""
+        },
+        {
+          "id": "h28",
+          "text": "load_config accepts a list of non-empty strings, a single non-empty string (regex or preset:<name>), or absence; any other type, an empty list/string, or an unknown preset name exits 1 with a hint listing the three accepted forms; an explicit list or regex round-trips unchanged into the dry-run plan and a preset round-trips as its resolved regex",
           "status": "confirmed",
           "instruction": ""
         }
@@ -48,7 +54,13 @@
       "hard_questions": [],
       "links": [],
       "instruction": "",
-      "revisions": []
+      "revisions": [
+        {
+          "text": "RunConfig in sloth/tune/config.py:91-118 gains an optional [hyperparameters].target_modules (list[str] | None) with a new _require_str_list validator following the _require_int/_require_float idiom at config.py:126-189, plus an lfm2 preset resolved from the model id; unknown TOML keys are silently ignored today (config.py:232,260) so there is no schema-rejection code to update",
+          "kind": "requirement",
+          "reason": "PR #19 review: c2's type excluded the regex/preset string form that c27 and the live probe require"
+        }
+      ]
     },
     {
       "id": "c3",
@@ -163,7 +175,7 @@
     {
       "id": "c8",
       "kind": "boundary",
-      "text": "--format safetensors stays pure stdlib \u2014 no container, no torch \u2014 exactly as export.py:16-29 and the catalog _EXPORT entry (catalog.py:277) promise today; only merged-16bit/merged-4bit/gguf launch the container",
+      "text": "--format safetensors stays pure stdlib \u2014 no container, no torch \u2014 exactly as export.py:16-29 and the catalog _EXPORT entry (catalog.py:277) promise today; every other format (merged-16bit, merged-4bit, gguf, awq, nvfp4) launches the container",
       "origin": "llm",
       "status": "confirmed",
       "honesty_conditions": [
@@ -177,7 +189,13 @@
       "hard_questions": [],
       "links": [],
       "instruction": "",
-      "revisions": []
+      "revisions": [
+        {
+          "text": "--format safetensors stays pure stdlib \u2014 no container, no torch \u2014 exactly as export.py:16-29 and the catalog _EXPORT entry (catalog.py:277) promise today; only merged-16bit/merged-4bit/gguf launch the container",
+          "kind": "boundary",
+          "reason": "PR #19 review: the boundary listed only the first three container formats, written before awq/nvfp4 were added"
+        }
+      ]
     },
     {
       "id": "c9",

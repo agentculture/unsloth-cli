@@ -20,8 +20,8 @@
 
 ## Requirements
 
-- RunConfig in sloth/tune/config.py:91-118 gains an optional \[hyperparameters\].`target_modules` (list\[str\] | None) with a new `_require_str_list` validator following the `_require_int`/`_require_float` idiom at config.py:126-189, plus an lfm2 preset resolved from the model id; unknown TOML keys are silently ignored today (config.py:232,260) so there is no schema-rejection code to update
-  - honesty: `load_config` rejects a non-list / non-string-element `target_modules` with exit 1 + hint, and round-trips an explicit list unchanged into the dry-run plan
+- RunConfig in sloth/tune/config.py:91-118 gains an optional \[hyperparameters\].`target_modules` typed list\[str\] | str | None — a list of module names, a single regex string, or preset:<name> (resolved to its regex before use) — with a new `_require_target_modules` validator following the `_require_int`/`_require_float` idiom at config.py:126-189; unknown TOML keys are silently ignored today (config.py:232,260) so there is no schema-rejection code to update
+  - honesty: `load_config` accepts a list of non-empty strings, a single non-empty string (regex or preset:<name>), or absence; any other type, an empty list/string, or an unknown preset name exits 1 with a hint listing the three accepted forms; an explicit list or regex round-trips unchanged into the dry-run plan and a preset round-trips as its resolved regex
 - sloth/tune/`_trainer.py` passes `target_modules`= to backend.`fast_language_model`.`get_peft_model` (today only r/`lora_alpha`/`lora_dropout`/`random_state` at `_trainer.py`:270-276) and adds the resolved list to `_resolved_hyperparameters` (`_trainer.py`:91-104), which is the single source for the --dry-run plan and for `training_metadata.json` (metadata.py:121 dumps the hyperparameters dict whole; train.py:119-140 renders the dict generically)
   - honesty: the fake backend's `get_peft` events record `target_modules` exactly as resolved, and `training_metadata.json` contains the same list
 - sloth/cli/`_commands`/export.py extends `SUPPORTED_FORMATS` (export.py:42) with merged-16bit, merged-4bit, gguf and adds --quant, --base (default read from `adapter_config.json` `base_model_name_or_path` — export.py never parses that file today), and --dry-run (no dry-run exists in export.py or eval.py); the new formats route host→container exactly like eval.py:122-146 (hidden --in-container flag eval.py:194-199, identity mounts of adapter/output parents, container.launch with checkout=`_repo_root`()); tests/`test_cmd_export.py`:71-80 (gguf rejected) and 231-257 (container never launched) get scoped to --format safetensors
@@ -78,7 +78,7 @@
 
 ## Scope / boundaries
 
-- --format safetensors stays pure stdlib — no container, no torch — exactly as export.py:16-29 and the catalog `_EXPORT` entry (catalog.py:277) promise today; only merged-16bit/merged-4bit/gguf launch the container
+- --format safetensors stays pure stdlib — no container, no torch — exactly as export.py:16-29 and the catalog `_EXPORT` entry (catalog.py:277) promise today; every other format (merged-16bit, merged-4bit, gguf, awq, nvfp4) launches the container
 - sloth validate and sloth/tune/datasets.py stay strictly stdlib (validate.py:18-27, datasets.py:20-26, no model/tokenizer argument); a no-chat-template preflight for chat-schema datasets, if built, lives in train.py's host preflight (between dataset validation and the scope guard, train.py:232-247) and reads `tokenizer_config.json` / `chat_template`.jinja from the local HF cache with json/pathlib, or runs in-container — it never imports transformers on the host
 - sloth export never overwrites a non-empty --output directory; it exits 1 with a hint unless --force is given (a re-export must not silently clobber a model a lobes/Jetson deployment is already reading from)
 
