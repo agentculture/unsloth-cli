@@ -7,7 +7,7 @@ unsloth dependency layer with **uv** (never ``pip``), bind-mount this checkout +
 the working directory, and run ``python -m sloth <args>`` *inside* the container.
 
 This module is the host-side orchestrator. It is **pure stdlib** — it imports
-``os``/``shutil``/``subprocess``/``shlex``/``pathlib`` only and **never** imports
+``json``/``os``/``shutil``/``subprocess``/``shlex``/``sys``/``pathlib`` only and **never** imports
 torch/unsloth/datasets/trl/peft — so it loads on a machine with no GPU and no ML
 stack, keeping the introspection verbs import-light. The only code that imports
 the heavy stack is :mod:`sloth.tune._trainer`, which becomes the in-container
@@ -27,10 +27,12 @@ export_launch_kwargs() -> dict
     The ``env`` + ``extra_mounts`` an export run needs (explicit ``HOME``, pinned
     ``UNSLOTH_LLAMA_TAG``, persistent llama.cpp cache mount).
 launch(sloth_args, *, workdir=None, checkout=None, image=NGC_IMAGE, gpus="all",
-       skip_preflight=False, extra_mounts=None, use_host_user=True, env=None) -> int
-    Run :func:`preflight` (unless skipped), build the command, run it streaming
-    its output to the parent stdio. Returns 0 on success; raises :class:`CliError`
-    (code 1 or 2) on any container or docker-infrastructure failure.
+       skip_preflight=False, extra_mounts=None, use_host_user=True, env=None) -> dict
+    Run :func:`preflight` (unless skipped), build the command, run it while teeing
+    the container's stdout to the host's stderr line by line. Returns the parsed
+    JSON result object from the container's last result line; raises
+    :class:`CliError` (code 1 or 2) on any container or docker-infrastructure
+    failure, including an exit-0 run that produced no parseable result line.
 
 Design notes
 ------------
@@ -54,10 +56,12 @@ Design notes
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import shutil
 import subprocess  # nosec B404 - orchestrating docker is this module's whole job
+import sys
 from pathlib import Path
 
 from sloth.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
@@ -70,6 +74,10 @@ from sloth.cli._output import emit_diagnostic
 #: NVIDIA's official NGC PyTorch container with a Blackwell-compatible torch.
 #: Pinned and deterministic; bumping it is a documented, deliberate change.
 NGC_IMAGE: str = "nvcr.io/nvidia/pytorch:25.11-py3"
+
+#: How many trailing captured stdout lines are quoted when a run ends with no
+#: parseable JSON result line (enough context to debug, short enough to read).
+RESULT_TAIL_LINES: int = 20
 
 #: Dependency layer installed with ``uv pip install`` into the in-container venv.
 #: Pinned to a set validated against NGC 25.11's torch 2.10 + the container's
@@ -472,13 +480,69 @@ def _run_quiet(cmd: list[str]) -> int:
     return proc.returncode
 
 
-def _stream(cmd: list[str]) -> int:
-    """Run *cmd* inheriting the parent's stdio (live streaming); return exit code."""
+class StreamResult(int):
+    """A container exit code that also carries the container's captured stdout.
+
+    Subclasses :class:`int` so every existing exit-code comparison (and every
+    test that stubs :func:`_stream` with a bare ``int``) keeps working; the
+    captured lines ride along in :attr:`lines`.
+    """
+
+    lines: tuple[str, ...]
+
+    def __new__(cls, code: int, lines: "tuple[str, ...] | list[str] | None" = None):
+        obj = super().__new__(cls, code)
+        obj.lines = tuple(lines or ())
+        return obj
+
+
+def _stream(cmd: list[str]) -> StreamResult:
+    """Run *cmd*, teeing its stdout to host **stderr** line by line; capture it too.
+
+    The container's stdout is piped (so the host can read the in-container
+    ``sloth --json`` result off the last line) while its stderr is inherited
+    untouched. Every line read — JSON or banner noise — is written to
+    ``sys.stderr`` as it arrives and flushed, so a long training run still
+    streams live for the human watching. Nothing is written to the host's
+    stdout here: the caller decides what the *result* is.
+
+    Returns a :class:`StreamResult` (the exit code, ``.lines`` the captured
+    stdout lines without their trailing newline); ``127`` with no lines when
+    ``docker`` cannot be executed at all (``OSError``).
+    """
+    lines: list[str] = []
     try:
-        proc = subprocess.run(cmd, check=False)  # nosec B607 - docker resolved from PATH
+        proc = subprocess.Popen(  # nosec B607 - docker resolved from PATH on purpose
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            text=True,
+            bufsize=1,
+        )
     except OSError:
-        return 127
-    return proc.returncode
+        return StreamResult(127)
+    with proc.stdout as out:
+        for raw in out:
+            line = raw.rstrip("\n")
+            sys.stderr.write(line + "\n")
+            sys.stderr.flush()
+            lines.append(line)
+    return StreamResult(proc.wait(), lines)
+
+
+def _last_json_object(lines: "tuple[str, ...] | list[str]") -> dict | None:
+    """Return the last line that parses as a JSON **object**, or ``None``."""
+    for line in reversed(list(lines)):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            parsed = json.loads(stripped)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
 
 
 def _docker_available() -> bool:
@@ -639,13 +703,22 @@ def launch(
     extra_mounts: list[tuple[str, str]] | None = None,
     use_host_user: bool = True,
     env: list[tuple[str, str]] | None = None,
-) -> int:
-    """Preflight, build the docker command, run it streaming output, return 0 or raise.
+) -> dict:
+    """Preflight, build the docker command, run it, and return the captured result.
 
     Calls :func:`preflight` first (unless *skip_preflight*), so a host that
     cannot run the container fails fast with ``CliError(code=2)`` before any
     container starts. Then builds the command with :func:`build_command` and runs
-    it via :func:`_stream`, inheriting the parent's stdio so logs stream live.
+    it via :func:`_stream`, which tees every stdout line to the host's **stderr**
+    as it arrives (logs still stream live) while capturing it.
+
+    The in-container ``sloth`` run always ends with a single-line JSON result on
+    stdout, so the **last captured line that parses as a JSON object is the
+    result** and is returned to the caller — which renders it (text or JSON) on
+    the host's stdout. This is fail-closed: a container that exits 0 without such
+    a line raises ``CliError(code=2)`` quoting the last
+    :data:`RESULT_TAIL_LINES` captured lines, rather than reporting a success it
+    cannot substantiate.
 
     Parameters mirror :func:`build_command` (including *env* and *extra_mounts*,
     forwarded verbatim — see :func:`export_launch_kwargs` for the export-run pair);
@@ -654,14 +727,15 @@ def launch(
 
     Returns
     -------
-    int
-        ``0`` on success.
+    dict
+        The parsed JSON result object from the container's last result line.
 
     Raises
     ------
     CliError(code=2)
-        From :func:`preflight` when the host cannot run the container, or when
-        the container exits due to an environment/infrastructure error (exit
+        From :func:`preflight` when the host cannot run the container, when the
+        container exits 0 without a parseable JSON result line, or when the
+        container exits due to an environment/infrastructure error (exit
         codes: 2, 137 OOM/SIGKILL, or any other non-{0,1,2} docker infra code).
     CliError(code=1)
         When the container exits with code 1 (in-container user-input error;
@@ -679,9 +753,26 @@ def launch(
         use_host_user=use_host_user,
         env=env,
     )
-    code = _stream(cmd)
+    outcome = _stream(cmd)
+    code = int(outcome)
+    lines: tuple[str, ...] = tuple(getattr(outcome, "lines", ()))
     if code == 0:
-        return 0
+        result = _last_json_object(lines)
+        if result is not None:
+            return result
+        tail = "\n".join(lines[-RESULT_TAIL_LINES:]) if lines else "(no output captured)"
+        raise CliError(
+            code=EXIT_ENV_ERROR,
+            message=(
+                "Container exited 0 but produced no JSON result line on stdout. "
+                f"Last {RESULT_TAIL_LINES} captured lines:\n{tail}"
+            ),
+            remediation=(
+                "The in-container run must end with a single-line JSON result on stdout "
+                "(the host appends --json). Re-run with the container output above in view, "
+                "and check that the in-container sloth verb emitted its result."
+            ),
+        )
     if code == 1:
         raise CliError(
             code=EXIT_USER_ERROR,

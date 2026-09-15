@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import io
 import os
 import subprocess
 import sys
@@ -528,6 +529,17 @@ class TestH12CrossCheck:
 # ---------------------------------------------------------------------------
 
 
+def _ok_stream(record: dict | None = None):
+    """Return a ``_stream`` stub: exit 0 with a single parseable JSON result line."""
+
+    def stub(cmd: list[str]) -> container.StreamResult:
+        if record is not None:
+            record.setdefault("cmd", cmd)
+        return container.StreamResult(0, ['{"ok": true}'])
+
+    return stub
+
+
 class TestLaunch:
     def test_runs_preflight_then_streams_exit_code(self, tmp_path: Path, monkeypatch) -> None:
         events: dict[str, object] = {}
@@ -535,16 +547,16 @@ class TestLaunch:
         def fake_preflight(*, image: str = NGC_IMAGE) -> None:
             events["preflight"] = image
 
-        def fake_stream(cmd: list[str]) -> int:
+        def fake_stream(cmd: list[str]) -> container.StreamResult:
             events["streamed"] = cmd
-            return 0  # success path
+            return container.StreamResult(0, ['{"ok": true}'])  # success path
 
         monkeypatch.setattr(container, "preflight", fake_preflight)
         monkeypatch.setattr(container, "_stream", fake_stream)
 
-        code = launch(["train", "--config", "run.toml"], workdir=tmp_path, checkout=tmp_path)
+        result = launch(["train", "--config", "run.toml"], workdir=tmp_path, checkout=tmp_path)
 
-        assert code == 0
+        assert result == {"ok": True}
         assert events["preflight"] == NGC_IMAGE
         streamed = events["streamed"]
         assert isinstance(streamed, list)
@@ -556,8 +568,10 @@ class TestLaunch:
             raise AssertionError("preflight must not run when skip_preflight=True")
 
         monkeypatch.setattr(container, "preflight", boom)
-        monkeypatch.setattr(container, "_stream", lambda cmd: 0)
-        assert launch(["eval"], workdir=tmp_path, checkout=tmp_path, skip_preflight=True) == 0
+        monkeypatch.setattr(container, "_stream", _ok_stream())
+        assert launch(["eval"], workdir=tmp_path, checkout=tmp_path, skip_preflight=True) == {
+            "ok": True
+        }
 
     def test_preflight_failure_propagates_before_stream(self, tmp_path: Path, monkeypatch) -> None:
         def fail_preflight(*, image: str = NGC_IMAGE) -> None:
@@ -585,10 +599,10 @@ class TestLaunchExitCodeMapping:
     launch(). preflight is stubbed out for all tests in this class.
     """
 
-    def test_exit_0_returns_0(self, tmp_path: Path, monkeypatch) -> None:
-        monkeypatch.setattr(container, "_stream", lambda cmd: 0)
+    def test_exit_0_returns_the_parsed_result(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(container, "_stream", _ok_stream())
         result = launch(["train"], workdir=tmp_path, checkout=tmp_path, skip_preflight=True)
-        assert result == 0
+        assert result == {"ok": True}
 
     def test_exit_1_raises_cli_error_code_1(self, tmp_path: Path, monkeypatch) -> None:
         monkeypatch.setattr(container, "_stream", lambda cmd: 1)
@@ -727,8 +741,8 @@ class TestLaunchEnvPassthrough:
     def test_launch_forwards_env_and_extra_mounts(self, tmp_path: Path, monkeypatch) -> None:
         seen: dict[str, list[str]] = {}
 
-        monkeypatch.setattr(container, "_stream", lambda cmd: seen.setdefault("cmd", cmd) and 0)
-        code = launch(
+        monkeypatch.setattr(container, "_stream", _ok_stream(seen))
+        result = launch(
             ["export"],
             workdir=tmp_path,
             checkout=tmp_path,
@@ -736,7 +750,7 @@ class TestLaunchEnvPassthrough:
             env=[("HOME", container.EXPORT_HOME)],
             extra_mounts=[("/host/cache", "/workspace/.home/.unsloth/llama.cpp")],
         )
-        assert code == 0
+        assert result == {"ok": True}
         joined = _joined(seen["cmd"])
         assert f"-e HOME={container.EXPORT_HOME}" in joined
         assert "-v /host/cache:/workspace/.home/.unsloth/llama.cpp" in joined
@@ -744,17 +758,14 @@ class TestLaunchEnvPassthrough:
     def test_launch_accepts_export_launch_kwargs(self, tmp_path: Path, monkeypatch) -> None:
         monkeypatch.setenv(container.LLAMA_CPP_CACHE_ENV, str(tmp_path / "c"))
         captured: dict[str, list[str]] = {}
-        monkeypatch.setattr(container, "_stream", lambda cmd: captured.setdefault("cmd", cmd) and 0)
-        assert (
-            launch(
-                ["export"],
-                workdir=tmp_path,
-                checkout=tmp_path,
-                skip_preflight=True,
-                **container.export_launch_kwargs(),
-            )
-            == 0
-        )
+        monkeypatch.setattr(container, "_stream", _ok_stream(captured))
+        assert launch(
+            ["export"],
+            workdir=tmp_path,
+            checkout=tmp_path,
+            skip_preflight=True,
+            **container.export_launch_kwargs(),
+        ) == {"ok": True}
         assert f"-e UNSLOTH_LLAMA_TAG={container.UNSLOTH_LLAMA_TAG}" in _joined(captured["cmd"])
 
 
@@ -855,3 +866,175 @@ class TestMemoryPreflight:
         monkeypatch.setattr(container, "MEMINFO_PATH", self._meminfo(tmp_path, 4 * 1024 * 1024 - 1))
         preflight()
         assert "out of memory" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# 6. t1 — launch captures the container's stdout (tee to stderr, last JSON wins)
+# ---------------------------------------------------------------------------
+
+
+class _FakeStdout:
+    """Lazy line iterator that snapshots host stderr before each yield."""
+
+    def __init__(self, lines: list[str], proc: "_FakeProc") -> None:
+        self._lines = lines
+        self._proc = proc
+        self.closed = False
+
+    def __enter__(self) -> "_FakeStdout":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.closed = True
+
+    def __iter__(self):
+        for line in self._lines:
+            # Snapshot what the host has already teed, and whether the process
+            # has been reaped, *before* handing over the next line.
+            self._proc.observations.append((self._proc.stderr_value(), self._proc.waited))
+            yield line
+
+
+class _FakeProc:
+    """Minimal stand-in for ``subprocess.Popen`` with a line-yielding stdout."""
+
+    def __init__(self, lines: list[str], code: int, stderr_buf: io.StringIO) -> None:
+        self._code = code
+        self._stderr = stderr_buf
+        self.waited = False
+        self.observations: list[tuple[str, bool]] = []
+        self.stdout = _FakeStdout(lines, self)
+
+    def stderr_value(self) -> str:
+        return self._stderr.getvalue()
+
+    def wait(self) -> int:
+        self.waited = True
+        return self._code
+
+
+def _fake_popen(
+    monkeypatch, lines: list[str], code: int = 0
+) -> tuple[_FakeProc, io.StringIO, dict[str, object]]:
+    """Install a fake Popen yielding *lines*; return (proc, stderr buffer, call record)."""
+    buf = io.StringIO()
+    monkeypatch.setattr(container.sys, "stderr", buf)
+    proc = _FakeProc([line + "\n" for line in lines], code, buf)
+    record: dict[str, object] = {}
+
+    def fake_popen(cmd, **kwargs):
+        record["cmd"] = cmd
+        record["kwargs"] = kwargs
+        return proc
+
+    monkeypatch.setattr(container.subprocess, "Popen", fake_popen)
+    return proc, buf, record
+
+
+class TestStreamCapture:
+    """``_stream`` tees every line to stderr live and returns the captured lines."""
+
+    def test_popen_pipes_stdout_and_inherits_stderr(self, monkeypatch) -> None:
+        _proc, _buf, record = _fake_popen(monkeypatch, ["hello"])
+        container._stream(["docker", "run"])
+        kwargs = record["kwargs"]
+        assert isinstance(kwargs, dict)
+        assert kwargs["stdout"] is subprocess.PIPE
+        assert kwargs["stderr"] is None, "the container's own stderr must pass straight through"
+
+    def test_lines_reach_stderr_before_the_process_exits(self, monkeypatch) -> None:
+        proc, buf, _record = _fake_popen(monkeypatch, ["line-1", "line-2", "line-3"])
+        result = container._stream(["docker", "run"])
+
+        # The snapshot taken just before line-2 was handed over already shows line-1
+        # on stderr and an unreaped process: streaming is live, not buffered to the end.
+        before_second = proc.observations[1]
+        assert "line-1" in before_second[0]
+        assert before_second[1] is False
+        assert "line-2" not in before_second[0]
+
+        assert buf.getvalue() == "line-1\nline-2\nline-3\n"
+        assert int(result) == 0
+        assert list(result.lines) == ["line-1", "line-2", "line-3"]
+        assert proc.waited is True
+        assert proc.stdout.closed is True
+
+    def test_oserror_maps_to_127(self, monkeypatch) -> None:
+        def boom(cmd, **kwargs):
+            raise OSError("docker not found")
+
+        monkeypatch.setattr(container.subprocess, "Popen", boom)
+        result = container._stream(["docker", "run"])
+        assert int(result) == 127
+        assert list(result.lines) == []
+
+    def test_nonzero_exit_code_is_returned_with_lines(self, monkeypatch) -> None:
+        _proc, _buf, _record = _fake_popen(monkeypatch, ["boom"], code=1)
+        result = container._stream(["docker", "run"])
+        assert int(result) == 1
+        assert list(result.lines) == ["boom"]
+
+
+class TestLaunchResultCapture:
+    """launch() returns the LAST parseable JSON line, and fails closed without one."""
+
+    def _stub(self, monkeypatch, lines: list[str], code: int = 0) -> None:
+        monkeypatch.setattr(
+            container,
+            "_stream",
+            lambda cmd: container.StreamResult(code, lines),
+        )
+
+    def test_returns_last_json_line(self, tmp_path: Path, monkeypatch) -> None:
+        self._stub(
+            monkeypatch,
+            [
+                "== NGC banner ==",
+                '{"ok": false, "stage": "early"}',
+                "training: 10/10",
+                '{"ok": true, "adapter": "/out/adapter", "steps": 10}',
+            ],
+        )
+        result = launch(["train"], workdir=tmp_path, checkout=tmp_path, skip_preflight=True)
+        assert result == {"ok": True, "adapter": "/out/adapter", "steps": 10}
+
+    def test_non_json_trailing_lines_do_not_hide_the_result(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        self._stub(monkeypatch, ['{"ok": true}', "Segmentation-free shutdown", "bye"])
+        result = launch(["eval"], workdir=tmp_path, checkout=tmp_path, skip_preflight=True)
+        assert result == {"ok": True}
+
+    def test_non_object_json_is_not_a_result(self, tmp_path: Path, monkeypatch) -> None:
+        # A bare scalar (a step counter, say) is not a result payload.
+        self._stub(monkeypatch, ['{"ok": true}', "137", "[1, 2]"])
+        result = launch(["eval"], workdir=tmp_path, checkout=tmp_path, skip_preflight=True)
+        assert result == {"ok": True}
+
+    def test_exit_0_without_json_fails_closed_with_last_20_lines(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        lines = [f"banner-{i:02d}" for i in range(40)]
+        self._stub(monkeypatch, lines)
+        with pytest.raises(CliError) as exc_info:
+            launch(["train"], workdir=tmp_path, checkout=tmp_path, skip_preflight=True)
+        err = exc_info.value
+        assert err.code == 2
+        # The last 20 captured lines are quoted; the earlier ones are not.
+        for line in lines[20:]:
+            assert line in err.message
+        assert "banner-19" not in err.message
+        assert err.remediation
+
+    def test_exit_0_with_no_output_at_all_fails_closed(self, tmp_path: Path, monkeypatch) -> None:
+        self._stub(monkeypatch, [])
+        with pytest.raises(CliError) as exc_info:
+            launch(["train"], workdir=tmp_path, checkout=tmp_path, skip_preflight=True)
+        assert exc_info.value.code == 2
+
+    def test_nonzero_exit_still_maps_before_parsing(self, tmp_path: Path, monkeypatch) -> None:
+        # A parseable JSON line does NOT rescue a non-zero exit.
+        self._stub(monkeypatch, ['{"ok": true}'], code=1)
+        with pytest.raises(CliError) as exc_info:
+            launch(["train"], workdir=tmp_path, checkout=tmp_path, skip_preflight=True)
+        assert exc_info.value.code == 1
