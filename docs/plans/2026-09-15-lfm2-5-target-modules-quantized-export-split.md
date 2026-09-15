@@ -16,19 +16,19 @@ Edit the Owner/Model columns before approving gate 2 — the default Model is a 
 
 | Task | Owner | Model |
 | --- | --- | --- |
-| `t1` |  | sonnet |
-| `t2` |  | sonnet |
-| `t7` |  | sonnet |
-| `t8` |  | sonnet |
-| `t9` |  | sonnet |
-| `t3` |  | sonnet |
-| `t5` |  | sonnet |
-| `t10` |  | sonnet |
-| `t4` |  | sonnet |
-| `t11` |  | sonnet |
-| `t12` |  | sonnet |
-| `t6` |  | sonnet |
-| `t13` |  | sonnet |
+| `t1` | claude subagent | sonnet |
+| `t2` | claude subagent | sonnet |
+| `t7` | claude subagent | opus |
+| `t8` | claude subagent | opus |
+| `t9` | claude subagent | opus |
+| `t3` | claude subagent | sonnet |
+| `t5` | colleague | lobes cortex (Qwen3.8-27B-NVFP4) |
+| `t10` | claude subagent | sonnet |
+| `t4` | claude subagent | opus |
+| `t11` | claude subagent | opus |
+| `t12` | colleague | lobes cortex (Qwen3.8-27B-NVFP4) |
+| `t6` | fork of the main session | fable |
+| `t13` | fork of the main session | fable |
 
 ## Wave 1
 
