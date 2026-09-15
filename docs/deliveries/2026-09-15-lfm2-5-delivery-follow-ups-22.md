@@ -117,9 +117,9 @@ All four lapses approved by the owner 2026-09-15.
 ## Remaining Work / Follow-up
 
 - **Owner adjudication** — done 2026-09-15: deviations `d1`, `d3`, `d4` approved; lapses `l2`–`l4` approved; obligations, evidence and deltas `b1`–`b5` confirmed; frame parks `v1` and `v2` resolved with the measured outcomes.
-- **A trained adapter for the benchmarks table** — the per-format scores are 0/46 exact-match on the smoke adapter (h15 fail); train a multi-hundred-step adapter on a real corpus and re-run `sloth eval --model` per format so the table measures quantization loss. Owner: next fine-tuning run.
-- **Batched vs serial equivalence** (plan risk r8) — check on a model with non-zero scores whether left-padded batched decoding should match serial; record the batch size in `eval.json` (delta `b2`).
+- **A trained adapter for the benchmarks table** (#28) — the per-format scores are 0/46 exact-match on the smoke adapter (h15 fail); train a multi-hundred-step adapter on a real corpus and re-run `sloth eval --model` per format so the table measures quantization loss. Owner: next fine-tuning run.
+- **Batched vs serial equivalence** (plan risk r8, #28) — check on a model with non-zero scores whether left-padded batched decoding should match serial; record the batch size in `eval.json` (delta `b2`).
 - **Orin Nano gguf load** — #23 (needs lobes down on the Spark).
-- **Spec provenance nits** — h31's "125 lines" figure should cite issue #22; h45's grep should exclude the devague artifacts under `docs/`. Amend on the frame via `devague amend` / `interrogate --instruction`; no code change.
+- **Spec provenance nits** (#28) — h31's "125 lines" figure should cite issue #22; h45's grep should exclude the devague artifacts under `docs/`. Amend on the frame via `devague amend` / `interrogate --instruction`; no code change.
 - **Torch shim** — unchanged by design; delete when NGC ships torch ≥ 2.11 (park v4).
 - **`bump.py` hang** — the version-bump skill script hung twice on this box; worth an upstream look (guildmaster).
