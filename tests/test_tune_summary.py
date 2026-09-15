@@ -13,6 +13,12 @@ Covers:
 * A missing/corrupt ``exports.json`` degrades to an empty list plus a note,
   never an exception.
 * A run with no exports at all returns an empty list (no note necessary).
+
+Also covers (t6): ``build_summary`` reading ``eval.json`` (written by
+``sloth eval``, see :func:`sloth.tune.metrics.write_eval_json`) — both at the
+run's own output dir and at each discovered export's own output dir — into
+an ``"eval"`` block ``{exact_match_pct, f1, file_count}``, omitted silently
+(``None``, no note, no key on an export entry) when absent.
 """
 
 from __future__ import annotations
@@ -20,7 +26,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from sloth.tune.summary import build_summary, discover_exports
+from sloth.tune.summary import build_summary, discover_exports, read_eval
 
 _RECORD_A = {
     "format": "gguf",
@@ -190,3 +196,121 @@ def test_build_summary_exports_empty_when_none_present(tmp_path: Path) -> None:
     summary = build_summary(output_dir)
 
     assert summary["exports"] == []
+
+
+# ---------------------------------------------------------------------------
+# eval.json discovery (t6)
+# ---------------------------------------------------------------------------
+
+_EVAL_PAYLOAD = {
+    "total": 4,
+    "exact_match": 3,
+    "exact_match_pct": 75.0,
+    "f1": 0.82,
+    "results": [{"input": "x", "expected": "y", "actual": "y", "exact_match": True, "f1": 1.0}],
+    "files": [
+        {
+            "path": "suite_a.jsonl",
+            "total": 2,
+            "exact_match": 2,
+            "exact_match_pct": 100.0,
+            "f1": 1.0,
+            "results": [],
+        },
+        {
+            "path": "suite_b.jsonl",
+            "total": 2,
+            "exact_match": 1,
+            "exact_match_pct": 50.0,
+            "f1": 0.64,
+            "results": [],
+        },
+    ],
+    "suite_paths": ["suite_a.jsonl", "suite_b.jsonl"],
+    "target": "adapter",
+    "written_at": "2026-07-06T02:00:00+00:00",
+}
+
+
+def _write_eval_json(directory: Path, payload: dict) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "eval.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
+
+
+def test_read_eval_reads_parsed_payload(tmp_path: Path) -> None:
+    adapter = tmp_path / "adapter"
+    _write_eval_json(adapter, _EVAL_PAYLOAD)
+
+    payload = read_eval(adapter)
+
+    assert payload is not None
+    assert payload["exact_match_pct"] == 75.0
+    assert len(payload["files"]) == 2
+
+
+def test_read_eval_missing_file_returns_none(tmp_path: Path) -> None:
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+
+    assert read_eval(adapter) is None
+
+
+def test_read_eval_corrupt_file_returns_none(tmp_path: Path) -> None:
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "eval.json").write_text("not json", encoding="utf-8")
+
+    assert read_eval(adapter) is None
+
+
+def test_build_summary_includes_eval_block(tmp_path: Path) -> None:
+    output_dir = tmp_path / "adapter"
+    _write_eval_json(output_dir, _EVAL_PAYLOAD)
+
+    summary = build_summary(output_dir)
+
+    assert summary["eval"] == {"exact_match_pct": 75.0, "f1": 0.82, "file_count": 2}
+    assert summary["notes"] == [
+        "no training_metadata.json found — metadata omitted",
+        "no checkpoint-N directory found — no trainer_state.json to read",
+    ]
+
+
+def test_build_summary_eval_none_when_absent_no_note(tmp_path: Path) -> None:
+    output_dir = tmp_path / "adapter"
+    output_dir.mkdir()
+
+    summary = build_summary(output_dir)
+
+    assert summary["eval"] is None
+    assert not any("eval" in note for note in summary["notes"])
+
+
+def test_build_summary_attaches_eval_to_export_entry(tmp_path: Path) -> None:
+    output_dir = tmp_path / "adapter"
+    output_dir.mkdir()
+    record_a = _record(_RECORD_A, output_dir)
+    export_dir = output_dir / "gguf-export"
+    _write_export_json(export_dir, record_a)
+    _write_eval_json(export_dir, _EVAL_PAYLOAD)
+
+    summary = build_summary(output_dir)
+
+    assert len(summary["exports"]) == 1
+    export_eval = summary["exports"][0]["eval"]
+    assert export_eval == {"exact_match_pct": 75.0, "f1": 0.82, "file_count": 2}
+
+
+def test_build_summary_export_entry_omits_eval_key_when_absent(tmp_path: Path) -> None:
+    output_dir = tmp_path / "adapter"
+    output_dir.mkdir()
+    record_a = _record(_RECORD_A, output_dir)
+    export_dir = output_dir / "gguf-export"
+    _write_export_json(export_dir, record_a)
+
+    summary = build_summary(output_dir)
+
+    assert len(summary["exports"]) == 1
+    assert "eval" not in summary["exports"][0]
