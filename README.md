@@ -83,7 +83,11 @@ adapter-only — it does not attempt the job silently.
 |------|--------------|
 | `sloth train` | Validate JSONL dataset → run LoRA/QLoRA adapter job → write run metadata |
 | `sloth eval` | Run an adapter against a small local eval suite (no network) |
-| `sloth export` | Convert an adapter to safetensors (servable by lobes, runnable by colleague) |
+| `sloth export` | Export an adapter — `safetensors`, `merged-16bit`, `merged-4bit`, `gguf`, `awq`, `nvfp4` (servable by lobes, runnable by colleague, or deployable per target — see [deployment targets](docs/fine-tuning.md#deployment-targets)) |
+
+`sloth export --format safetensors` (the default) is pure stdlib, no container.
+Every other format (`merged-16bit`, `merged-4bit`, `gguf`, `awq`, `nvfp4`) runs
+inside the same NGC container as `train`/`eval`.
 
 The `/finetune` skill drives the full loop non-interactively:
 validate dataset → `sloth train` → `sloth eval` → `sloth export`.
@@ -102,7 +106,7 @@ fine-tuning dep layer with uv (never pip):
 # Installed into a --system-site-packages venv (inherits the container's nv torch);
 # pins are validated against NGC 25.11's torch 2.10 (see docs/dgx-spark.md).
 uv venv --system-site-packages "$HOME/.unsloth-cli-venv" && . "$HOME/.unsloth-cli-venv/bin/activate"
-uv pip install transformers==4.57.1 peft==0.18.0 hf_transfer 'datasets==4.3.0' trl==0.24.0
+uv pip install transformers==4.57.1 peft==0.18.0 hf_transfer 'datasets==4.8.5' trl==0.24.0
 uv pip uninstall torch torchvision        # drop venv-pulled torch so the nv torch shows through
 uv pip install --no-deps unsloth unsloth_zoo bitsandbytes
 ```
@@ -178,7 +182,11 @@ grad_accum    = 4                 # default: 4
 max_steps     = 60                # default: 60 (quick smoke-run; raise for production)
 seed          = 3407              # default: 3407
 load_in_4bit  = true              # default: true (required for qlora)
+target_modules = "preset:lfm2"    # optional — list of names, regex, or preset
 ```
+
+`target_modules` accepts a list of module names, a single regex string, or
+`"preset:lfm2"` (see `docs/fine-tuning.md`).
 
 A metadata file is written next to the adapter output recording model, method,
 dataset SHA-256 and line count, hyperparameters, and an ISO-8601 timestamp.

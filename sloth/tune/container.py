@@ -23,8 +23,11 @@ preflight(*, image=NGC_IMAGE) -> None
     Validate the host can run the container (docker present, image pullable,
     NVIDIA GPU runtime usable). Raises :class:`CliError` (code 2) on any failure,
     with a remediation naming the NGC image + ``nvidia-container-toolkit``.
+export_launch_kwargs() -> dict
+    The ``env`` + ``extra_mounts`` an export run needs (explicit ``HOME``, pinned
+    ``UNSLOTH_LLAMA_TAG``, persistent llama.cpp cache mount).
 launch(sloth_args, *, workdir=None, checkout=None, image=NGC_IMAGE, gpus="all",
-       skip_preflight=False, extra_mounts=None, use_host_user=True) -> int
+       skip_preflight=False, extra_mounts=None, use_host_user=True, env=None) -> int
     Run :func:`preflight` (unless skipped), build the command, run it streaming
     its output to the parent stdio. Returns 0 on success; raises :class:`CliError`
     (code 1 or 2) on any container or docker-infrastructure failure.
@@ -40,6 +43,10 @@ Design notes
   The convention is identity-mounts (``host_path == container_path``) so that
   host-absolute paths in *sloth_args* (dataset, output, adapter, suite dirs)
   resolve unchanged inside the container without any path rewriting.
+* Export runs need an explicit ``HOME`` (:data:`EXPORT_HOME`) that is its own
+  host-owned bind mount (outside the workdir), because unsloth resolves llama.cpp
+  from ``Path.home()``. :func:`export_launch_kwargs` returns exactly that
+  ``env``/``extra_mounts`` pair.
 * Subprocess calls are isolated in tiny helpers (:func:`_docker_available`,
   :func:`_image_available`, :func:`_gpu_runtime_ok`, :func:`_stream`,
   :func:`_run_quiet`) so tests can monkeypatch them without invoking docker.
@@ -54,6 +61,7 @@ import subprocess  # nosec B404 - orchestrating docker is this module's whole jo
 from pathlib import Path
 
 from sloth.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
+from sloth.cli._output import emit_diagnostic
 
 # ---------------------------------------------------------------------------
 # Pinned NVIDIA recipe — image, dependency layer, uv bootstrap (all importable)
@@ -70,12 +78,28 @@ NGC_IMAGE: str = "nvcr.io/nvidia/pytorch:25.11-py3"
 #: unpinned ``trl==0.26.1`` was out of range), and peft>=0.19 hard-requires
 #: torchao>0.16 — which itself needs torch>=2.11 that the container lacks — so peft
 #: is held at 0.18.x and transformers at the matching 4.57.1.
+#:
+#: Quantized-export pins (``llmcompressor`` / ``compressed-tensors``), measured live
+#: 2026-09-15 on NGC 25.11 (torch 2.10):
+#:
+#: * ``llmcompressor==0.11.0`` + ``compressed-tensors==0.16.0`` is the pair that
+#:   handles LFM2 correctly. compressed-tensors 0.16.0 calls
+#:   ``torch.accelerator.get_memory_info``, which only exists on **torch>=2.11**, so
+#:   the exporter installs a small API shim for it before importing the stack.
+#: * The older ``llmcompressor==0.10.0.3`` + ``compressed-tensors==0.14.0.1`` pair
+#:   runs NVFP4 natively (no shim needed) but its **AWQ** path fails on **LFM2**
+#:   (``args[0]`` IndexError, because the decoder layers are called with kwargs).
+#:   The shim is the cheaper of the two defects, so 0.11.0/0.16.0 win.
 DEP_LAYER_PACKAGES: tuple[str, ...] = (
     "transformers==4.57.1",
     "peft==0.18.0",
     "hf_transfer",
-    "datasets==4.3.0",
+    # datasets 4.8.5 (was 4.3.0): llmcompressor==0.11.0 requires datasets>=4.8.4,<=4.8.5;
+    # trl 0.24 only needs >=3.0 (deviation d3, live-verified 2026-09-15).
+    "datasets==4.8.5",
     "trl==0.24.0",
+    "llmcompressor==0.11.0",
+    "compressed-tensors==0.16.0",
 )
 
 #: Dependency layer installed with ``uv pip install --no-deps`` — these must NOT
@@ -121,6 +145,59 @@ DEFAULT_HF_CACHE: Path = Path.home() / ".cache" / "huggingface"
 DOCKER_ENV: tuple[tuple[str, str], ...] = (
     ("PYTORCH_ALLOC_CONF", "expandable_segments:True"),
     ("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"),
+)
+
+#: Explicit ``HOME`` for container runs that need a stable, writable home — notably
+#: GGUF export, because unsloth resolves its llama.cpp checkout from
+#: ``Path.home()/".unsloth"/"llama.cpp"`` (``unsloth_zoo/llama_cpp.py``). It is its
+#: **own bind mount** (see :func:`export_launch_kwargs`), deliberately *outside* the
+#: ``/workspace`` workdir mount: docker creates missing mount-point parents as root,
+#: so a HOME nested under the bind-mounted workdir ended up root-owned and the
+#: container user could not create ``$HOME/.cache/uv`` (measured 2026-09-15). A
+#: dedicated host-owned home also means :data:`VENV_DIR` (``$HOME/.unsloth-cli-venv``)
+#: and the llama.cpp cache **persist across ``--rm`` runs** — the dep layer is
+#: installed once per host, not once per run.
+EXPORT_HOME: str = "/opt/sloth-home"
+
+#: Environment variable overriding the host-side directory mounted at
+#: :data:`EXPORT_HOME`.
+EXPORT_HOME_ENV: str = "SLOTH_EXPORT_HOME"
+
+#: Default host-owned directory mounted at :data:`EXPORT_HOME`.
+DEFAULT_EXPORT_HOME: Path = Path.home() / ".cache" / "unsloth-cli" / "home"
+
+#: Pinned llama.cpp release tag used for unsloth's *prebuilt* llama.cpp install
+#: (``UNSLOTH_LLAMA_TAG``). Validated live 2026-09-15. Unsloth skips the prebuilt
+#: install entirely when the cache dir is already populated (measured: 48 s first
+#: run, 28 s cached). Bumping this tag is a deliberate, re-validated change.
+UNSLOTH_LLAMA_TAG: str = "b10909"
+
+#: Environment variable overriding the host-side llama.cpp cache directory. When set,
+#: that directory is bind-mounted at ``<EXPORT_HOME>/.unsloth/llama.cpp`` on top of the
+#: home mount; when unset the cache simply lives inside the home dir at
+#: :data:`DEFAULT_LLAMA_CPP_CACHE`.
+LLAMA_CPP_CACHE_ENV: str = "SLOTH_LLAMA_CPP_CACHE"
+
+#: Default llama.cpp cache location (inside the default export home), so the prebuilt
+#: install survives ``--rm``.
+DEFAULT_LLAMA_CPP_CACHE: Path = DEFAULT_EXPORT_HOME / ".unsloth" / "llama.cpp"
+
+#: Where the Linux kernel reports memory statistics (patched in tests).
+MEMINFO_PATH: Path = Path("/proc/meminfo")
+
+#: Below this much ``MemFree`` (in KiB — 4 GiB), :func:`preflight` emits a
+#: non-blocking stderr hint about the Unsloth-import OOM on the Spark's UMA.
+LOW_MEMFREE_KIB: int = 4 * 1024 * 1024
+
+#: The non-blocking low-memory hint text emitted by :func:`preflight`. It is a
+#: *diagnostic* (stderr, ``note:``-prefixed at emission), not a ``CliError`` — the
+#: check never blocks a run, because MemFree is a snapshot and page cache is
+#: reclaimable.
+LOW_MEMORY_HINT: str = (
+    "Unsloth import can fail with CUDA out of memory on the Spark's unified "
+    "memory when MemFree is low even with expandable_segments; free page cache "
+    "(e.g. touch-and-free a large mmap, or drop caches with root) or stop other "
+    "GPU residents"
 )
 
 #: Single remediation string reused by every :func:`preflight` failure. It names
@@ -431,11 +508,93 @@ def _gpu_runtime_ok(image: str = NGC_IMAGE) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _export_home_dir() -> Path:
+    """Return the host dir mounted at :data:`EXPORT_HOME` (:data:`EXPORT_HOME_ENV` overrides)."""
+    override = os.environ.get(EXPORT_HOME_ENV)
+    if override:
+        return Path(override).expanduser()
+    return DEFAULT_EXPORT_HOME
+
+
+def _llama_cpp_cache_override() -> Path | None:
+    """Return the :data:`LLAMA_CPP_CACHE_ENV` override as a path, or ``None``."""
+    override = os.environ.get(LLAMA_CPP_CACHE_ENV)
+    return Path(override).expanduser() if override else None
+
+
+def export_launch_kwargs() -> dict:
+    """Return the :func:`launch` kwargs an export run needs (env + home mount).
+
+    Export (GGUF) asks unsloth to fetch/build llama.cpp, and unsloth resolves that
+    checkout from ``Path.home()/".unsloth"/"llama.cpp"``. So ``HOME`` is set explicitly
+    to :data:`EXPORT_HOME` and a **host-owned** directory is bind-mounted there. The
+    host side pre-creates ``<home>/.unsloth/llama.cpp`` so docker never has to create
+    a mount-point parent as root (the failure mode that made ``$HOME`` unwritable
+    when HOME lived under the workdir mount). With the cache populated, unsloth skips
+    the prebuilt install on subsequent runs (measured 48 s first, 28 s cached).
+    :data:`UNSLOTH_LLAMA_TAG` pins which prebuilt release is fetched.
+
+    When :data:`LLAMA_CPP_CACHE_ENV` is set, that directory is additionally mounted
+    at ``<EXPORT_HOME>/.unsloth/llama.cpp`` (nested inside the home mount).
+
+    Returns
+    -------
+    dict
+        ``{"env": [("HOME", EXPORT_HOME), ("UNSLOTH_LLAMA_TAG", UNSLOTH_LLAMA_TAG)],
+        "extra_mounts": [(host_home, EXPORT_HOME), ...]}`` — splat straight into
+        :func:`launch` or :func:`build_command`.
+    """
+    home = _export_home_dir()
+    os.makedirs(home / ".unsloth" / "llama.cpp", exist_ok=True)
+    mounts: list[tuple[str, str]] = [(str(home), EXPORT_HOME)]
+    cache = _llama_cpp_cache_override()
+    if cache is not None:
+        os.makedirs(cache, exist_ok=True)
+        mounts.append((str(cache), EXPORT_HOME + "/.unsloth/llama.cpp"))
+    return {
+        "env": [("HOME", EXPORT_HOME), ("UNSLOTH_LLAMA_TAG", UNSLOTH_LLAMA_TAG)],
+        "extra_mounts": mounts,
+    }
+
+
+def _read_memfree_kib() -> int | None:
+    """Return ``MemFree`` in KiB from :data:`MEMINFO_PATH`, or ``None`` if unreadable.
+
+    Never raises: a missing file (non-Linux hosts), an unreadable one, or a line that
+    does not parse all yield ``None`` so the caller stays non-blocking.
+    """
+    try:
+        text = MEMINFO_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if not line.startswith("MemFree:"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            return None
+        try:
+            return int(parts[1])
+        except ValueError:
+            return None
+    return None
+
+
+def _memory_hint() -> None:
+    """Emit the non-blocking low-memory diagnostic when ``MemFree`` is under 4 GiB."""
+    mem_free = _read_memfree_kib()
+    if mem_free is None or mem_free >= LOW_MEMFREE_KIB:
+        return
+    emit_diagnostic(f"note: MemFree is {mem_free / 1024 / 1024:.1f} GiB — {LOW_MEMORY_HINT}")
+
+
 def preflight(*, image: str = NGC_IMAGE) -> None:
     """Validate the host can run the NGC container; raise ``CliError`` otherwise.
 
-    Checks, in order: docker present → image present/pullable → NVIDIA GPU
-    runtime usable. Every failure raises :class:`CliError` with
+    Checks, in order: a **non-blocking** low-memory diagnostic (:func:`_memory_hint`,
+    which only ever writes a ``note:`` line to stderr — emitted first so it survives
+    a later hard failure), then docker present → image present/pullable → NVIDIA GPU
+    runtime usable. Every *failure* raises :class:`CliError` with
     ``code=EXIT_ENV_ERROR`` (2) and :data:`NGC_REMEDIATION` — never a code-1
     "file a bug" — so an agent knows to install docker + nvidia-container-toolkit.
 
@@ -445,6 +604,7 @@ def preflight(*, image: str = NGC_IMAGE) -> None:
         When docker is absent, the image cannot be pulled, or the GPU runtime is
         unavailable.
     """
+    _memory_hint()
     if not _docker_available():
         raise CliError(
             code=EXIT_ENV_ERROR,
@@ -478,6 +638,7 @@ def launch(
     skip_preflight: bool = False,
     extra_mounts: list[tuple[str, str]] | None = None,
     use_host_user: bool = True,
+    env: list[tuple[str, str]] | None = None,
 ) -> int:
     """Preflight, build the docker command, run it streaming output, return 0 or raise.
 
@@ -486,8 +647,10 @@ def launch(
     container starts. Then builds the command with :func:`build_command` and runs
     it via :func:`_stream`, inheriting the parent's stdio so logs stream live.
 
-    Parameters mirror :func:`build_command`; *skip_preflight* lets a caller that
-    already validated the environment (or a test) bypass the docker probes.
+    Parameters mirror :func:`build_command` (including *env* and *extra_mounts*,
+    forwarded verbatim — see :func:`export_launch_kwargs` for the export-run pair);
+    *skip_preflight* lets a caller that already validated the environment (or a
+    test) bypass the docker probes.
 
     Returns
     -------
@@ -514,6 +677,7 @@ def launch(
         gpus=gpus,
         extra_mounts=extra_mounts,
         use_host_user=use_host_user,
+        env=env,
     )
     code = _stream(cmd)
     if code == 0:

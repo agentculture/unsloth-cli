@@ -2,7 +2,8 @@
 
 Flow::
 
-    load_config  ->  validate dataset  ->  scope-guard  ->  dry-run | train
+    load_config  ->  validate dataset  ->  model preflight  ->  scope-guard
+                 ->  dry-run | train
 
 1. **load_config** — parse the ``run.toml`` into a :class:`~sloth.tune.config.RunConfig`
    (``CliError`` propagates on a missing/invalid config).
@@ -10,6 +11,12 @@ Flow::
    :func:`~sloth.tune.datasets.validate_dataset` *before any GPU work* so a
    malformed dataset fails fast with ``CliError(code=1)`` ("validate before
    spending GPU").
+2b. **model preflight** — :func:`_preflight_model` (host path only, stdlib only):
+   recommends ``target_modules = "preset:lfm2"`` for an LFM2 model that leaves it
+   unset, notes that lobes' hand lane caps LoRA rank at 32, and — for a ``chat``
+   dataset — refuses (``CliError(code=1)``) when the *locally cached* model ships
+   no chat template. It never imports transformers/huggingface_hub, and is skipped
+   under ``--in-container`` so each diagnostic is emitted once per invocation.
 3. **scope-guard** — :func:`~sloth.tune.scope.check_scope` classifies the
    (model, method) request. An out-of-scope request (e.g. full fine-tuning of a
    large dense model) emits its warning EXPLICITLY to stderr via
@@ -57,6 +64,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +88,138 @@ SCOPE_NOTICE = (
     "dense models is out of scope and will be refused — use method='lora' or "
     "method='qlora'."
 )
+
+
+#: Substring (matched case-insensitively) that identifies an LFM2-family model id.
+LFM2_MARKER = "lfm2"
+
+#: LoRA rank ceiling accepted by lobes' "hand" serving lane. A higher rank still
+#: trains — it just may not be servable there — so exceeding it is a DIAGNOSTIC,
+#: never an error.
+LOBES_HAND_LANE_RANK_CAP = 32
+
+#: One-line recommendation emitted when an LFM2 model is trained with no explicit
+#: ``target_modules``: Unsloth's default adapts only the attention projections and
+#: silently misses LFM2's short-conv blocks (see sloth/tune/presets.py).
+LFM2_PRESET_HINT = (
+    "note: {model} looks like an LFM2 model and target_modules is unset — set "
+    'target_modules = "preset:lfm2" in [hyperparameters] to adapt the short-conv '
+    "and feed-forward blocks too (the default adapts attention projections only)."
+)
+
+#: One-line diagnostic emitted when an LFM2 run asks for a rank above the cap.
+LFM2_RANK_HINT = (
+    "note: lora_r = {rank} — lobes' hand lane caps LoRA rank at "
+    "{cap}; the adapter will still train but may not be servable there."
+)
+
+#: One-line diagnostic when the chat-template check cannot run (model not cached).
+CHAT_TEMPLATE_UNKNOWN_HINT = (
+    "note: {model} is not in the local Hugging Face cache, so its chat template "
+    "could not be verified before the run; a base model without a chat template "
+    "cannot train on the chat schema."
+)
+
+
+# ---------------------------------------------------------------------------
+# Host-side model preflight (pure stdlib — no transformers, no huggingface_hub)
+# ---------------------------------------------------------------------------
+
+
+def _hf_hub_root() -> Path:
+    """Return the local Hugging Face hub cache root, honouring ``HF_HOME``."""
+    hf_home = os.environ.get("HF_HOME")
+    base = Path(hf_home) if hf_home else Path.home() / ".cache" / "huggingface"
+    return base / "hub"
+
+
+def _model_snapshot_dir(model: str) -> Path | None:
+    """Return the local directory holding *model*'s files, or ``None`` if not cached.
+
+    A *local path* that is a directory counts as cached and is returned as-is.
+    Otherwise the HF cache layout is walked:
+    ``<hub>/models--<org>--<name>/snapshots/<rev>/`` — the most recently modified
+    revision wins when several are present. Purely ``pathlib`` — the heavy HF
+    libraries are never imported on the host path.
+    """
+    local = Path(model).expanduser()
+    if local.is_dir():
+        return local
+
+    repo_dir = _hf_hub_root() / f"models--{model.replace('/', '--')}"
+    snapshots = repo_dir / "snapshots"
+    try:
+        revisions = [d for d in snapshots.iterdir() if d.is_dir()]
+    except OSError:
+        return None
+    if not revisions:
+        return None
+    return max(revisions, key=lambda d: d.stat().st_mtime)
+
+
+def _has_chat_template(snapshot: Path) -> bool:
+    """True when *snapshot* ships a chat template in either supported form.
+
+    Two forms exist in the wild: a ``chat_template`` key inside
+    ``tokenizer_config.json``, and a standalone ``chat_template.jinja`` file
+    (which is what LiquidAI/LFM2.5-1.2B-Base ships — measured 2026-09-15).
+    """
+    if (snapshot / "chat_template.jinja").is_file():
+        return True
+    try:
+        with (snapshot / "tokenizer_config.json").open(encoding="utf-8") as fh:
+            config = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(config, dict) and bool(config.get("chat_template"))
+
+
+def _preflight_model(config: RunConfig, schema: str) -> None:
+    """Emit host-side model diagnostics and refuse a chat run the model cannot do.
+
+    Runs between dataset validation and the scope guard, on the HOST path only
+    (the ``--in-container`` recursion skips it so each invocation emits each
+    diagnostic exactly once). Three checks:
+
+    1. **LFM2 target_modules hint** — an LFM2 model with no ``target_modules``
+       gets one line recommending ``"preset:lfm2"``.
+    2. **Hand-lane rank cap** — an LFM2 run with ``lora_r`` above
+       :data:`LOBES_HAND_LANE_RANK_CAP` gets one line; never an error.
+    3. **Chat-template check** — for a ``chat`` dataset, a *cached* model with no
+       chat template raises ``CliError(code=1)`` pointing at the task schema; an
+       uncached model only emits a diagnostic and proceeds.
+    """
+    is_lfm2 = LFM2_MARKER in config.model.lower()
+
+    if is_lfm2 and config.target_modules is None:
+        emit_diagnostic(LFM2_PRESET_HINT.format(model=config.model))
+
+    if is_lfm2 and config.lora_r > LOBES_HAND_LANE_RANK_CAP:
+        emit_diagnostic(LFM2_RANK_HINT.format(rank=config.lora_r, cap=LOBES_HAND_LANE_RANK_CAP))
+
+    if schema != "chat":
+        return
+
+    snapshot = _model_snapshot_dir(config.model)
+    if snapshot is None:
+        emit_diagnostic(CHAT_TEMPLATE_UNKNOWN_HINT.format(model=config.model))
+        return
+    if not _has_chat_template(snapshot):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=(
+                f"model {config.model} ships no chat template (neither a "
+                f"'chat_template' key in tokenizer_config.json nor a "
+                f"chat_template.jinja under {snapshot}), so it cannot train on a "
+                f"chat-schema dataset"
+            ),
+            remediation=(
+                "Convert the dataset to the task schema "
+                '({"task", "input", "expected_output"} per line) and rerun, or point '
+                "the config at an instruct/chat variant of the model that ships a "
+                "chat template."
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +372,13 @@ def cmd_train(args: argparse.Namespace) -> int | None:
     # 2) Validate the dataset BEFORE any GPU work ("validate before spending GPU").
     schema = _resolve_schema(config.dataset)
     validate_dataset(config.dataset, schema)
+
+    # 2b) Host model preflight (stdlib only): LFM2 target_modules hint, lobes'
+    # hand-lane rank cap, and the chat-template check. Skipped under
+    # --in-container so the container recursion never repeats a diagnostic the
+    # host already emitted (one line per invocation).
+    if not in_container:
+        _preflight_model(config, schema)
 
     # 3) Scope-guard: warn explicitly, then hard-refuse an out-of-scope request.
     scope = check_scope(config.model, config.method)

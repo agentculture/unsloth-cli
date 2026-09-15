@@ -115,6 +115,7 @@ def write_metadata(
         "model": model,
         "method": method,
         "dataset": {
+            "path": str(dataset_path),
             "sha256": sha256,
             "line_count": line_count,
         },

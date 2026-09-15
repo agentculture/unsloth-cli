@@ -1,0 +1,31 @@
+# LFM2 LoRA config — LiquidAI/LFM2.5-1.2B-Base with the lfm2 target preset.
+#
+# Run from the repo root:
+#   sloth train --config examples/lfm2-lora.toml
+#
+# `target_modules = "preset:lfm2"` resolves to the regex that adapts all 92
+# LoRA-able modules of LFM2.5-1.2B (24 attention, 20 short-conv, 48
+# feed-forward). Unsloth's default adapts only q/k/v on the 6 attention
+# layers; a plain name list cannot reach the conv layers. Sized for a quick
+# smoke run (max_steps = 10), not a production adapter.
+
+[run]
+model   = "LiquidAI/LFM2.5-1.2B-Base"   # a LoRA must be SERVED on the checkpoint it was trained on:
+                                          # lobes' hand lane serves -Instruct by default, so train on
+                                          # "LiquidAI/LFM2.5-1.2B-Instruct" for hand; Base is the #16 target
+method  = "lora"                     # "lora" or "qlora" — the only supported methods
+dataset = "examples/chat-smoke.jsonl"
+output  = "runs/lfm2-lora"
+
+[hyperparameters]
+lora_r         = 16                  # lobes' hand lane caps LoRA rank at 32; keep 16
+lora_alpha     = 16
+lora_dropout   = 0.0
+learning_rate  = 2e-4
+max_seq_len    = 1024
+batch_size     = 1
+grad_accum     = 4
+max_steps      = 10
+seed           = 3407
+load_in_4bit   = false               # 16-bit base for plain LoRA
+target_modules = "preset:lfm2"

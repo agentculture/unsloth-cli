@@ -1,0 +1,734 @@
+{
+  "slug": "lfm2-5-target-modules-quantized-export",
+  "title": "LFM2.5 target_modules + quantized export",
+  "frame_slug": "lfm2-5-target-modules-quantized-export",
+  "schema_version": 5,
+  "status": "exported",
+  "created": "2026-09-15T10:02:14Z",
+  "updated": "2026-09-15T12:51:14Z",
+  "targets": [
+    {
+      "id": "c1",
+      "kind": "announcement",
+      "text": "unsloth-cli trains full-coverage LoRA adapters for LFM2.5 (short-conv blocks included, via an explicit target_modules key with an lfm2 preset) and exports any adapter as merged-16bit, merged-4bit, quantized GGUF, or AWQ W4A16, so the same adapter runs on a Jetson Orin Nano (llama.cpp), a Jetson Thor or DGX Spark (vLLM), or lobes' hand lane",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h10",
+      "kind": "honesty",
+      "text": "the four export formats and the lfm2 preset are exercised by real Spark runs before the announcement is made; formats that fail live are documented as not tested, never claimed",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c2",
+      "kind": "requirement",
+      "text": "RunConfig in sloth/tune/config.py:91-118 gains an optional [hyperparameters].target_modules typed list[str] | str | None \u2014 a list of module names, a single regex string, or preset:<name> (resolved to its regex before use) \u2014 with a new _require_target_modules validator following the _require_int/_require_float idiom at config.py:126-189; unknown TOML keys are silently ignored today (config.py:232,260) so there is no schema-rejection code to update",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h28",
+      "kind": "honesty",
+      "text": "load_config accepts a list of non-empty strings, a single non-empty string (regex or preset:<name>), or absence; any other type, an empty list/string, or an unknown preset name exits 1 with a hint listing the three accepted forms; an explicit list or regex round-trips unchanged into the dry-run plan and a preset round-trips as its resolved regex",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c3",
+      "kind": "requirement",
+      "text": "sloth/tune/_trainer.py passes target_modules= to backend.fast_language_model.get_peft_model (today only r/lora_alpha/lora_dropout/random_state at _trainer.py:270-276) and adds the resolved list to _resolved_hyperparameters (_trainer.py:91-104), which is the single source for the --dry-run plan and for training_metadata.json (metadata.py:121 dumps the hyperparameters dict whole; train.py:119-140 renders the dict generically)",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h3",
+      "kind": "honesty",
+      "text": "the fake backend's get_peft events record target_modules exactly as resolved, and training_metadata.json contains the same list",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c5",
+      "kind": "requirement",
+      "text": "sloth/cli/_commands/export.py extends SUPPORTED_FORMATS (export.py:42) with merged-16bit, merged-4bit, gguf and adds --quant, --base (default read from adapter_config.json base_model_name_or_path \u2014 export.py never parses that file today), and --dry-run (no dry-run exists in export.py or eval.py); the new formats route host\u2192container exactly like eval.py:122-146 (hidden --in-container flag eval.py:194-199, identity mounts of adapter/output parents, container.launch with checkout=_repo_root()); tests/test_cmd_export.py:71-80 (gguf rejected) and 231-257 (container never launched) get scoped to --format safetensors",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h4",
+      "kind": "honesty",
+      "text": "sloth export --format safetensors still never imports sloth.tune.container (existing tests scoped, not deleted); every other format launches the container exactly once with identity mounts of adapter and output parents",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c6",
+      "kind": "requirement",
+      "text": "A new lazy seam (sloth/tune/_exporter.py, same discipline as _trainer.py:145-173 _load_backend) loads base + adapter through FastLanguageModel and calls model.save_pretrained_merged(save_method='merged_16bit'|'merged_4bit') or model.save_pretrained_gguf(quantization_method=[...]); both are generic monkeypatched methods bound to every Unsloth model incl. FastModel (save.py:3604-3623) with no LFM2 block (only VLMs at save.py:3463 and GPT-OSS at 2234-2266 are special-cased); the --quant allowlist is the ggml list documented at save.py:2153-2204 and is validated host-side (exit 1 + hint) before any container launch",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h5",
+      "kind": "honesty",
+      "text": "a fake backend test proves save_pretrained_merged / save_pretrained_gguf are called with the resolved save_method / quantization_method list; one real Spark run per format proves the artifact loads (transformers for merged, llama-cli for gguf)",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c7",
+      "kind": "requirement",
+      "text": "sloth/tune/container.py gains a persistent llama.cpp cache mount + env passthrough: unsloth_zoo.llama_cpp.install_llama_cpp (llama_cpp.py:1179-1394) installs to ~/.unsloth/llama.cpp (llama_cpp.py:132-138), prebuilt-binary download first (1167-1178), source build fallback needing gcc/cmake/git/curl (2707-2751, auto-apt), and honours UNSLOTH_LLAMA_CPP_PATH / UNSLOTH_LLAMA_TAG; the container runs --rm and mounts only the HF cache (container.py:112-115,357-359) so every gguf export would refetch/rebuild; launch() (471-481) does not expose the env param build_command has (342-343)",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h6",
+      "kind": "honesty",
+      "text": "two consecutive gguf exports on the Spark reuse the mounted llama.cpp (second run performs no clone/download), and UNSLOTH_LLAMA_TAG is pinned in container.py",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c8",
+      "kind": "boundary",
+      "text": "--format safetensors stays pure stdlib \u2014 no container, no torch \u2014 exactly as export.py:16-29 and the catalog _EXPORT entry (catalog.py:277) promise today; every other format (merged-16bit, merged-4bit, gguf, awq, nvfp4) launches the container",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h7",
+      "kind": "honesty",
+      "text": "tests/test_packaging_import_light.py-style check: importing sloth.cli._commands.export never imports torch, and safetensors export runs on a box without docker",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c9",
+      "kind": "boundary",
+      "text": "sloth validate and sloth/tune/datasets.py stay strictly stdlib (validate.py:18-27, datasets.py:20-26, no model/tokenizer argument); a no-chat-template preflight for chat-schema datasets, if built, lives in train.py's host preflight (between dataset validation and the scope guard, train.py:232-247) and reads tokenizer_config.json / chat_template.jinja from the local HF cache with json/pathlib, or runs in-container \u2014 it never imports transformers on the host",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h8",
+      "kind": "honesty",
+      "text": "sloth validate's import graph is unchanged; the chat-template preflight in train reads only files under the HF cache with json/pathlib and degrades to a diagnostic (not an error) when the model is not cached yet",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c14",
+      "kind": "requirement",
+      "text": "Docs and skill surfaces that hardcode safetensors or omit target_modules are updated together: catalog.py _EXPORT (267-298) and _TRAIN (201-235), README.md:86, docs/fine-tuning.md export section + [hyperparameters] block, docs/benchmarks.md:47,79-80, examples/*.toml (add an lfm2 example config), .claude/skills/finetune/SKILL.md run-mode table and scripts/finetune.sh:182 (hardcoded --format safetensors, needs an --export-format/--quant passthrough); learn.py needs no change (it lists only introspection verbs, learn.py:15-66)",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h9",
+      "kind": "honesty",
+      "text": "grep for 'safetensors' in README, docs/fine-tuning.md, catalog _EXPORT and finetune.sh shows the format list, and finetune.sh run mode forwards --export-format/--quant",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c20",
+      "kind": "audience",
+      "text": "AgentCulture mesh agents and their operators producing adapters on a DGX Spark, plus three deployment targets: Jetson Orin series incl. Nano 8 GB (llama.cpp/Ollama GGUF, or vLLM AWQ W4A16), Jetson Thor and DGX Spark (vLLM NVFP4 preferred, or bf16 + LoRA via lobes hand)",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h12",
+      "kind": "honesty",
+      "text": "docs/fine-tuning.md has a target table with one row each for Orin (gguf / awq), Thor and Spark (nvfp4 / bf16+LoRA via lobes hand), and each row names the export format that was live-tested for it",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c21",
+      "kind": "before_state",
+      "text": "Today sloth train silently adapts only what Unsloth auto-detects (LFM2 conv blocks excluded), sloth export only copies a PEFT adapter directory, and nothing produced by this repo can run on a Jetson or as a quantized vLLM model",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h13",
+      "kind": "honesty",
+      "text": "a dry-run with an LFM2 model id on the pre-change code shows no target_modules and export rejects any non-safetensors format (test_cmd_export.py::test_unsupported_format passes on main today)",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c22",
+      "kind": "after_state",
+      "text": "An operator trains an LFM2.5-1.2B-Base adapter with target_modules = \"preset:lfm2\", then runs sloth export --format gguf --quant q4_k_m for an Orin Nano or --format awq for Thor/Spark vLLM, each producing a self-contained model directory plus export.json, with every step honouring --json, --dry-run and error:/hint:",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h14",
+      "kind": "honesty",
+      "text": "the /finetune skill run mode drives train -> eval -> export --format gguf|awq|nvfp4 end to end on the Spark with --json, and each step's JSON lands on stdout only",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c23",
+      "kind": "why_it_matters",
+      "text": "Adapters are only useful where they run: lobes hand needs loadable LoRA dirs, edge Jetsons need a single quantized file, and the same Spark that trains should be able to serve a W4A16 build without a second toolchain",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h15",
+      "kind": "honesty",
+      "text": "the same adapter directory produced by sloth train is the input to every export format; no format requires retraining",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c24",
+      "kind": "requirement",
+      "text": "sloth export --format awq (W4A16, compressed-tensors layout that vLLM loads on Thor/Spark/Orin) is built on llm-compressor, not Unsloth: the pinned unsloth 2026.6.9 save.py has no AWQ save path (awq appears only in loader_utils/loader/vision for loading pre-quantized models); the container path first produces merged-16bit via save_pretrained_merged, then runs llmcompressor.oneshot with AWQModifier and scheme W4A16_ASYM using --calib <jsonl> (default: the training dataset, N samples at max_seq_len); llmcompressor==0.11.0 + compressed-tensors==0.16.0 resolve on aarch64 against the exact container pins torch==2.10.0 transformers==4.57.1 peft==0.18.0 (uv pip compile, 2026-09-15) and are added to DEP_LAYER_PACKAGES pinned",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h1",
+      "kind": "honesty",
+      "text": "llmcompressor imports and runs oneshot inside the NGC 25.11 venv without pulling a second torch (the same uninstall-venv-torch trick as container.py:177-184 must hold)",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c25",
+      "kind": "success_signal",
+      "text": "Live-tested on the DGX Spark, not just unit-tested: 1 real LFM2.5-1.2B-Base LoRA train with the lfm2 preset (adapter_config.json target_modules lists in_proj + out_proj), 1 gguf q4_k_m export, 1 awq W4A16 export and 1 merged-16bit export, each recorded as a row in docs/tested.md with the exact invocation",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h11",
+      "kind": "honesty",
+      "text": "each docs/tested.md row is backed by a command that was actually run on the Spark in that PR's branch, with the artifact loaded once (llama-cli for gguf, vllm for awq, transformers for merged-16bit, vllm --lora-modules for the LFM2.5 adapter); a format whose live run fails ships as 'not tested', not as supported",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c26",
+      "kind": "success_signal",
+      "text": "Unit suite stays >= 60% coverage and teken cli doctor . --strict stays green with the new flags; export --dry-run for every format exits 0 with no container launch; an invalid --quant exits 1 with a hint before any docker call",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h16",
+      "kind": "honesty",
+      "text": "CI's test job reports coverage >= 60 and the lint job's teken cli doctor . --strict exits 0 on the PR branch; a test asserts export --dry-run never calls container.launch for each format",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c27",
+      "kind": "requirement",
+      "text": "When the model id contains lfm2 (case-insensitive) and [hyperparameters].target_modules is absent, sloth train emits one emit_diagnostic hint on stderr pointing at target_modules = \"preset:lfm2\" (dry-run and real runs) and proceeds. Presets are spelled preset:<name> in the same TOML key that also accepts a list of names or a single regex string. Because Unsloth folds a name list into a tag regex that cannot reach LFM2's conv.in_proj/out_proj (measured live: 0 conv modules adapted from an 8-name list), preset:lfm2 resolves to the regex model\\.layers\\.\\d+\\.(self_attn\\.(q|k|v|out)_proj|conv\\.(in|out)_proj|feed_forward\\.w[123]) and the resolved value is what lands in the dry-run plan and training_metadata.json",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h17",
+      "kind": "honesty",
+      "text": "with an LFM2 model id and no target_modules the hint text appears on stderr exactly once and stdout is unchanged (dry-run JSON parses); with preset:lfm2 the plan's hyperparameters.target_modules equals the documented regex and a fake-backend run records that same string in get_peft_model kwargs",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c29",
+      "kind": "requirement",
+      "text": "sloth export --format nvfp4 (Blackwell: Spark, Thor) reuses the same llm-compressor oneshot path as awq with QuantizationModifier(scheme='NVFP4', targets=['Linear'], ignore=['lm_head']) and the same calibration data, writing a compressed-tensors nvfp4 layout that vLLM loads on Blackwell; --format awq stays for Orin",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h18",
+      "kind": "honesty",
+      "text": "one real nvfp4 export on the Spark writes quantization_config.format == nvfp4-pack-quantized and vllm/vllm-openai loads it and generates (measured 2026-09-15 with llmcompressor 0.10.0.3, no shim)",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c30",
+      "kind": "requirement",
+      "text": "Adding target_modules to RunConfig must not change config_hash for existing TOMLs that do not set it: registry.compute_config_hash hashes dataclasses.asdict(config) (registry.py:147-158), so a new None-default field silently changes every stored run's hash and breaks runs/compare matching \u2014 omit None-valued optional fields from the hash (or version the hash) and test that a pre-change TOML hashes identically",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h20",
+      "kind": "honesty",
+      "text": "tests/test_runs_registry.py asserts compute_config_hash of examples/lora-smoke.toml is byte-identical before and after the target_modules field is added",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c31",
+      "kind": "requirement",
+      "text": "Calibration data for awq/nvfp4 defaults to the run's training dataset rendered exactly as the trainer renders it (chat template or Task/Input/Output text, _trainer.py:228); export emits a stderr diagnostic when fewer than 64 calibration samples are available (the smoke datasets have single digits) and --calib <jsonl> / --calib-samples N override it",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h21",
+      "kind": "honesty",
+      "text": "a fake-backend test shows the calibration texts passed to oneshot equal the trainer's rendered texts for the same dataset, and a 5-record dataset triggers the <64-samples diagnostic on stderr",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c32",
+      "kind": "requirement",
+      "text": "Exports are atomic and named as asked: the container writes into <output>.partial and the host renames to <output> only on exit 0, so a killed/OOM run never leaves a half-written model dir; Unsloth's '_gguf' directory suffix and its F16 intermediate GGUF (2x the model size) are normalised away \u2014 final files land exactly under --output and intermediates are deleted unless --keep-intermediate",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h22",
+      "kind": "honesty",
+      "text": "killing the container mid-export (SIGKILL in a test via a fake launcher that exits 137) leaves no <output> dir, only <output>.partial; a successful gguf export leaves exactly the requested quant files under --output and no F16 intermediate",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c33",
+      "kind": "requirement",
+      "text": "Export --dry-run reports estimated disk need (merged bf16 = 2 bytes/param; gguf adds an F16 intermediate of the same size; awq/nvfp4 ~0.5-0.6 bytes/param) and free space under --output, and the real run fails closed with exit 2 + hint when free space is below the estimate",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h23",
+      "kind": "honesty",
+      "text": "export --dry-run --json carries estimated_bytes and free_bytes; a test with a fake statvfs below the estimate gets exit 2 + hint without any container launch",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c34",
+      "kind": "requirement",
+      "text": "The torch.accelerator.get_memory_info shim for compressed-tensors 0.16 is applied only when the API is absent AND compressed_tensors.__version__ == 0.16.0, lives in one function in _exporter.py with a comment naming the NGC image it works around, and a unit test asserts the shim is a no-op when the API exists so it is removed when the image moves to torch>=2.11",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h24",
+      "kind": "honesty",
+      "text": "the shim function is covered by two tests: applied when the attribute is missing and compressed_tensors is 0.16.0; skipped (torch untouched) when the attribute exists",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c35",
+      "kind": "requirement",
+      "text": "Container preflight for merge/quantize exports reports host MemAvailable/MemFree and prints a hint when MemFree is below ~4 GB (Unsloth import CUDA-OOMs on the Spark UMA in that state even with expandable_segments; reclaiming page cache fixed it in the probe), instead of letting the run die at import with a CUDA out-of-memory traceback",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h25",
+      "kind": "honesty",
+      "text": "preflight reads /proc/meminfo on Linux and the low-MemFree hint text appears on stderr in a test with a fake meminfo; it never blocks the run, only warns",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c36",
+      "kind": "boundary",
+      "text": "sloth export never overwrites a non-empty --output directory; it exits 1 with a hint unless --force is given (a re-export must not silently clobber a model a lobes/Jetson deployment is already reading from)",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h26",
+      "kind": "honesty",
+      "text": "exporting into a dir that already contains files exits 1 with a hint naming --force; with --force it proceeds; an empty or absent dir needs no flag",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c39",
+      "kind": "requirement",
+      "text": "sloth eval --model DIR (mutually exclusive with --adapter) runs the task-schema suite against a merged-16bit, awq or nvfp4 directory in-container via transformers + compressed-tensors (gguf is scored via llama.cpp's llama-completion from the mounted cache); the result JSON carries the same fields as adapter eval plus model_dir, quant_method/format from config.json, so summarize/compare can show quantization loss side by side",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h27",
+      "kind": "honesty",
+      "text": "one Spark run scores the same eval suite on the LFM2.5 merged-16bit, awq and nvfp4 outputs and the three scores appear in docs/tested.md; a fake-backend test covers the --model branch and the --adapter/--model exclusivity error (exit 1 + hint)",
+      "deferred": false,
+      "deferred_reason": ""
+    }
+  ],
+  "tasks": [
+    {
+      "id": "t1",
+      "summary": "PR1/t1 \u2014 config: target_modules key (list | regex string | preset:<name>) + lfm2 preset resolution",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "sloth/tune/config.py: RunConfig.target_modules is list[str] | str | None (default None); load_config accepts a non-empty list of non-empty strings, a single non-empty string, or absence; anything else (wrong type, empty, unknown preset) raises CliError(code=1) whose remediation names the three accepted forms",
+        "a new pure-stdlib module sloth/tune/presets.py exposes PRESETS = {'lfm2': r'model\\.layers\\.\\d+\\.(self_attn\\.(q|k|v|out)_proj|conv\\.(in|out)_proj|feed_forward\\.w[123])'} and resolve_target_modules(value) which maps 'preset:<name>' to its regex and passes lists/regex strings through unchanged",
+        "tests/test_tune_config.py covers: absent key -> None; explicit list round-trips; regex string round-trips; preset:lfm2 resolves to the documented regex; wrong type / empty / preset:nope -> exit 1 with hint; black/isort/flake8 clean"
+      ],
+      "deps": [],
+      "covers": [
+        "c2",
+        "h28"
+      ],
+      "instruction": "Follow the _require_int/_require_float idiom at config.py:126-189 and add _require_target_modules. Keep the module importing only stdlib. Do NOT try to reach conv layers with a name list \u2014 the live probe showed Unsloth folds a list into a tag regex without 'conv' (0 conv modules adapted from an 8-name list); only the regex string form adapts all 92 LFM2.5-1.2B modules. Owned files: sloth/tune/config.py, sloth/tune/presets.py (new), tests/test_tune_config.py."
+    },
+    {
+      "id": "t2",
+      "summary": "PR1/t2 \u2014 registry: config_hash stays stable when optional fields are unset",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "sloth/tune/registry.py compute_config_hash drops keys whose value is None before hashing; tests/test_runs_registry.py asserts the hash of examples/lora-smoke.toml equals the literal hex value it has on main today (record it in the test) and that setting target_modules changes it"
+      ],
+      "deps": [],
+      "covers": [
+        "c30",
+        "h20"
+      ],
+      "instruction": "The hash is over dataclasses.asdict(config) (registry.py:147-158). Filter None-valued top-level keys, nothing else, so every pre-existing run keeps its id. Owned files: sloth/tune/registry.py, tests/test_runs_registry.py."
+    },
+    {
+      "id": "t3",
+      "summary": "PR1/t3 \u2014 trainer: pass resolved target_modules to get_peft_model and surface it in the plan + metadata",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "sloth/tune/_trainer.py passes target_modules=<resolved value> to backend.fast_language_model.get_peft_model only when the config sets it (kwarg omitted when None so Unsloth's default path is unchanged)",
+        "_resolved_hyperparameters includes 'target_modules' (resolved regex/list or null), so run_training(dry_run=True) plan and training_metadata.json both carry it with no change to metadata.py",
+        "tests/test_tune_trainer.py: fake backend events['get_peft'][0]['target_modules'] equals the resolved value for preset:lfm2 and the kwarg is absent when unset; metadata file contains the same value"
+      ],
+      "deps": [
+        "t1"
+      ],
+      "covers": [
+        "c3",
+        "h3"
+      ],
+      "instruction": "Only _trainer.py changes: the get_peft_model call at 270-276 and _resolved_hyperparameters at 91-104. Resolve via sloth.tune.presets.resolve_target_modules. Owned files: sloth/tune/_trainer.py, tests/test_tune_trainer.py."
+    },
+    {
+      "id": "t4",
+      "summary": "PR1/t4 \u2014 train host preflight: LFM2 hint, rank>32 hand-lane diagnostic, chat-template check",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "sloth train (dry-run and real) with a model id containing 'lfm2' (case-insensitive) and no target_modules emits exactly one emit_diagnostic line on stderr recommending target_modules = \"preset:lfm2\" and proceeds; stdout JSON is unchanged and parses",
+        "when the model id contains 'lfm2' and lora_r > 32 a stderr diagnostic says lobes' hand lane caps LoRA rank at 32; never an error",
+        "for a chat-schema dataset, the host preflight looks for chat_template in tokenizer_config.json or a chat_template.jinja under the local HF cache snapshot for the model; if the model is cached and neither exists it exits 1 with a hint to use the task schema; if the model is not cached yet it emits a diagnostic and proceeds; sloth validate and sloth/tune/datasets.py import graphs are unchanged (tests/test_packaging_import_light.py still passes)",
+        "tests/test_cmd_train.py covers all three behaviours with tmp HF-cache fixtures; no transformers import on the host"
+      ],
+      "deps": [
+        "t1",
+        "t3"
+      ],
+      "covers": [
+        "c27",
+        "h17",
+        "c9",
+        "h8"
+      ],
+      "instruction": "Insert between dataset validation and the scope guard (train.py:232-247). The HF cache layout is ~/.cache/huggingface/hub/models--<org>--<name>/snapshots/<rev>/; read files with json/pathlib only. Owned files: sloth/cli/_commands/train.py, tests/test_cmd_train.py."
+    },
+    {
+      "id": "t5",
+      "summary": "PR1/t5 \u2014 docs + catalog + example for target_modules and the deployment-target table",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "docs/fine-tuning.md documents target_modules (list / regex / preset:lfm2) in the [hyperparameters] block and adds a 'Deployment targets' table with rows Orin (gguf, awq W4A16), Thor (nvfp4), Spark (nvfp4, bf16 + LoRA via lobes hand), each naming the format live-tested for it and linking docs/tested.md",
+        "examples/lfm2-lora.toml exists (LiquidAI/LFM2.5-1.2B-Base, method lora, lora_r 16, target_modules = \"preset:lfm2\") and sloth train --config examples/lfm2-lora.toml --dry-run exits 0 in tests",
+        "catalog.py _TRAIN and _CONFIG_INIT mention target_modules and preset:lfm2; README's config section mentions the key; uv run teken cli doctor . --strict stays green; markdownlint clean"
+      ],
+      "deps": [
+        "t1"
+      ],
+      "covers": [
+        "c20",
+        "h12"
+      ],
+      "instruction": "Docs-only task for PR1; the PR2 docs task (t12) depends on this one to avoid same-file merges on catalog.py/README/docs/fine-tuning.md. Owned files: docs/fine-tuning.md, README.md, examples/lfm2-lora.toml, sloth/explain/catalog.py (train/config entries only)."
+    },
+    {
+      "id": "t6",
+      "summary": "PR1/t6 \u2014 live validation on the Spark: LFM2.5-1.2B-Base LoRA with preset:lfm2, served by vLLM, recorded in docs/tested.md",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "before the change (main): sloth train --config examples/lfm2-lora.toml --dry-run shows no target_modules in the plan (record the command + output in the PR description) \u2014 the before-state",
+        "after: a real sloth train run of examples/lfm2-lora.toml completes on the Spark; the adapter's adapter_config.json target_modules equals the lfm2 regex; the adapter loads in vllm/vllm-openai with --enable-lora (LoRARequest generation succeeds); docs/tested.md gains the train row with the exact invocation and the LFM2 hint behaviour is shown"
+      ],
+      "deps": [
+        "t2",
+        "t3",
+        "t4",
+        "t5"
+      ],
+      "covers": [
+        "c21",
+        "h13"
+      ],
+      "instruction": "If Unsloth import dies with CUDA out-of-memory at import while lobes' vLLM holds most of the UMA, reclaim page cache first (touch-and-free a 16 GiB mmap works without sudo) \u2014 see memory record unsloth-cli-quant-export-livetest-2026-09-15. Use the version-bump skill and open PR 1 via the cicd skill after this task. Owned files: docs/tested.md (PR1 rows), CHANGELOG.md, pyproject.toml."
+    },
+    {
+      "id": "t7",
+      "summary": "PR2/t7 \u2014 export CLI host side: new formats, flags, validation, dry-run, no-clobber, atomic output, disk estimate, container routing",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "SUPPORTED_FORMATS = {safetensors, merged-16bit, merged-4bit, gguf, awq, nvfp4}; --format safetensors keeps today's pure-stdlib behaviour byte-for-byte and the module never imports sloth.tune.container at module level (existing container-not-called tests scoped to safetensors, not deleted)",
+        "new flags: --quant (comma list, validated against the ggml allowlist q4_k_m q5_k_m q8_0 f16 q2_k q3_k_m q4_0 q4_1 q5_0 q6_k), --calib PATH, --calib-samples N, --base ID (default: adapter_config.json base_model_name_or_path), --force, --dry-run, hidden --in-container; every invalid value exits 1 with a hint before any container.launch call",
+        "--dry-run (all formats) exits 0 with no container launch and a plan containing format, quant, base, output, estimated_bytes, free_bytes, docker_command; the real run exits 2 with a hint when free_bytes < estimated_bytes (test with a fake statvfs)",
+        "a non-empty --output without --force exits 1 with a hint; the container writes into <output>.partial and the host renames to <output> only on exit 0 (a fake launcher returning 137 leaves <output> absent and .partial present)",
+        "host->container routing mirrors eval.py:122-146 (identity mounts of adapter/output/calib parents, checkout=_repo_root(), --in-container recursion guard) and passes UNSLOTH_LLAMA_TAG/HOME through container.launch's new env parameter; tests/test_cmd_export.py covers every bullet; uv run teken cli doctor . --strict green"
+      ],
+      "deps": [],
+      "covers": [
+        "c5",
+        "h4",
+        "c8",
+        "h7",
+        "c33",
+        "h23",
+        "c36",
+        "h26",
+        "c26",
+        "h16"
+      ],
+      "instruction": "Read eval.py first \u2014 it is the routing template. Estimate bytes from the base model's config.json parameter count if cached (2 bytes/param merged; x2 for gguf's F16 intermediate; 0.6 bytes/param awq/nvfp4), else from the parameter count parsed from the model id (sloth/tune/scope.py scanner style). Do not implement the in-container work here \u2014 call sloth.tune._exporter.run_export (t9) from the --in-container branch. Owned files: sloth/cli/_commands/export.py, tests/test_cmd_export.py."
+    },
+    {
+      "id": "t8",
+      "summary": "PR2/t8 \u2014 container: llama.cpp cache mount, explicit HOME, env passthrough, llm-compressor pin, memory preflight",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "container.launch/build_command accept env=[(k,v)...] and extra mounts; export runs set HOME=/workspace/.home (or a documented constant) and bind-mount a host-owned cache dir (default ~/.cache/unsloth-cli/llama.cpp, override via SLOTH_LLAMA_CPP_CACHE) at <HOME>/.unsloth/llama.cpp; UNSLOTH_LLAMA_TAG is set to a pinned constant (the prebuilt tag validated live, b10909, or newer once re-validated)",
+        "DEP_LAYER_PACKAGES gains llmcompressor==0.11.0 and compressed-tensors==0.16.0 (the pin matrix comment explains the torch-2.11 API shim and that 0.10.0.3 runs NVFP4 natively but breaks AWQ on LFM2); docs/dgx-spark.md pin table updated",
+        "preflight() reads /proc/meminfo on Linux and emits a stderr hint when MemFree < 4 GiB naming the Unsloth-import OOM and the page-cache reclaim workaround; it never blocks; tests/test_tune_container.py covers env passthrough, the mount args, the tag env, and the meminfo hint with a fake meminfo"
+      ],
+      "deps": [],
+      "covers": [
+        "c7",
+        "h6",
+        "c35",
+        "h25"
+      ],
+      "instruction": "Unsloth resolves its llama.cpp dir from Path.home()/.unsloth/llama.cpp (unsloth_zoo/llama_cpp.py:132-138) so HOME must be explicit and the mount target must match; prebuilt install is skipped on the second run when the dir is populated (measured: 48s first, 28s cached). Owned files: sloth/tune/container.py, tests/test_tune_container.py, docs/dgx-spark.md."
+    },
+    {
+      "id": "t9",
+      "summary": "PR2/t9 \u2014 _exporter.py: lazy in-container seam for merged/gguf (Unsloth) and awq/nvfp4 (llm-compressor), calibration, cleanup, export.json",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "new sloth/tune/_exporter.py with run_export(plan) that lazy-imports unsloth/torch/llmcompressor inside the function (tests/test_lazy_import.py + test_packaging_import_light.py extended to it); missing stack -> CliError(code=2) with the NGC hint; CUDA OOM -> CliError(code=2) with the memory hint",
+        "merged-16bit / merged-4bit call model.save_pretrained_merged(dir, tokenizer, save_method='merged_16bit'|'merged_4bit'); gguf calls model.save_pretrained_gguf(dir, tokenizer, quantization_method=[...]) then moves the *.gguf files from Unsloth's <dir>_gguf suffix dir into the requested dir and deletes the F16 intermediate unless keep_intermediate; a fake backend test asserts each call's kwargs and the final file layout",
+        "awq: merged-16bit first, then llmcompressor.oneshot(pipeline='basic', recipe=[AWQModifier(mappings=..., duo_scaling='both'), QuantizationModifier(scheme='W4A16_ASYM', targets=['Linear'], ignore=['lm_head'])]); for model_type lfm2 the mappings are built per layer from config.layer_types (operator_norm -> self_attn q/k/v on full_attention layers, operator_norm -> conv.in_proj on conv layers, ffn_norm -> feed_forward w1/w3, feed_forward.w3 -> w2, and NO v_proj->out_proj pair); other architectures use llm-compressor defaults; nvfp4: QuantizationModifier(scheme='NVFP4', targets=['Linear'], ignore=['lm_head']) with the same basic pipeline; save_pretrained(save_compressed=True)",
+        "calibration: default = the run's dataset rendered exactly as _trainer._format_records renders it (import the same helper), --calib overrides, --calib-samples caps; fewer than 64 samples -> one stderr diagnostic; the count and source are recorded",
+        "the torch.accelerator.get_memory_info shim is one function applied only when the attribute is missing AND compressed_tensors.__version__ == '0.16.0', maps to torch.cuda.mem_get_info, and two tests prove applied/skipped",
+        "export.json is written next to the artifacts and appended (list) to <adapter>/exports.json with: format, quant, base, adapter, files{name:bytes}, calibration{source,count}, versions{unsloth,unsloth_zoo,transformers,peft,llmcompressor,compressed_tensors,llama_cpp_tag}, timestamp; tests/test_tune_exporter.py covers every bullet with fakes, no GPU"
+      ],
+      "deps": [],
+      "covers": [
+        "c6",
+        "h5",
+        "c24",
+        "h1",
+        "c29",
+        "h18",
+        "c31",
+        "h21",
+        "c32",
+        "h22",
+        "c34",
+        "h24"
+      ],
+      "instruction": "Copy the seam discipline of _trainer.py:145-173 (_load_backend) so tests can monkeypatch one loader. Import unsloth before trl/transformers/peft. The fx-tracing failure ('NoneType has no attribute get_mask_sizes') is why pipeline='basic' is mandatory for LFM2; the GQA shape error (512 vs 2048) is why the v_proj->out_proj pair is dropped. Reference: the session probe script recorded in memory unsloth-cli-quant-export-livetest-2026-09-15. Owned files: sloth/tune/_exporter.py (new), tests/test_tune_exporter.py (new), tests/test_lazy_import.py, tests/test_packaging_import_light.py."
+    },
+    {
+      "id": "t10",
+      "summary": "PR2/t10 \u2014 surface exports in runs / summarize / compare",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "sloth/tune/summary.py build_summary discovers <output_dir>/exports.json and any export.json under the run dir and returns an 'exports' list; summarize text mode prints one line per export (format, quant, files, bytes); compare shows export presence/format deltas; runs show renders the exports key; tests for each renderer"
+      ],
+      "deps": [
+        "t9"
+      ],
+      "covers": [
+        "c22",
+        "h14"
+      ],
+      "instruction": "Mirror find_latest_checkpoint / read_trainer_state (summary.py:100-149); summarize.py's renderer is hand-listed (23-47) so add an explicit block; compare.py delta block at 37-56. Owned files: sloth/tune/summary.py, sloth/cli/_commands/summarize.py, sloth/cli/_commands/compare.py, sloth/cli/_commands/runs.py, their tests."
+    },
+    {
+      "id": "t11",
+      "summary": "PR2/t11 \u2014 eval --model DIR for merged / quantized outputs",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "sloth eval accepts --model DIR (mutually exclusive with --adapter: both or neither -> exit 1 + hint); host side routes to the container like --adapter; in-container, run_eval_model loads a merged/awq/nvfp4 dir via transformers (compressed-tensors auto-detected) or, when the dir holds a .gguf, scores via llama-completion from the mounted llama.cpp cache",
+        "result JSON has the same score fields as adapter eval plus model_dir, quant_method, quant_format (from config.json quantization_config, null for bf16/gguf); catalog _EVAL updated; tests/test_cmd_eval.py covers the exclusivity error, host routing, and a fake-backend --model run"
+      ],
+      "deps": [
+        "t3",
+        "t9"
+      ],
+      "covers": [
+        "c39",
+        "h27"
+      ],
+      "instruction": "Add run_eval_model next to run_eval in _trainer.py (or in _exporter.py to keep _trainer.py untouched after t3 \u2014 prefer _exporter.py). Owned files: sloth/cli/_commands/eval.py, sloth/tune/_exporter.py (eval helper only), sloth/explain/catalog.py (_EVAL entry), tests/test_cmd_eval.py."
+    },
+    {
+      "id": "t12",
+      "summary": "PR2/t12 \u2014 docs, catalog, README, benchmarks and the /finetune skill for the export formats",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "catalog.py _EXPORT enumerates all six formats, every new flag, the container/no-container split and the exit codes; README.md:86 row and docs/fine-tuning.md export section list the formats and the target table links them; docs/benchmarks.md gains measured sizes (bf16 2.34 GB, gguf q4 0.73 GB, awq 1.08 GB, nvfp4 1.12 GB for LFM2.5-1.2B)",
+        ".claude/skills/finetune/SKILL.md run-mode table and scripts/finetune.sh accept --export-format FMT and --quant LIST (default safetensors) and forward them to sloth export; grep 'safetensors' across README, docs/fine-tuning.md, catalog _EXPORT and finetune.sh shows the format list; markdownlint and teken cli doctor . --strict green"
+      ],
+      "deps": [
+        "t5",
+        "t7"
+      ],
+      "covers": [
+        "c14",
+        "h9"
+      ],
+      "instruction": "Depends on t5 so catalog.py/README/docs/fine-tuning.md are edited once per PR, not concurrently. Owned files: sloth/explain/catalog.py (_EXPORT), README.md, docs/fine-tuning.md (export section), docs/benchmarks.md, .claude/skills/finetune/SKILL.md, .claude/skills/finetune/scripts/finetune.sh."
+    },
+    {
+      "id": "t13",
+      "summary": "PR2/t13 \u2014 live validation on the Spark: every export format + eval --model scores, recorded in docs/tested.md; PR 2 opened",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "on the LFM2.5-1.2B-Base adapter from t6: sloth export --format merged-16bit, gguf --quant q4_k_m, awq, nvfp4 (and merged-4bit) each exit 0 on the Spark; merged loads with transformers, gguf runs with llama-completion, awq and nvfp4 load in vllm/vllm-openai; a second gguf export reuses the cached llama.cpp (no download in the log)",
+        "sloth eval --model on merged-16bit, awq and nvfp4 (and --adapter) against examples/eval-suite.jsonl produces four scores recorded side by side in docs/tested.md; each tested.md row carries the exact invocation; any format that fails live is listed under Not tested, never claimed",
+        "the /finetune skill run mode completes train -> eval -> export --export-format gguf with --json and every step's JSON is on stdout only; version bumped; PR 2 opened via the cicd skill; CI test job >= 60% coverage and the rubric gate green"
+      ],
+      "deps": [
+        "t6",
+        "t7",
+        "t8",
+        "t9",
+        "t10",
+        "t11",
+        "t12"
+      ],
+      "covers": [
+        "c1",
+        "h10",
+        "c25",
+        "h11",
+        "c23",
+        "h15"
+      ],
+      "instruction": "Run sequentially, the box is memory-tight with lobes' vLLM resident; keep gpu_memory_utilization low (0.12 worked) for the vLLM load checks. Owned files: docs/tested.md (PR2 rows), CHANGELOG.md, pyproject.toml."
+    }
+  ],
+  "risks": [
+    {
+      "id": "r1",
+      "text": "unsloth / unsloth_zoo / bitsandbytes are installed unpinned (--no-deps) in the container; the live probes ran on 2026.9.4 while docs cite 2026.6.9 \u2014 decide whether t8 pins them (recommended: pin to the version validated in t6/t13)",
+      "kind": "unknown_nonblocking",
+      "task_id": "t8",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r2",
+      "text": "The torch.accelerator.get_memory_info shim exists only because NGC 25.11 ships torch 2.10; when the image moves to torch>=2.11 the shim test (t9) must flip to 'skipped' and the shim be deleted",
+      "kind": "follow_up",
+      "task_id": "t9",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r3",
+      "text": "QLoRA-trained (4-bit) adapters were not merged in the probes; Unsloth's dequantize-then-merge path is unmeasured until t13 runs a qlora example",
+      "kind": "unknown_nonblocking",
+      "task_id": "t13",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r4",
+      "text": "Qwen3 through awq/nvfp4/gguf is unmeasured (all probes were LFM2.5); llm-compressor default mappings should fit Qwen3 but the GQA v->o pair may need the same skip",
+      "kind": "unknown_nonblocking",
+      "task_id": "t13",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r5",
+      "text": "Two concurrent gguf exports sharing the mounted llama.cpp cache could race on Unsloth's prebuilt install (no lock); single-operator today",
+      "kind": "unknown_nonblocking",
+      "task_id": "t8",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r6",
+      "text": "Disk estimate uses a parameter-count heuristic; a wrong count under-estimates and the fail-closed check passes when it should not \u2014 t13 compares estimated_bytes to measured sizes and tightens the constants",
+      "kind": "unknown_nonblocking",
+      "task_id": "t7",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r7",
+      "text": "t9 encoded four call-signature inferences that no probe measured: llmcompressor.oneshot(dataset=<list of dicts>) vs a datasets.Dataset (the probe used Dataset.from_list); AWQMapping positional (smooth_layer, balance_layers); FastModel.from_pretrained(model_name=<adapter dir>) as the base+adapter loader for merging; and the exact 're:' regex flavour of the per-layer LFM2 mapping strings. t13's first live run must confirm or correct each; a correction is a /deviate record, not a silent edit",
+      "kind": "unknown_nonblocking",
+      "task_id": "t13",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r8",
+      "text": "t11 inferences unverified until t13: llama-completion may or may not echo the prompt (a startswith strip guards it); eval --model picks the first *.gguf alphabetically when a dir holds several (a kept F16 intermediate would win over Q4_K_M) \u2014 t13 must evaluate a clean gguf dir or add a selector",
+      "kind": "unknown_nonblocking",
+      "task_id": "t13",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r9",
+      "text": "the /finetune skill's resolve_sloth prefers any 'sloth' on PATH over the checkout it lives in; on this box PATH has an editable install of a different worktree (unsloth-cli-worktrees/spec-291, metadata 0.5.0), so the first run-mode validation exercised that branch's code and its export rejected --quant. Decide whether the skill should prefer 'uv run --project <its own repo>' when invoked from inside a checkout",
+      "kind": "follow_up",
+      "task_id": "t13",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r10",
+      "text": "in-container trl/transformers training progress dicts ({'loss': ...}) are printed to stdout and pass through the shipped host path, so 'sloth train --json' stdout is not pure JSON (pre-existing; observed in the skill run-mode log). Route trainer logging to stderr or suppress it",
+      "kind": "follow_up",
+      "task_id": "t13",
+      "resolved": false,
+      "resolution": ""
+    }
+  ],
+  "obligations": []
+}

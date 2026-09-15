@@ -93,6 +93,125 @@ def _training_progress(state: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Export discovery
+# ---------------------------------------------------------------------------
+
+_EXPORTS_INDEX_NAME = "exports.json"
+_EXPORT_RECORD_NAME = "export.json"
+
+
+def _load_exports_index(output_dir: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    """Read ``<output_dir>/exports.json`` (the index ``_exporter._append_index``
+    writes), tolerating absence/corruption exactly like the rest of this module.
+
+    Returns ``([], [])`` when the file is absent (not an error — a run with no
+    exports yet). A present-but-unparseable file, or one that does not decode
+    to a JSON list, degrades to ``([], [note])``.
+    """
+    index_path = output_dir / _EXPORTS_INDEX_NAME
+    if not index_path.is_file():
+        return [], []
+    try:
+        raw = index_path.read_text(encoding="utf-8")
+        parsed = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return [], [f"{_EXPORTS_INDEX_NAME} is missing or unreadable — export index omitted"]
+    if not isinstance(parsed, list):
+        return [], [f"{_EXPORTS_INDEX_NAME} does not contain a JSON list — export index omitted"]
+    return [entry for entry in parsed if isinstance(entry, dict)], []
+
+
+def _find_export_json_files(output_dir: Path) -> list[Path]:
+    """Every ``export.json`` nested anywhere under *output_dir*, sorted for
+    determinism. Returns ``[]`` when *output_dir* does not exist."""
+    if not output_dir.is_dir():
+        return []
+    return sorted(output_dir.rglob(_EXPORT_RECORD_NAME))
+
+
+def _read_export_record(path: Path) -> dict[str, Any] | None:
+    """Read+parse one ``export.json``. Returns ``None`` on absence/corruption
+    (tolerated, never raised)."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+        parsed = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _export_identity(record: dict[str, Any]) -> tuple[Any, Any]:
+    """A record's dedup key: (format, timestamp) — the pair a single
+    ``run_export`` call stamps identically onto both the ``exports.json``
+    entry and the record's own ``export.json``."""
+    return record.get("format"), record.get("timestamp")
+
+
+def discover_exports(output_dir: str | Path) -> tuple[list[dict[str, Any]], list[str]]:
+    """Discover every export recorded for a run.
+
+    Joins two sources:
+
+    * ``<output_dir>/exports.json`` — the append-only index
+      :func:`sloth.tune._exporter._append_index` maintains.
+    * any ``export.json`` nested under *output_dir* — the per-export record
+      :func:`sloth.tune._exporter._write_export_json` writes into each
+      export's own output directory (present even when that directory was
+      never, or not yet, mirrored into the index).
+
+    A record discovered via a nested ``export.json`` is merged with its
+    matching index entry (filling in ``export_json``/``output`` paths) rather
+    than duplicated, keyed on ``(format, timestamp)``. A genuinely new record
+    (no matching index entry — e.g. a corrupt/missing index) is appended.
+
+    Every returned entry carries ``export_json`` and ``output`` keys — ``None``
+    when the record came only from the index and no matching file was found
+    on disk.
+
+    Never raises: a missing/corrupt index or a corrupt individual
+    ``export.json`` degrades gracefully, with a note explaining what was
+    skipped, exactly like the rest of this module.
+    """
+    output_path = Path(output_dir)
+    notes: list[str] = []
+
+    index_entries, index_notes = _load_exports_index(output_path)
+    notes.extend(index_notes)
+
+    exports: list[dict[str, Any]] = []
+    for entry in index_entries:
+        merged = dict(entry)
+        merged.setdefault("export_json", None)
+        merged.setdefault("output", None)
+        exports.append(merged)
+
+    by_identity: dict[tuple[Any, Any], dict[str, Any]] = {
+        _export_identity(entry): entry for entry in exports
+    }
+
+    for path in _find_export_json_files(output_path):
+        record = _read_export_record(path)
+        if record is None:
+            notes.append(f"{_EXPORT_RECORD_NAME} at {path} is missing or unreadable — skipped")
+            continue
+        identity = _export_identity(record)
+        existing = by_identity.get(identity)
+        if existing is not None and existing.get("export_json") is None:
+            existing["export_json"] = str(path)
+            existing["output"] = str(path.parent)
+            continue
+        if existing is not None:
+            continue
+        new_entry = dict(record)
+        new_entry["export_json"] = str(path)
+        new_entry["output"] = str(path.parent)
+        exports.append(new_entry)
+        by_identity[identity] = new_entry
+
+    return exports, notes
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -112,12 +231,15 @@ def build_summary(output_dir: str | Path) -> dict[str, Any]:
                 "best_metric": float | None,
                 "best_model_checkpoint": str | None,
             } | None,
+            "exports": list[dict],    # discover_exports() — [] when none found
             "notes": list[str],       # what was skipped/degraded, and why
         }
 
     Never raises: a missing/unreadable ``training_metadata.json`` or
     ``trainer_state.json`` degrades that half to ``None`` plus a note in
     ``notes`` — the other half (and the overall summary) is still returned.
+    Likewise a missing/corrupt export index or record degrades ``exports`` to
+    ``[]`` (or a partial list) plus a note, never an exception.
     """
     output_path = Path(output_dir)
     notes: list[str] = []
@@ -141,9 +263,13 @@ def build_summary(output_dir: str | Path) -> dict[str, Any]:
             training = _training_progress(state)
             training["checkpoint"] = checkpoint_dir.name
 
+    exports, export_notes = discover_exports(output_path)
+    notes.extend(export_notes)
+
     return {
         "output_dir": str(output_path),
         "metadata": metadata,
         "training": training,
+        "exports": exports,
         "notes": notes,
     }

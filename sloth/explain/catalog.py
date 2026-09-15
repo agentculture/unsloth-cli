@@ -190,6 +190,10 @@ Refuses to overwrite an existing file unless `--force` is passed.
 - `--path PATH` — override the written config path (default: `<output>/run.toml`).
 - `--json` — emit the write result as structured JSON.
 
+The generated file omits `target_modules` (optional; a list of module names, a
+single regex string, or a known preset such as `"preset:lfm2"`). Add it under
+`[hyperparameters]` to extend which modules the adapter touches.
+
 ## Exit codes
 
 - `0` success — config written.
@@ -224,6 +228,12 @@ are imported lazily inside the trainer, so `--dry-run` never loads the ML stack.
 - `--dry-run` — validate and resolve the plan without importing torch or training.
 - `--json` — emit the resolved plan / result as structured JSON to stdout.
 
+`[hyperparameters]` may set `target_modules` — a list of module names, a single
+regex string, or a known preset such as `"preset:lfm2"` (unknown presets fail at
+load time, before any GPU spend). `preset:lfm2` adapts all 92 LoRA-able modules
+of LFM2.5-1.2B (24 attention, 20 short-conv, 48 feed-forward); Unsloth's default
+adapts only q/k/v on the 6 attention layers.
+
 ## Exit codes
 
 - `0` success
@@ -234,10 +244,11 @@ are imported lazily inside the trainer, so `--dry-run` never loads the ML stack.
 _EVAL = """\
 # unsloth-cli eval
 
-Run a trained LoRA/QLoRA adapter against a local task-schema eval suite and
-report exact-match scoring. All inference is local and offline
-(`local_files_only=True`); the heavy ML stack is imported lazily inside the
-inference backend, so importing the verb stays torch-free.
+Score a trained LoRA/QLoRA adapter — or a merged / quantized model directory —
+against a local task-schema eval suite, reporting exact-match scoring. All
+inference is local and offline (`local_files_only=True`); the heavy ML stack is
+imported lazily inside the inference backend, so importing the verb stays
+torch-free.
 
 The suite is a JSONL file whose records conform to the **task** schema
 (`{"task", "input", "expected_output"}`), validated before inference. Each
@@ -245,56 +256,132 @@ record's prediction is compared to its `expected_output` for an exact match, and
 a summary (`total`, `exact_match`, `exact_match_pct`) plus per-record results is
 emitted.
 
+## Two targets: `--adapter` or `--model`
+
+Exactly one is required — passing both, or neither, exits `1` with a `hint:`.
+
+- `--adapter DIR` scores a LoRA adapter by loading its base model and wrapping it
+  with the adapter weights.
+- `--model DIR` scores a directory produced by `unsloth-cli export`: a merged
+  (bf16/4-bit) checkpoint, an AWQ or NVFP4 compressed-tensors checkpoint (both
+  auto-detected by transformers from `config.json`), or a GGUF — which is scored
+  with llama.cpp's `llama-completion` from the mounted llama.cpp cache.
+
+A `--model` run reports the same score fields plus `model_dir`, `quant_method`
+and `quant_format` (read from `config.json`'s `quantization_config`; both `null`
+for a plain bf16 merged directory or a GGUF).
+
 ## Usage
 
     unsloth-cli eval --adapter adapters/qwen3-4b-qlora --suite data/eval.jsonl
-    unsloth-cli eval --adapter adapters/qwen3-4b-qlora --suite data/eval.jsonl --json
+    unsloth-cli eval --model exports/qwen3-4b-awq --suite data/eval.jsonl
+    unsloth-cli eval --model exports/qwen3-4b-gguf --suite data/eval.jsonl --json
 
 ## Key flags
 
-- `--adapter DIR` (required) — adapter directory produced by `unsloth-cli train`.
+- `--adapter DIR` — adapter directory produced by `unsloth-cli train`.
+- `--model DIR` — merged / quantized / GGUF directory produced by
+  `unsloth-cli export` (mutually exclusive with `--adapter`).
 - `--suite PATH` (required) — task-schema JSONL eval suite.
 - `--json` — emit the scored summary and per-record results as structured JSON.
 
 ## Exit codes
 
 - `0` success
-- `1` user-input error (missing adapter dir, missing/malformed suite)
-- `2` environment / setup error (ML stack not installed)
+- `1` user-input error (both/neither target, missing adapter or model dir,
+  missing/malformed suite)
+- `2` environment / setup error (ML stack not installed, llama.cpp missing, OOM)
 """
 
 _EXPORT = """\
 # unsloth-cli export
 
-Export a trained adapter to the canonical PEFT/safetensors layout that `lobes`
-can serve and `colleague` can run:
+Export a trained adapter to a servable model layout. Six formats, two lanes:
 
-    <output>/
-      adapter_config.json
-      adapter_model.safetensors
+- `safetensors` (default) — pure stdlib, **no container**. Copies/normalises the
+  adapter into the canonical PEFT layout that `lobes` can serve and `colleague`
+  can run:
 
-This is a pure stdlib file-system operation — no torch or ML runtime is loaded.
+      <output>/
+        adapter_config.json
+        adapter_model.safetensors
+        tokenizer.json / tokenizer_config.json / special_tokens_map.json /
+        vocab.json / merges.txt / tokenizer.model   # copied when present
+
+  Nothing is loaded or converted — unsloth/PEFT already write these files in
+  safetensors format during training, so this lane only reorganises and
+  validates file-system artefacts. No torch import, no container launch.
+
+- `merged-16bit`, `merged-4bit`, `gguf`, `awq`, `nvfp4` — **host→container**.
+  These genuinely need the ML stack (base-model load, merge, ggml conversion,
+  llm-compressor one-shot quantization), so the host side validates everything
+  cheaply and hands off to the NGC container (same pattern as `sloth train` /
+  `sloth eval`). Safety rails: **no-clobber** (a non-empty `--output` is
+  refused unless `--force`), **atomic output** (the container writes to
+  `<output>.partial` and the host renames it to `<output>` only after a clean
+  exit, so a killed/OOM run never leaves a half-written model directory), and
+  a **fail-closed disk check** (the estimated artifact size is compared
+  against free space under `--output` before any GPU spend; `--dry-run`
+  reports both numbers instead of failing).
+
 When `--output` is omitted (or resolves to the adapter directory itself), the
-adapter is normalised in place. Only the `safetensors` format is supported today.
+adapter is normalised in place.
 
 ## Usage
 
     unsloth-cli export --adapter adapters/qwen3-4b-qlora
     unsloth-cli export --adapter adapters/qwen3-4b-qlora --output exported/qwen3-4b
-    unsloth-cli export --adapter adapters/qwen3-4b-qlora --json
+    unsloth-cli export --adapter adapters/qwen3-4b-qlora --format gguf \\
+        --quant q4_k_m --output exported/qwen3-4b-gguf
+    unsloth-cli export --adapter adapters/qwen3-4b-qlora --format awq \\
+        --calib data/calib.jsonl --output exported/qwen3-4b-awq
+    unsloth-cli export --adapter adapters/qwen3-4b-qlora --format nvfp4 \\
+        --output exported/qwen3-4b-nvfp4
+    unsloth-cli export --adapter adapters/qwen3-4b-qlora --dry-run --json
 
 ## Key flags
 
 - `--adapter DIR` (required) — adapter directory to export.
-- `--format FMT` — output format (default: `safetensors`).
+- `--format FMT` — one of `safetensors`, `merged-16bit`, `merged-4bit`, `gguf`,
+  `awq`, `nvfp4` (default: `safetensors`).
 - `--output DIR` — output directory (default: normalise in place inside `--adapter`).
+- `--quant LIST` — comma-separated ggml quantizations for `--format gguf`
+  (e.g. `q4_k_m,q8_0`); ignored (with a diagnostic) for other formats.
+- `--calib PATH` — JSONL calibration data for `--format awq`/`nvfp4` (default:
+  the run's training dataset); ignored (with a diagnostic) for other formats.
+- `--calib-samples N` — cap the number of calibration samples used for `awq`/`nvfp4`.
+- `--base ID` — base model id (default: read from the adapter's
+  `adapter_config.json` `base_model_name_or_path`); required for the
+  container formats when it cannot be resolved.
+- `--force` — overwrite a non-empty `--output` directory (container lane only).
+- `--dry-run` — resolve and print the export plan (format, base, disk estimate,
+  and the exact docker command for container formats) without exporting or
+  launching anything.
+- `--keep-intermediate` — keep intermediate artifacts (e.g. the F16 GGUF)
+  instead of deleting them.
 - `--json` — emit the export result (output dir, format, files) as structured JSON.
 
-## Exit codes
+## Container vs. no-container
+
+- **No container:** `--format safetensors` only. Pure stdlib, instant, no GPU.
+- **Container (NGC, same image as `train`/`eval`):** `merged-16bit`,
+  `merged-4bit`, `gguf`, `awq`, `nvfp4`. Host validates cheaply, then launches
+  `nvcr.io/nvidia/pytorch:25.11-py3` with identity bind-mounts for the parents
+  of the adapter/output/calibration paths, forwarding the same args plus a
+  hidden `--in-container` recursion guard.
+
+## Paths given to --adapter / --output / --calib / a local --base are canonicalised and
+must sit under the working directory, your home, the HF cache or the temp dir;
+extend the allow-list with `SLOTH_ALLOWED_ROOTS=<dir>[:<dir>]`.
+
+Exit codes
 
 - `0` success
-- `1` user-input error (missing adapter dir, unsupported format)
-- `2` environment / setup error
+- `1` user-input error (missing/incomplete adapter dir, unsupported `--format`,
+  bad `--quant`, missing calibration file, non-empty `--output` without
+  `--force`)
+- `2` environment / setup error (container exits non-zero, insufficient disk
+  space under `--output`)
 """
 
 

@@ -250,7 +250,7 @@ not.
   **`--system-site-packages` venv** (so it inherits the container's nv torch; a bare
   `uv pip install --system` fails on the NGC image — PEP-668 as root, root-owned
   site-packages under `--user`). The pins are **validated against NGC 25.11's torch
-  2.10** (`transformers==4.57.1 peft==0.18.0 trl==0.24.0 datasets==4.3.0 hf_transfer`,
+  2.10** (`transformers==4.57.1 peft==0.18.0 trl==0.24.0 datasets==4.8.5 hf_transfer`,
   then `--no-deps unsloth unsloth_zoo bitsandbytes`; the venv-pulled torch is then
   uninstalled so the nv torch shows through). **Do not float these** — `peft>=0.19`
   hard-requires `torchao>0.16`, which needs `torch>=2.11` the container lacks. The

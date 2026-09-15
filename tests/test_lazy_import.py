@@ -95,3 +95,51 @@ def test_whoami_verb_does_not_load_unsloth():
         f"Expected returncode 0, got {result.returncode}\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
+
+
+def test_exporter_import_does_not_load_torch():
+    """Importing sloth.tune._exporter must not bring torch into sys.modules.
+
+    The export seam (merged/gguf via Unsloth, awq/nvfp4 via llm-compressor) is
+    allowed to touch the heavy stack, but only inside ``_load_backend``.
+    """
+    code = (
+        "import sloth.tune._exporter; import sys; "
+        "assert 'torch' not in sys.modules, "
+        "'torch was imported at top level of _exporter'; "
+        "print('PASS')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=_REPO_ROOT,
+    )
+    assert result.returncode == 0, (
+        f"Expected returncode 0, got {result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+
+
+def test_exporter_import_does_not_load_unsloth_or_llmcompressor():
+    """Importing sloth.tune._exporter must not bring unsloth/llmcompressor in."""
+    code = (
+        "import sloth.tune._exporter; import sys; "
+        "assert 'unsloth' not in sys.modules, "
+        "'unsloth was imported at top level of _exporter'; "
+        "assert 'llmcompressor' not in sys.modules, "
+        "'llmcompressor was imported at top level of _exporter'; "
+        "assert 'compressed_tensors' not in sys.modules, "
+        "'compressed_tensors was imported at top level of _exporter'; "
+        "print('PASS')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=_REPO_ROOT,
+    )
+    assert result.returncode == 0, (
+        f"Expected returncode 0, got {result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )

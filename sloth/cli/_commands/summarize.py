@@ -42,9 +42,25 @@ def _summary_text_lines(summary: dict[str, Any]) -> list[str]:
         lines.append(f"final_loss:  {training.get('final_loss')}")
         if training.get("best_metric") is not None:
             lines.append(f"best_metric: {training.get('best_metric')}")
+    exports = summary.get("exports") or []
+    if exports:
+        lines.append("exports:")
+        for export in exports:
+            lines.append(f"  {_export_line(export)}")
     for note in summary.get("notes") or []:
         lines.append(f"note: {note}")
     return lines
+
+
+def _export_line(export: dict[str, Any]) -> str:
+    """Render one export record as ``<format> quant=<a,b> files=<n> bytes=<n>``."""
+    raw_quant = export.get("quant")
+    quant_items = [str(q) for q in raw_quant] if isinstance(raw_quant, list) else []
+    quant = ",".join(quant_items) or "-"
+    files = export.get("files")
+    files = files if isinstance(files, dict) else {}
+    total_bytes = sum(v for v in files.values() if isinstance(v, (int, float)))
+    return f"{export.get('format')} quant={quant} files={len(files)} bytes={int(total_bytes)}"
 
 
 def cmd_summarize(args: argparse.Namespace) -> int:

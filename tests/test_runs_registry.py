@@ -15,6 +15,8 @@ Covers:
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
 import os
 import re
@@ -23,7 +25,7 @@ from pathlib import Path
 import pytest
 
 from sloth.cli._errors import EXIT_ENV_ERROR, CliError
-from sloth.tune.config import RunConfig
+from sloth.tune.config import RunConfig, load_config
 from sloth.tune.registry import (
     RUNS_FILENAME,
     STATUS_FAILED,
@@ -107,6 +109,56 @@ class TestConfigHash:
         cfg = _make_config(tmp_path)
         digest = compute_config_hash(cfg)
         assert re.fullmatch(r"[0-9a-f]{64}", digest)
+
+    def test_lora_smoke_hash_matches_recorded_literal(self) -> None:
+        # Recorded from `compute_config_hash(load_config("examples/lora-smoke.toml"))`
+        # on main BEFORE the None-filter change below was made. Every
+        # pre-existing run's id is derived from this hash, so it must not
+        # move as part of adding the None-filter.
+        cfg = load_config("examples/lora-smoke.toml")
+        assert (
+            compute_config_hash(cfg)
+            == "752c600641c508e00a4720ee7ce503530706e29be51915ee52ba71efd82f39a2"[:64]
+        )
+
+    def test_none_valued_top_level_key_dropped_before_hashing(self) -> None:
+        # A top-level None-valued field must not affect the hash at all —
+        # the hash of a config carrying `extra=None` must equal the hash of
+        # the same fields with that key absent entirely, proving None keys
+        # are filtered rather than just serialized as `null`.
+        @dataclasses.dataclass
+        class _ConfigWithOptional:
+            model: str
+            dataset: str
+            output: str
+            extra: str | None = None
+
+        with_none_field = _ConfigWithOptional(model="m", dataset="d", output="o")
+        without_field_hash = hashlib.sha256(
+            json.dumps(
+                {"model": "m", "dataset": "d", "output": "o"}, sort_keys=True, default=str
+            ).encode("utf-8")
+        ).hexdigest()
+
+        assert compute_config_hash(with_none_field) == without_field_hash
+
+    def test_setting_target_modules_changes_hash(self, tmp_path: Path) -> None:
+        # Sibling task t1 (same wave) adds `RunConfig.target_modules` to
+        # sloth/tune/config.py; that field does not exist in this worktree
+        # yet. Prove the hash formula (None-filter, sorted-key JSON, sha256)
+        # is sensitive to an added `target_modules` key by applying that
+        # exact formula to `asdict(config)` plus the extra key — this holds
+        # both before and after t1 merges the real field.
+        cfg = _make_config(tmp_path)
+        base_fields = {k: v for k, v in dataclasses.asdict(cfg).items() if v is not None}
+        changed_fields = {**base_fields, "target_modules": "preset:lfm2"}
+
+        def _hash(fields: dict[str, object]) -> str:
+            canonical = json.dumps(fields, sort_keys=True, default=str)
+            return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+        assert _hash(base_fields) == compute_config_hash(cfg)
+        assert _hash(changed_fields) != _hash(base_fields)
 
 
 class TestRunId:

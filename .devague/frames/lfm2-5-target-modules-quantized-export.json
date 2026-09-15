@@ -4,7 +4,7 @@
   "schema_version": 6,
   "status": "exported",
   "created": "2026-09-15T06:00:34Z",
-  "updated": "2026-09-15T07:46:59Z",
+  "updated": "2026-09-15T13:42:43Z",
   "claims": [
     {
       "id": "c1",
@@ -1162,6 +1162,28 @@
       "skipped_check": "eval-suite score on merged vs gguf vs awq vs nvfp4",
       "refs": [
         "challenge pass / observability lens"
+      ],
+      "origin": "llm",
+      "status": "approved"
+    },
+    {
+      "id": "l2",
+      "code": "control-absent",
+      "what": "task t9 (_exporter.py) wrote the implementation before tests/test_tune_exporter.py, so its 29 tests were authored against the code rather than driving it; the TDD 'seen failing first' guarantee does not hold for t9 (self-reported by the task agent)",
+      "skipped_check": "red-first run of tests/test_tune_exporter.py",
+      "refs": [
+        "assign-to-workforce wave 1 / t9"
+      ],
+      "origin": "llm",
+      "status": "approved"
+    },
+    {
+      "id": "l3",
+      "code": "assumption-for-measurement",
+      "what": "task t7 inferred the plan['dataset'] contract from the plan-dict spec instead of checking that sloth/tune/metadata.py supplies a dataset path (it only writes sha256 + line_count); caught late by reading metadata.py, self-reported. Also: its test file was authored before the implementation but only run red afterwards via a stash check",
+      "skipped_check": "verify training_metadata.json carries a dataset path before coding the calibration default",
+      "refs": [
+        "assign-to-workforce wave 1 / t7"
       ],
       "origin": "llm",
       "status": "approved"

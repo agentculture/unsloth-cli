@@ -183,6 +183,74 @@ def test_compare_includes_both_summaries(
 
 
 # ---------------------------------------------------------------------------
+# Export presence/format deltas (t10)
+# ---------------------------------------------------------------------------
+
+
+def _write_export_index(adapter: Path, fmt: str) -> None:
+    adapter_dir = adapter
+    (adapter_dir / "exports.json").write_text(
+        json.dumps(
+            [
+                {
+                    "format": fmt,
+                    "quant": [],
+                    "base": "m",
+                    "adapter": str(adapter_dir),
+                    "files": {"f": 1},
+                    "calibration": None,
+                    "versions": {},
+                    "timestamp": "2026-07-06T00:00:00+00:00",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_compare_reports_export_delta_when_one_side_has_export(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dataset = _write_dataset(tmp_path)
+    dir_a = tmp_path / "exp-a"
+    dir_a.mkdir()
+    write_metadata(dir_a, model="m", method="lora", dataset_path=dataset, hyperparameters={})
+    _write_export_index(dir_a, "gguf")
+
+    dir_b = tmp_path / "exp-b"
+    dir_b.mkdir()
+    write_metadata(dir_b, model="m", method="lora", dataset_path=dataset, hyperparameters={})
+
+    rc = cmd_compare(_args(str(dir_a), str(dir_b), json_mode=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "exports" in payload["deltas"]
+    assert payload["deltas"]["exports"]["a"]["count"] == 1
+    assert payload["deltas"]["exports"]["a"]["formats"] == ["gguf"]
+    assert payload["deltas"]["exports"]["b"]["count"] == 0
+
+
+def test_compare_no_export_delta_when_both_sides_match(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dataset = _write_dataset(tmp_path)
+    dir_a = tmp_path / "exp-a"
+    dir_a.mkdir()
+    write_metadata(dir_a, model="m", method="lora", dataset_path=dataset, hyperparameters={})
+    _write_export_index(dir_a, "gguf")
+
+    dir_b = tmp_path / "exp-b"
+    dir_b.mkdir()
+    write_metadata(dir_b, model="m", method="lora", dataset_path=dataset, hyperparameters={})
+    _write_export_index(dir_b, "gguf")
+
+    rc = cmd_compare(_args(str(dir_a), str(dir_b), json_mode=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "exports" not in payload["deltas"]
+
+
+# ---------------------------------------------------------------------------
 # Unresolvable target
 # ---------------------------------------------------------------------------
 

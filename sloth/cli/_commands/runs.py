@@ -17,6 +17,7 @@ from sloth.cli._commands.overview import emit_overview
 from sloth.cli._errors import EXIT_USER_ERROR, CliError
 from sloth.cli._output import emit_diagnostic, emit_result
 from sloth.tune import registry as registry_mod
+from sloth.tune.summary import discover_exports
 
 _VERBS = [
     "runs list — newest-first table of every registered run",
@@ -97,6 +98,8 @@ def cmd_runs_show(args: argparse.Namespace) -> int:
     output_dir = record.get("output_dir", "")
     report: dict[str, Any] = dict(record)
     report["output_dir_exists"] = bool(output_dir) and Path(output_dir).is_dir()
+    exports, _export_notes = discover_exports(output_dir) if output_dir else ([], [])
+    report["exports"] = exports
 
     json_mode = bool(getattr(args, "json", False))
     if json_mode:
