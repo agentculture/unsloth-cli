@@ -2,7 +2,7 @@
   "plan_slug": "lfm2-5-target-modules-quantized-export",
   "schema_version": 2,
   "created": "2026-09-15T11:22:08Z",
-  "updated": "2026-09-15T13:49:07Z",
+  "updated": "2026-09-15T14:00:57Z",
   "deviations": [
     {
       "id": "d1",
@@ -567,7 +567,7 @@
         "e16"
       ],
       "origin": "llm",
-      "status": "proposed",
+      "status": "approved",
       "superseded": false
     },
     {
@@ -581,7 +581,7 @@
         "e11"
       ],
       "origin": "llm",
-      "status": "proposed",
+      "status": "approved",
       "superseded": false
     }
   ],
