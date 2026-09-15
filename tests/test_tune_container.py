@@ -631,3 +631,205 @@ class TestLaunchExitCodeMapping:
         with pytest.raises(CliError) as exc_info:
             launch(["train"], workdir=tmp_path, checkout=tmp_path, skip_preflight=True)
         assert exc_info.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# 5. t8 — llama.cpp cache mount, explicit HOME, env passthrough, memory preflight
+# ---------------------------------------------------------------------------
+
+
+class TestExportLaunchKwargs:
+    """The export-run contract: explicit HOME + a host-owned llama.cpp cache mount.
+
+    Unsloth resolves its llama.cpp checkout from ``Path.home()/.unsloth/llama.cpp``
+    (unsloth_zoo/llama_cpp.py), so ``HOME`` must be explicit inside the container and
+    the bind-mount target must match it exactly — otherwise the prebuilt llama.cpp
+    install is redone on every ``--rm`` run.
+    """
+
+    def test_constants(self) -> None:
+        assert container.EXPORT_HOME == "/workspace/.home"
+        assert container.UNSLOTH_LLAMA_TAG == "b10909"
+        assert container.LLAMA_CPP_CACHE_ENV == "SLOTH_LLAMA_CPP_CACHE"
+        assert container.DEFAULT_LLAMA_CPP_CACHE == (
+            Path.home() / ".cache" / "unsloth-cli" / "llama.cpp"
+        )
+
+    def test_kwargs_shape_and_mount_target(self, tmp_path: Path, monkeypatch) -> None:
+        cache = tmp_path / "llama-cache"
+        monkeypatch.setenv(container.LLAMA_CPP_CACHE_ENV, str(cache))
+        kwargs = container.export_launch_kwargs()
+        assert kwargs["env"] == [
+            ("HOME", container.EXPORT_HOME),
+            ("UNSLOTH_LLAMA_TAG", container.UNSLOTH_LLAMA_TAG),
+        ]
+        assert kwargs["extra_mounts"] == [
+            (str(cache), container.EXPORT_HOME + "/.unsloth/llama.cpp")
+        ]
+
+    def test_creates_host_cache_dir(self, tmp_path: Path, monkeypatch) -> None:
+        cache = tmp_path / "nested" / "llama.cpp"
+        monkeypatch.setenv(container.LLAMA_CPP_CACHE_ENV, str(cache))
+        assert not cache.exists()
+        container.export_launch_kwargs()
+        assert cache.is_dir()
+        # Idempotent: a second call on an existing dir must not raise.
+        container.export_launch_kwargs()
+
+    def test_default_cache_used_without_override(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.delenv(container.LLAMA_CPP_CACHE_ENV, raising=False)
+        default = tmp_path / "default-cache"
+        monkeypatch.setattr(container, "DEFAULT_LLAMA_CPP_CACHE", default)
+        kwargs = container.export_launch_kwargs()
+        assert kwargs["extra_mounts"][0][0] == str(default)
+        assert default.is_dir()
+
+    def test_kwargs_feed_build_command(self, tmp_path: Path, monkeypatch) -> None:
+        cache = tmp_path / "llama-cache"
+        monkeypatch.setenv(container.LLAMA_CPP_CACHE_ENV, str(cache))
+        kwargs = container.export_launch_kwargs()
+        joined = _joined(
+            build_command(
+                ["export", "--adapter", "a"],
+                workdir=tmp_path,
+                checkout=tmp_path / "checkout",
+                hf_cache=tmp_path / "none",
+                **kwargs,
+            )
+        )
+        assert f"-e HOME={container.EXPORT_HOME}" in joined
+        assert f"-e UNSLOTH_LLAMA_TAG={container.UNSLOTH_LLAMA_TAG}" in joined
+        assert f"-v {cache}:{container.EXPORT_HOME}/.unsloth/llama.cpp" in joined
+
+
+class TestLaunchEnvPassthrough:
+    def test_launch_forwards_env_and_extra_mounts(self, tmp_path: Path, monkeypatch) -> None:
+        seen: dict[str, list[str]] = {}
+
+        monkeypatch.setattr(container, "_stream", lambda cmd: seen.setdefault("cmd", cmd) and 0)
+        code = launch(
+            ["export"],
+            workdir=tmp_path,
+            checkout=tmp_path,
+            skip_preflight=True,
+            env=[("HOME", container.EXPORT_HOME)],
+            extra_mounts=[("/host/cache", "/workspace/.home/.unsloth/llama.cpp")],
+        )
+        assert code == 0
+        joined = _joined(seen["cmd"])
+        assert f"-e HOME={container.EXPORT_HOME}" in joined
+        assert "-v /host/cache:/workspace/.home/.unsloth/llama.cpp" in joined
+
+    def test_launch_accepts_export_launch_kwargs(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv(container.LLAMA_CPP_CACHE_ENV, str(tmp_path / "c"))
+        captured: dict[str, list[str]] = {}
+        monkeypatch.setattr(container, "_stream", lambda cmd: captured.setdefault("cmd", cmd) and 0)
+        assert (
+            launch(
+                ["export"],
+                workdir=tmp_path,
+                checkout=tmp_path,
+                skip_preflight=True,
+                **container.export_launch_kwargs(),
+            )
+            == 0
+        )
+        assert f"-e UNSLOTH_LLAMA_TAG={container.UNSLOTH_LLAMA_TAG}" in _joined(captured["cmd"])
+
+
+class TestQuantizationPins:
+    def test_llmcompressor_and_compressed_tensors_pinned(self) -> None:
+        assert "llmcompressor==0.11.0" in DEP_LAYER_PACKAGES
+        assert "compressed-tensors==0.16.0" in DEP_LAYER_PACKAGES
+
+    def test_pins_reach_the_install_line(self, tmp_path: Path) -> None:
+        joined = _joined(
+            build_command(
+                ["export"],
+                workdir=tmp_path,
+                checkout=tmp_path / "checkout",
+                hf_cache=tmp_path / "none",
+            )
+        )
+        assert "llmcompressor==0.11.0" in joined
+        assert "compressed-tensors==0.16.0" in joined
+
+    def test_pin_matrix_comment_documents_the_choice(self) -> None:
+        source = inspect.getsource(container)
+        assert "0.10.0.3" in source, "the rejected llmcompressor version must be documented"
+        assert "AWQ" in source and "LFM2" in source
+        assert "2.11" in source
+
+
+class TestMemoryPreflight:
+    """preflight() emits a low-memory hint from a faked /proc/meminfo; never blocks."""
+
+    @staticmethod
+    def _ok_probes(monkeypatch) -> None:
+        monkeypatch.setattr(container, "_docker_available", lambda: True)
+        monkeypatch.setattr(container, "_image_available", lambda image=NGC_IMAGE: True)
+        monkeypatch.setattr(container, "_gpu_runtime_ok", lambda image=NGC_IMAGE: True)
+
+    @staticmethod
+    def _meminfo(tmp_path: Path, mem_free_kib: int) -> Path:
+        path = tmp_path / "meminfo"
+        path.write_text(
+            f"MemTotal:      119537664 kB\nMemFree:       {mem_free_kib} kB\n"
+            "MemAvailable:   50000000 kB\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def test_low_memfree_emits_hint_and_does_not_block(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        self._ok_probes(monkeypatch)
+        monkeypatch.setattr(container, "MEMINFO_PATH", self._meminfo(tmp_path, 1024 * 1024))
+        assert preflight() is None
+        err = capsys.readouterr().err
+        assert "out of memory" in err
+        assert "expandable_segments" in err
+        assert "page cache" in err
+        assert capsys.readouterr().out == ""
+
+    def test_ample_memfree_emits_nothing(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        self._ok_probes(monkeypatch)
+        monkeypatch.setattr(container, "MEMINFO_PATH", self._meminfo(tmp_path, 64 * 1024 * 1024))
+        assert preflight() is None
+        assert capsys.readouterr().err == ""
+
+    def test_missing_meminfo_is_silent(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        self._ok_probes(monkeypatch)
+        monkeypatch.setattr(container, "MEMINFO_PATH", tmp_path / "absent")
+        assert preflight() is None
+        assert capsys.readouterr().err == ""
+
+    def test_unparsable_meminfo_is_silent(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        self._ok_probes(monkeypatch)
+        bad = tmp_path / "meminfo"
+        bad.write_text("garbage\nMemFree: not-a-number kB\n", encoding="utf-8")
+        monkeypatch.setattr(container, "MEMINFO_PATH", bad)
+        assert preflight() is None
+        assert capsys.readouterr().err == ""
+
+    def test_hint_emitted_before_a_failing_docker_probe(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        """The hint is informational: it must survive a preflight that then raises."""
+        monkeypatch.setattr(container, "_docker_available", lambda: False)
+        monkeypatch.setattr(container, "MEMINFO_PATH", self._meminfo(tmp_path, 1024))
+        with pytest.raises(CliError):
+            preflight()
+        assert "out of memory" in capsys.readouterr().err
+
+    def test_threshold_is_four_gib(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        self._ok_probes(monkeypatch)
+        assert container.LOW_MEMFREE_KIB == 4 * 1024 * 1024
+        # Exactly at the threshold: not low.
+        monkeypatch.setattr(container, "MEMINFO_PATH", self._meminfo(tmp_path, 4 * 1024 * 1024))
+        preflight()
+        assert capsys.readouterr().err == ""
+        # One KiB under: low.
+        monkeypatch.setattr(container, "MEMINFO_PATH", self._meminfo(tmp_path, 4 * 1024 * 1024 - 1))
+        preflight()
+        assert "out of memory" in capsys.readouterr().err
