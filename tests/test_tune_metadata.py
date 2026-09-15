@@ -116,6 +116,25 @@ class TestWriteMetadata:
         assert data["hyperparameters"] == HYPERPARAMS
         assert data["timestamp"] == FIXED_TS
 
+    def test_metadata_records_dataset_path(self, tmp_path: Path) -> None:
+        """Deviation d1: dataset.path is recorded exactly as given, so quantized
+        exports can calibrate on the training dataset by default."""
+        dataset = _make_dataset(tmp_path, ['{"a": 1}'])
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        write_metadata(
+            adapter_dir,
+            model="unsloth/Qwen3-4B",
+            method="lora",
+            dataset_path=dataset,
+            hyperparameters=HYPERPARAMS,
+            timestamp=FIXED_TS,
+        )
+        data = json.loads((adapter_dir / "training_metadata.json").read_text(encoding="utf-8"))
+        assert data["dataset"]["path"] == str(dataset)
+        # existing keys unchanged, one new key added
+        assert set(data["dataset"]) == {"path", "sha256", "line_count"}
+
     def test_timestamp_defaults_to_utc_iso(self, tmp_path: Path) -> None:
         dataset = _make_dataset(tmp_path, ['{"x": 1}'])
         adapter_dir = tmp_path / "adapter"
@@ -173,6 +192,7 @@ class TestRoundTrip:
         assert recovered["method"] == "lora"
         assert recovered["dataset"]["sha256"] == _expected_sha256(dataset)
         assert recovered["dataset"]["line_count"] == 2
+        assert recovered["dataset"]["path"] == str(dataset)
         assert recovered["hyperparameters"] == HYPERPARAMS
         assert recovered["timestamp"] == FIXED_TS
 
@@ -184,6 +204,25 @@ class TestRoundTrip:
         with pytest.raises(CliError) as exc_info:
             read_metadata(adapter_dir)
         assert exc_info.value.code == 2
+
+    def test_legacy_metadata_without_path_key_still_reads(self, tmp_path: Path) -> None:
+        """Older metadata files written before deviation d1 lack dataset.path;
+        read_metadata must not raise on the missing key."""
+        adapter_dir = tmp_path / "legacy_adapter"
+        adapter_dir.mkdir()
+        legacy_record = {
+            "model": "unsloth/Qwen3-4B",
+            "method": "lora",
+            "dataset": {"sha256": "deadbeef", "line_count": 5},
+            "hyperparameters": HYPERPARAMS,
+            "timestamp": FIXED_TS,
+        }
+        (adapter_dir / "training_metadata.json").write_text(
+            json.dumps(legacy_record, indent=2), encoding="utf-8"
+        )
+        recovered = read_metadata(adapter_dir)
+        assert recovered["dataset"]["sha256"] == "deadbeef"
+        assert "path" not in recovered["dataset"]
 
 
 class TestDatasetDigestLineCount:

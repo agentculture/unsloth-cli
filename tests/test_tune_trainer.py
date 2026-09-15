@@ -32,6 +32,7 @@ from sloth.cli._errors import CliError
 from sloth.tune import _trainer
 from sloth.tune._trainer import run_eval, run_training
 from sloth.tune.config import RunConfig
+from sloth.tune.presets import PRESETS
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -149,6 +150,23 @@ class TestDryRunPlan:
         plan = run_training(config, dry_run=True)
         assert plan["scope"]["ok"] is True
         assert plan["scope"]["out_of_scope"] is False
+
+    def test_plan_carries_null_target_modules_when_unset(self, tmp_path: Path) -> None:
+        config = _config(tmp_path)
+        plan = run_training(config, dry_run=True)
+        assert plan["hyperparameters"]["target_modules"] is None
+
+    def test_plan_carries_resolved_target_modules_for_preset(self, tmp_path: Path) -> None:
+        config = _config(tmp_path)
+        config.target_modules = "preset:lfm2"
+        plan = run_training(config, dry_run=True)
+        assert plan["hyperparameters"]["target_modules"] == PRESETS["lfm2"]
+
+    def test_plan_carries_literal_target_modules_list_unchanged(self, tmp_path: Path) -> None:
+        config = _config(tmp_path)
+        config.target_modules = ["q_proj", "k_proj"]
+        plan = run_training(config, dry_run=True)
+        assert plan["hyperparameters"]["target_modules"] == ["q_proj", "k_proj"]
 
     def test_dry_run_does_not_import_torch(self, tmp_path: Path, monkeypatch) -> None:
         """Dry-run must not call _load_backend at all."""
@@ -274,6 +292,57 @@ class TestRealFlowWithFakes:
         assert result["status"] == "trained"
         assert result["adapter_dir"] == str(Path(config.output))
         assert result["metadata_path"] == str(meta_path)
+
+    def test_get_peft_model_omits_target_modules_when_unset(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        config = _config(tmp_path)
+        _write_chat_dataset(Path(config.dataset))
+        backend, events = _make_fake_backend()
+        monkeypatch.setattr(_trainer, "_load_backend", lambda: backend)
+        fake_module, _, _ = _fake_datasets_module()
+        monkeypatch.setitem(sys.modules, "datasets", fake_module)
+
+        run_training(config, dry_run=False)
+
+        assert "target_modules" not in events["get_peft"][0]
+
+    def test_get_peft_model_receives_resolved_preset_target_modules(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        config = _config(tmp_path)
+        config.target_modules = "preset:lfm2"
+        _write_chat_dataset(Path(config.dataset))
+        backend, events = _make_fake_backend()
+        monkeypatch.setattr(_trainer, "_load_backend", lambda: backend)
+        fake_module, _, _ = _fake_datasets_module()
+        monkeypatch.setitem(sys.modules, "datasets", fake_module)
+
+        result = run_training(config, dry_run=False)
+
+        assert events["get_peft"][0]["target_modules"] == PRESETS["lfm2"]
+
+        meta_path = Path(result["metadata_path"])
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        assert data["hyperparameters"]["target_modules"] == PRESETS["lfm2"]
+
+    def test_metadata_records_dataset_path_export_reader_expects(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The real-flow writes training_metadata.json['dataset']['path'] —
+        the same key export.py's ``_training_dataset`` helper reads."""
+        config = _config(tmp_path)
+        _write_chat_dataset(Path(config.dataset))
+        backend, _ = _make_fake_backend()
+        monkeypatch.setattr(_trainer, "_load_backend", lambda: backend)
+        fake_module, _, _ = _fake_datasets_module()
+        monkeypatch.setitem(sys.modules, "datasets", fake_module)
+
+        result = run_training(config, dry_run=False)
+
+        meta_path = Path(result["metadata_path"])
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        assert data["dataset"]["path"] == config.dataset
 
 
 # ---------------------------------------------------------------------------
