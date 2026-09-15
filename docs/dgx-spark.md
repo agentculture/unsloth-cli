@@ -49,11 +49,17 @@ Inside the container the dep layer is installed into a **`--system-site-packages
 venv** (see "Gotchas" below). The pins are **load-bearing**, validated against
 NGC 25.11's torch 2.10:
 
-```text
-transformers==4.57.1   peft==0.18.0   trl==0.24.0   datasets==4.3.0   hf_transfer
-unsloth  unsloth_zoo  bitsandbytes        # installed --no-deps
-torchao  → left at the container's 0.14.0+git (NOT upgraded)
-```
+| Package | Pin | Why this exact value |
+|---------|-----|----------------------|
+| `transformers` | `4.57.1` | The window unsloth 2026.6.9 + peft 0.18 agree on. |
+| `peft` | `0.18.0` | ≥ unsloth's floor, < the `torchao>0.16` demand of peft 0.19+. |
+| `trl` | `0.24.0` | unsloth requires `trl<=0.24.0` (the old `0.26.1` was out of range). |
+| `datasets` | `4.3.0` | Validated against transformers 4.57.1. |
+| `hf_transfer` | unpinned | Download accelerator only; no API surface. |
+| `llmcompressor` | `0.11.0` | Quantized export (NVFP4 / AWQ). See the note below. |
+| `compressed-tensors` | `0.16.0` | Must match llmcompressor 0.11.0. Needs a torch-2.11 shim. |
+| `unsloth`, `unsloth_zoo`, `bitsandbytes` | unpinned, `--no-deps` | Must not drag their own torch/transformers in. |
+| `torchao` | **left** at the container's `0.14.0+git` | Not upgraded — 0.17+ needs torch 2.11. |
 
 The reason this exact set matters — a real version-matrix deadlock:
 
@@ -64,6 +70,14 @@ The reason this exact set matters — a real version-matrix deadlock:
 - But `torchao>0.16` (0.17+) needs `torch>=2.11` (it imports
   `torch.nn.functional.ScalingType`), which NGC 25.11 does **not** have.
 - `unsloth_zoo` only needs `torchao>=0.13`, so the container's 0.14 is fine.
+
+**The quantized-export pair (measured live 2026-09-15 on NGC 25.11 / torch 2.10).**
+`compressed-tensors 0.16.0` calls `torch.accelerator.get_memory_info`, which only
+exists on **torch >= 2.11** — the exporter installs a small API shim for it before
+importing the stack. The older pair `llmcompressor 0.10.0.3` + `compressed-tensors
+0.14.0.1` needs no shim and runs NVFP4 natively, but its **AWQ** path fails on
+**LFM2** (`args[0]` IndexError — the decoder layers are called with kwargs). A shim
+is cheaper than a broken AWQ path, so **0.11.0 / 0.16.0** are the pins.
 
 → Hold **peft at 0.18.x** (≥ unsloth's floor, < the torchao-0.16 demand), pair it
 with **transformers 4.57.1** and **trl 0.24.0**, and leave torchao alone. These
@@ -111,7 +125,44 @@ re-downloads the base model. The orchestration bind-mounts your
 `$HOME/.cache/huggingface` to `/opt/hf-cache` and points `HF_HOME` there, so models
 are downloaded once and reused.
 
-### 4. trl/unsloth API specifics (handled in the trainer)
+### 4. Export needs an explicit `HOME` + a mounted llama.cpp cache
+
+Unsloth resolves its llama.cpp checkout from `Path.home()/".unsloth"/"llama.cpp"`
+(`unsloth_zoo/llama_cpp.py`). Under `--user uid:gid` the NGC image's `HOME` is not
+reliably writable, and on an `--rm` container anything written there is lost — so
+every GGUF export would re-install llama.cpp. The orchestration therefore:
+
+- sets **`HOME=/workspace/.home`** explicitly (`container.EXPORT_HOME`);
+- bind-mounts a **host-owned** cache dir at exactly `$HOME/.unsloth/llama.cpp`
+  (default `~/.cache/unsloth-cli/llama.cpp`, override with
+  **`SLOTH_LLAMA_CPP_CACHE`**), created on the host if absent;
+- pins the prebuilt release with **`UNSLOTH_LLAMA_TAG=b10909`** (validated live
+  2026-09-15).
+
+With the cache populated, unsloth skips the prebuilt install entirely — **measured
+48 s on the first run, 28 s cached**. `container.export_launch_kwargs()` returns
+exactly this `env` + `extra_mounts` pair.
+
+> **Side effect, and intended:** the in-container venv lives at
+> `$HOME/.unsloth-cli-venv`, so an explicit `HOME` under the workdir mount puts the
+> venv *under the bind-mounted working directory too*. It then persists across
+> `--rm` runs — the dep layer is installed once per working directory instead of
+> once per run.
+
+### 5. Low `MemFree` before a run → a non-blocking preflight hint
+
+`preflight()` reads `/proc/meminfo` on Linux and, when **`MemFree` is under 4 GiB**,
+writes a `note:` line to **stderr**. It **never blocks** — MemFree is a snapshot and
+page cache is reclaimable — but it names the failure it predicts:
+
+> Unsloth import can fail with CUDA out of memory on the Spark's unified memory
+> when MemFree is low even with `expandable_segments`; free page cache (e.g.
+> touch-and-free a large mmap, or drop caches with root) or stop other GPU
+> residents.
+
+A missing or unparsable `/proc/meminfo` (non-Linux hosts) is silent.
+
+### 6. trl/unsloth API specifics (handled in the trainer)
 
 The real trainer (`sloth/tune/_trainer.py`) encodes several API facts that only
 surface at run time on this stack:
@@ -149,3 +200,5 @@ The first real run creates the in-container venv and installs the dep layer
 | `exit 137` (SIGKILL) | UMA OOM reclaimer. Flush page cache, reduce batch/seq, or use QLoRA. |
 | `Found an incompatible version of torchao` | A drifted dep set. Use the pinned `DEP_LAYER_PACKAGES` (peft 0.18.0). |
 | Model re-downloads every run | HF cache not mounted — check `~/.cache/huggingface` exists and is readable. |
+| llama.cpp re-installs on every export | The llama.cpp cache is not persisting — check `~/.cache/unsloth-cli/llama.cpp` (or `SLOTH_LLAMA_CPP_CACHE`) is writable. |
+| `note: MemFree is …` on stderr | Informational, not a failure: free page cache or stop other GPU residents before a big run. |
