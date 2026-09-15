@@ -44,6 +44,27 @@ Each `train`/`eval` was *also* exercised via the in-container trainer code with 
 pre-baked dep image during bring-up; the shipped-host-path rows above are the
 authoritative ones.
 
+## ✅ Tested — passed (2026-09-15, LFM2.5 + quantized export)
+
+Same box and container as above. Differences from the 2026-06 matrix: the dep
+layer now pins `datasets==4.8.5`, `llmcompressor==0.11.0`,
+`compressed-tensors==0.16.0` (deviation d3); `unsloth` / `unsloth_zoo` float
+(measured 2026.9.4 / 2026.9.3 in the live layer). Model:
+**`LiquidAI/LFM2.5-1.2B-Base`**, config `examples/lfm2-lora.toml`
+(`method = "lora"`, `lora_r = 16`, `target_modules = "preset:lfm2"`,
+`max_steps = 10`, `examples/chat-smoke.jsonl`).
+
+| Verb | Method / mode | Model | Invocation | Result |
+|------|---------------|-------|------------|--------|
+| `train --dry-run` | lora, **no** `target_modules`, `lora_r = 64` | LFM2.5-1.2B-Base | host, GPU-free | ✅ exit 0; stderr carries exactly two `note:` lines (set `preset:lfm2`; lobes' hand lane caps rank at 32); stdout JSON unchanged |
+| `train` | **LoRA** (16-bit), `preset:lfm2` | LFM2.5-1.2B-Base | shipped host path: `uv run sloth train --config examples/lfm2-lora.toml --json` | ✅ 2 m 19 s wall incl. dep-layer install; `adapter_config.json` `target_modules` = the lfm2 regex (attention + short-conv + feed-forward), `r = 16`; `training_metadata.json` carries `dataset.path` and the resolved `target_modules` |
+| serve (vLLM) | `--enable-lora`, `max_lora_rank 16` | LFM2.5-1.2B-Base + the adapter above | `vllm/vllm-openai:nightly` (v0.26.1rc1), `LLM.generate(lora_request=…)` | ✅ adapter loads with no unsupported-module warning; vLLM JIT-compiled `_lora_expand_kernel` / `_lora_shrink_kernel` during the adapter call |
+| `eval` | LoRA adapter | LFM2.5-1.2B-Base | shipped host path: `uv run sloth eval --adapter runs/lfm2-lora --suite examples/eval-suite.jsonl --json` | ✅ 4 items scored end-to-end (exact_match 0/4 — smoke adapter, not an accuracy claim) |
+
+Before-state evidence (deviation record, main at `39a3f93`): the same TOML
+dry-run on `main` ignored the `target_modules` key silently — the plan's
+`hyperparameters` had no such key.
+
 ## ❌ Not tested (explicit gaps)
 
 Do not assume these work just because the 1.7B path does. The code path is often
@@ -55,7 +76,8 @@ identical, but they have **not** been run on hardware.
   `Qwen/Qwen3.5-4B` is cached on this box but was **not** trained (insufficient
   free unified memory: ~85 GB was held by running vLLM servers, ~5 GB free).
 - Larger local adapters (Qwen 3.6 27B dense, Qwen coder variants) — not tested.
-- Any non-Qwen / any model other than `unsloth/Qwen3-1.7B` — not tested.
+- Any model other than `unsloth/Qwen3-1.7B` (2026-06) and `LiquidAI/LFM2.5-1.2B-Base`
+  (2026-09-15) — not tested.
 
 ### Configs & scale
 
