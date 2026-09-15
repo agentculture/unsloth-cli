@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.2] - 2026-09-15
+
+### Added
+
+- Post-merge validation and delivery summary for the follow-ups #22 run:
+  `docs/deliveries/2026-09-15-lfm2-5-delivery-follow-ups-22.md` (planned vs
+  actual for all 11 tasks, 4 deviations, 3 honesty conditions filed as failing,
+  remaining work) plus the devague obligation/evidence/delta ledger behind it.
+
 ## [0.8.1] - 2026-09-15
 
 ### Added

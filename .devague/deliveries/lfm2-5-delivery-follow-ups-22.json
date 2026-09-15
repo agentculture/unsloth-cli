@@ -2,7 +2,7 @@
   "plan_slug": "lfm2-5-delivery-follow-ups-22",
   "schema_version": 2,
   "created": "2026-09-15T16:51:55Z",
-  "updated": "2026-09-15T18:34:41Z",
+  "updated": "2026-09-15T19:32:31Z",
   "deviations": [
     {
       "id": "d1",
@@ -59,7 +59,732 @@
       "seq": 3
     }
   ],
-  "evidence": [],
-  "deltas": [],
+  "evidence": [
+    {
+      "id": "e1",
+      "obligation_ref": "o1",
+      "test_ref": "tests/test_tune_container.py::TestStreamCapture + ::TestLaunchResultCapture",
+      "behavior_text": "Popen(stdout=PIPE) line loop tees to sys.stderr before exit; last JSON-object line is the returned result",
+      "contract_text": "sloth train/eval/export --json emit only the in-container result on host stdout",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "11 tests green in the 699-test suite at a072b88",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 4
+    },
+    {
+      "id": "e2",
+      "obligation_ref": "o1",
+      "test_ref": "docs/tested.md, section 'follow-ups #22' (live on the DGX Spark, integration branch, 2026-09-15) rows: train --json, eval --adapter --json, 6x export --json",
+      "behavior_text": "wc -l out.json == 1 and json.loads ok for every real run; 62-219 lines on stderr",
+      "contract_text": "sloth train/eval/export --json emit only the in-container result on host stdout",
+      "evidence_type": "observation",
+      "strength": "execution",
+      "strength_basis": "live runs on the Spark, commands and counts recorded per row",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 5
+    },
+    {
+      "id": "e3",
+      "obligation_ref": "o2",
+      "test_ref": "docs/tested.md, section 'follow-ups #22' (live on the DGX Spark, integration branch, 2026-09-15) (wc -l out.json = 1 on train, eval, export x6)",
+      "behavior_text": "one line, json.loads succeeds",
+      "contract_text": "stdout parses as exactly 1 JSON document each (0 non-JSON lines)",
+      "evidence_type": "observation",
+      "strength": "execution",
+      "strength_basis": "measured live, counts in the rows",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 6
+    },
+    {
+      "id": "e4",
+      "obligation_ref": "o3",
+      "test_ref": "grep -l subprocess sloth/cli/_commands/{train,eval,export}.py",
+      "behavior_text": "no match",
+      "contract_text": "the stdout fix lands in container.py once for all three verbs",
+      "evidence_type": "automated",
+      "strength": "coverage",
+      "strength_basis": "static grep at a072b88 returns nothing",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 7
+    },
+    {
+      "id": "e5",
+      "obligation_ref": "o4",
+      "test_ref": "tests/test_tune_container.py::TestLaunchResultCapture::test_exit_0_without_json_fails_closed_with_single_line_message",
+      "behavior_text": "40 banner lines + exit 0 -> CliError code 2, message has no newline and carries the count, stderr holds banner-39",
+      "contract_text": "with exit 0 and no parseable line it raises CliError(code=2) whose message contains the last 20 captured lines (amended by d4: single line, tail on stderr)",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "green at a072b88; wording amended per approved deviation d4",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 8
+    },
+    {
+      "id": "e6",
+      "obligation_ref": "o5",
+      "test_ref": "tests/test_tune_container.py::TestStreamCapture (lazy fake process) + existing exit-code mapping tests",
+      "behavior_text": "first line on stderr before the process ends; 1/2/137/other/127 mapping tests unmodified",
+      "contract_text": "line-streamed tee; existing mapping preserved",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "green at a072b88; real-docker streaming only observed live (lapse l4)",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 9
+    },
+    {
+      "id": "e7",
+      "obligation_ref": "o6",
+      "test_ref": "tests/test_cli.py::test_emit_result_json_is_single_line + grep indent sloth/cli/_output.py",
+      "behavior_text": "exactly one newline for a nested dict; no indent= in _output.py",
+      "contract_text": "emit_result writes JSON with no indent",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "green at a072b88",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 10
+    },
+    {
+      "id": "e8",
+      "obligation_ref": "o7",
+      "test_ref": "README.md:41-43,:95 + docs/tested.md, section 'follow-ups #22' (live on the DGX Spark, integration branch, 2026-09-15)",
+      "behavior_text": "promise unchanged; live rows show 1 stdout line per verb",
+      "contract_text": "README's promise is either true or caveated",
+      "evidence_type": "observation",
+      "strength": "execution",
+      "strength_basis": "proved by the live rows, no caveat needed",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 11
+    },
+    {
+      "id": "e9",
+      "obligation_ref": "o8",
+      "test_ref": "tests/test_finetune_skill_script.py (8 tests incl. one per resolution branch + empty SLOTH_BIN fall-through)",
+      "behavior_text": "each branch selects the expected executable; pre-existing forwarding tests unchanged",
+      "contract_text": "resolver order and per-branch tests; existing assertions pass with only the fixture changed",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "8/8 green at a072b88",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 12
+    },
+    {
+      "id": "e10",
+      "obligation_ref": "o9",
+      "test_ref": "shellcheck .claude/skills/finetune/scripts/finetune.sh + test_finetune_skill_script.py empty-SLOTH_BIN test",
+      "behavior_text": "no warning on the SLOTH_BIN line; SLOTH_BIN='' falls through",
+      "contract_text": "no word-splitting warning; empty falls through to the checkout branch",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "shellcheck clean on that line at a072b88; test green",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 13
+    },
+    {
+      "id": "e11",
+      "obligation_ref": "o10",
+      "test_ref": ".claude/skills/finetune/SKILL.md (resolution sentence + Requirements) vs resolve_sloth",
+      "behavior_text": "both state SLOTH_BIN -> checkout -> PATH; --suite help says <suite.jsonl | dir>",
+      "contract_text": "SKILL.md states the new order; markdownlint clean",
+      "evidence_type": "manual",
+      "strength": "fidelity",
+      "strength_basis": "read side by side at a072b88; skills dir is excluded from the repo lint config",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 14
+    },
+    {
+      "id": "e12",
+      "obligation_ref": "o11",
+      "test_ref": "tests/test_cmd_eval.py (dir suite, malformed file -> exit 1, launcher never called; --quant/--batch-size forwarded) + tests/test_cmd_validate.py (--suite file|dir, non-task --schema rejected) + teken cli doctor 26/26",
+      "behavior_text": "exit 1 naming file and line before any launch; explain eval documents --suite dir, --quant, --batch-size",
+      "contract_text": "validate every *.jsonl before launch; validate --suite; catalog documents the flags; rubric gate passes",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "green at a072b88, rubric healthy 26/26",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 15
+    },
+    {
+      "id": "e13",
+      "obligation_ref": "o12",
+      "test_ref": "tests/test_tune_trainer.py + tests/test_tune_exporter.py (f1('a b c','a b d')==0.667; per-file + aggregate; eval.json written next to a bare .gguf) + tests/test_tune_summary.py/test_cmd_compare.py (eval block, identical metrics -> no delta)",
+      "behavior_text": "shape and placement asserted; summarize/compare read eval.json",
+      "contract_text": "one entry per file plus an aggregate, each with total, exact_match, exact_match_pct, f1; metrics.py stdlib-only",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "green at a072b88; tests/test_lazy_import.py guards metrics.py",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 16
+    },
+    {
+      "id": "e14",
+      "obligation_ref": "o13",
+      "test_ref": "tests/test_tune_trainer.py (3 prompts of different lengths; eos-as-pad; both-None -> batch 1 + stderr diagnostic; offset == shared padded width)",
+      "behavior_text": "no prediction starts with its prompt under left padding",
+      "contract_text": "batches of batch_size with padding_side=left; pad fallbacks; each prediction excludes its own prompt",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "green at a072b88; 3 tests fail when the offset helper is sabotaged (t5 report)",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 17
+    },
+    {
+      "id": "e15",
+      "obligation_ref": "o13",
+      "test_ref": "docs/tested.md, section 'follow-ups #22' (live on the DGX Spark, integration branch, 2026-09-15) + docs/benchmarks.md: adapter batch 8 (220 s) vs batch 1 (524 s), 46 items",
+      "behavior_text": "2.4x wall-clock; exact 0/46 both; F1 0.038 vs 0.060",
+      "contract_text": "docs/tested.md records wall-clock for the 40-item suite batched vs the old per-prompt path",
+      "evidence_type": "observation",
+      "strength": "execution",
+      "strength_basis": "measured live; outputs not bit-identical (plan risk r8)",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 18
+    },
+    {
+      "id": "e16",
+      "obligation_ref": "o14",
+      "test_ref": "tests/test_tune_exporter.py (_find_gguf with quant on Q4_K_M + Q8_0; missing quant -> CliError 1 with names; no quant -> existing error)",
+      "behavior_text": "as stated",
+      "contract_text": "--quant q4_k_m scores the q4_k_m file; missing quant exits 1 with a hint listing the present ones",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "green at a072b88",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 19
+    },
+    {
+      "id": "e17",
+      "obligation_ref": "o15",
+      "test_ref": "tests/test_tune_trainer.py TestRunEval (decode honours tokens) + docs/tested.md, section 'follow-ups #22' (live on the DGX Spark, integration branch, 2026-09-15) eval --adapter row",
+      "behavior_text": "unit: slice asserted; live: predictions start after the prompt (echo of the Input: template, prompt excluded)",
+      "contract_text": "the fake tokenizer decodes its actual token slice and a test asserts no prediction starts with the prompt",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "green at a072b88 and live-verified",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 20
+    },
+    {
+      "id": "e18",
+      "obligation_ref": "o16",
+      "test_ref": "tests/test_tune_container.py::TestNodepsLayerPins + t8's in-container uv pip list (bitsandbytes 0.50.2, unsloth 2026.9.4, unsloth-zoo 2026.9.3)",
+      "behavior_text": "3 '==' entries reach the docker command; values equal the measured layer",
+      "contract_text": "pinned versions equal the versions printed by uv pip list inside the container",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "green at a072b88; measurement recorded in docs/dgx-spark.md bump section and the CHANGELOG",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 21
+    },
+    {
+      "id": "e19",
+      "obligation_ref": "o17",
+      "test_ref": "git diff a89c16b HEAD -- sloth/tune/container.py (tuple entries)",
+      "behavior_text": "no tuple entry line in the diff (only a comment/docstring mention)",
+      "contract_text": "DEP_LAYER_PACKAGES byte-identical before and after the pin PR",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "diff inspected at a072b88",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 22
+    },
+    {
+      "id": "e20",
+      "obligation_ref": "o18",
+      "test_ref": "grep -c '==' on the tuple (3/3); pytest -k pin; grep -i '## .*bump' docs/dgx-spark.md (1)",
+      "behavior_text": "as stated",
+      "contract_text": "3 '==' pins, tests assert each reaches the install line, a heading containing 'bump'",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "all three commands at a072b88",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 23
+    },
+    {
+      "id": "e21",
+      "obligation_ref": "o19",
+      "test_ref": "git diff a89c16b HEAD -- sloth/tune/container.py",
+      "behavior_text": "container.py changes are the t1 capture path (separate task) and the pin tuple; no fingerprint/invalidation code",
+      "contract_text": "the pin PR's diff to container.py is confined to DEP_LAYER_NODEPS_PACKAGES",
+      "evidence_type": "automated",
+      "strength": "fidelity",
+      "strength_basis": "read the diff; t1's capture rewrite shares the file, the pin change itself is the tuple only",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 24
+    },
+    {
+      "id": "e22",
+      "obligation_ref": "o20",
+      "test_ref": "docs/tested.md, section 'follow-ups #22' (live on the DGX Spark, integration branch, 2026-09-15) row: export --format merged-16bit on runs/qlora-smoke",
+      "behavior_text": "3.44 GB bf16 model.safetensors, no quantization_config, 150 s",
+      "contract_text": "docs/tested.md gets a row for qlora-smoke -> merged-16bit stating pass or fail",
+      "evidence_type": "observation",
+      "strength": "execution",
+      "strength_basis": "measured live",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 25
+    },
+    {
+      "id": "e23",
+      "obligation_ref": "o21",
+      "test_ref": "docs/tested.md, section 'follow-ups #22' (live on the DGX Spark, integration branch, 2026-09-15) rows: Qwen3-1.7B awq (1.98 GB, 28 GQA mappings auto-skipped, no custom mapping), nvfp4 (2.04 GB), gguf Q4_K_M (1.11 GB)",
+      "behavior_text": "all pass with llm-compressor defaults",
+      "contract_text": "one row each for awq, nvfp4, gguf; awq noting whether a custom mapping was needed",
+      "evidence_type": "observation",
+      "strength": "execution",
+      "strength_basis": "measured live",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 26
+    },
+    {
+      "id": "e24",
+      "obligation_ref": "o22",
+      "test_ref": "grep over the follow-ups section of docs/tested.md",
+      "behavior_text": "0 matches for larger Qwen3 variants",
+      "contract_text": "no model larger than 1.7B (Qwen) or 1.2B (LFM2.5) in new rows",
+      "evidence_type": "automated",
+      "strength": "coverage",
+      "strength_basis": "grep at a072b88",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 27
+    },
+    {
+      "id": "e25",
+      "obligation_ref": "o23",
+      "test_ref": "docs/tested.md, section 'follow-ups #22' (live on the DGX Spark, integration branch, 2026-09-15) rows: eval --adapter (0/4, F1 0.087, prompt excluded) and export --base LiquidAI/LFM2.5-1.2B-Instruct (staged copy loads, export.json records the override base)",
+      "behavior_text": "both recorded with outcomes",
+      "contract_text": "one row for eval --adapter with the exact_match count, one for export --base stating whether the staged copy loaded",
+      "evidence_type": "observation",
+      "strength": "execution",
+      "strength_basis": "measured live",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 28
+    },
+    {
+      "id": "e26",
+      "obligation_ref": "o24",
+      "test_ref": "docs/tested.md, section 'follow-ups #22' (live on the DGX Spark, integration branch, 2026-09-15) (train 1/219, eval 1/191, exports 1 each)",
+      "behavior_text": "counts recorded per verb; the /finetune skill loop itself was not re-run as one command",
+      "contract_text": "docs/tested.md records the stdout-line count of the /finetune --json loop on the Spark after the fix",
+      "evidence_type": "observation",
+      "strength": "execution",
+      "strength_basis": "per-verb counts measured; the single skill-driven loop run is not in the rows",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 29
+    },
+    {
+      "id": "e27",
+      "obligation_ref": "o25",
+      "test_ref": "docs/fine-tuning.md Thor row + docs/tested.md, section 'follow-ups #22' (live on the DGX Spark, integration branch, 2026-09-15) Thor row (vllm/vllm-openai:v0.29.0-aarch64, JetPack R38.2.2, awq + nvfp4 load and generate)",
+      "behavior_text": "Thor cell dated 2026-09-15; Orin points at #23",
+      "contract_text": "the Live-tested cell for at least one of the Orin / Thor rows names a date and a device",
+      "evidence_type": "observation",
+      "strength": "execution",
+      "strength_basis": "measured live on the Thor",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 30
+    },
+    {
+      "id": "e28",
+      "obligation_ref": "o26",
+      "test_ref": "docs/benchmarks.md per-format table (6 rows, 46 items)",
+      "behavior_text": "exact_match is 0/46 on every row; token-F1 is non-zero (0.036-0.092)",
+      "contract_text": "at least one row is not 0, otherwise the row set is a failed condition",
+      "evidence_type": "observation",
+      "strength": "execution",
+      "strength_basis": "table exists; on the exact-match metric every row is 0 for the 10-step smoke adapter \u2014 recorded as a failed condition, per the condition's own wording",
+      "outcome": "fail",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 31
+    },
+    {
+      "id": "e29",
+      "obligation_ref": "o27",
+      "test_ref": "docs/tested.md follow-ups section (32 table rows incl. 3 header/notes lines) + docs/benchmarks.md (6 scored rows, 46 items)",
+      "behavior_text": "row count and table present",
+      "contract_text": ">= 6 new rows; benchmarks carries a per-format score on a suite of >= 20 items",
+      "evidence_type": "observation",
+      "strength": "execution",
+      "strength_basis": "counted at a072b88",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 32
+    },
+    {
+      "id": "e30",
+      "obligation_ref": "o28",
+      "test_ref": "README.md:41-43 + docs/benchmarks.md table + docs/deliveries/...lfm2-5...md lapse ledger line",
+      "behavior_text": "README unchanged and live-true; table present; l1 annotated as superseded (cap stands until a trained adapter is scored)",
+      "contract_text": "README true on a real run; benchmarks per-format score; l1 superseded or annotated",
+      "evidence_type": "observation",
+      "strength": "fidelity",
+      "strength_basis": "read at a072b88",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 33
+    },
+    {
+      "id": "e31",
+      "obligation_ref": "o29",
+      "test_ref": "grep -rli 'ssh thor' sloth tests .claude docs README.md",
+      "behavior_text": "matches: docs/tested.md, and the exported spec, plan, and split-plan under docs/ (devague artifacts quoting the park resolution)",
+      "contract_text": "grep returns only docs/tested.md lines",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "sloth/, tests/, .claude/ and README are clean; the literal condition fails because the devague artifacts under docs/ also contain the phrase",
+      "outcome": "fail",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 34
+    },
+    {
+      "id": "e32",
+      "obligation_ref": "o30",
+      "test_ref": "grep '125' docs/tested.md (0); grep '0/4' delivery doc (2); grep '2026.6.9' shipped plan (1)",
+      "behavior_text": "two of three numbers grep where cited; '3 of 125 lines' lives in issue #22's body, not tested.md:73",
+      "contract_text": "the before-state numbers are quoted from docs/tested.md:73, the delivery doc :102 and the plan's r1 text",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "partial: the 125 figure is cited to the wrong file",
+      "outcome": "fail",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 35
+    },
+    {
+      "id": "e33",
+      "obligation_ref": "o31",
+      "test_ref": "gh issue view 22 --comments (last body: 9 numbered lines) + gh issue view 22 state=CLOSED",
+      "behavior_text": "as stated",
+      "contract_text": "a closing comment with nine lines each pointing at a row, PR, or #23; the issue is closed",
+      "evidence_type": "observation",
+      "strength": "execution",
+      "strength_basis": "checked after closing at a072b88",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 36
+    },
+    {
+      "id": "e34",
+      "obligation_ref": "o32",
+      "test_ref": "docs/specs/2026-09-15-lfm2-5-delivery-follow-ups-22.md ## Audience first bullet",
+      "behavior_text": "'Agents and operators who drive sloth ... and parse stdout as JSON' is first",
+      "contract_text": "audience names agents parsing stdout first",
+      "evidence_type": "manual",
+      "strength": "fidelity",
+      "strength_basis": "read at a072b88",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 37
+    },
+    {
+      "id": "e35",
+      "obligation_ref": "o33",
+      "test_ref": "devague plan show --plan lfm2-5-target-modules-quantized-export (Risks)",
+      "behavior_text": "r5, r6, r7 still listed unresolved; r1-r4, r8-r10 resolved with pointers",
+      "contract_text": "r5/r6/r7 remain listed and unresolved",
+      "evidence_type": "automated",
+      "strength": "execution",
+      "strength_basis": "read at a072b88",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 38
+    },
+    {
+      "id": "e36",
+      "obligation_ref": "o34",
+      "test_ref": "gh issue view 22 (state CLOSED, nine-item map comment, closing comment naming #25/#26/#23)",
+      "behavior_text": "as stated",
+      "contract_text": "issue #22 is closed with a comment mapping each of its nine items",
+      "evidence_type": "observation",
+      "strength": "execution",
+      "strength_basis": "checked at a072b88",
+      "outcome": "pass",
+      "run": {
+        "timestamp": "2026-09-15T19:29:32Z",
+        "commit": "a072b88"
+      },
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false,
+      "seq": 39
+    }
+  ],
+  "deltas": [
+    {
+      "id": "b1",
+      "kind": "added",
+      "behavior_text": "sloth export forwards SLOTH_ALLOWED_ROOTS (adapter/output/calib/dataset \u2014 and, after review, a local --base \u2014 parents) into the container env so the in-container path sanitizer accepts the identity-mounted host paths; every real export had exited 1 since #20",
+      "caused_by": [
+        "d2"
+      ],
+      "evidence_refs": [
+        "e2"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false
+    },
+    {
+      "id": "b2",
+      "kind": "added",
+      "behavior_text": "batched eval (batch 8, left padding) is not bit-identical to serial decoding: same adapter and 46-item suite give F1 0.038 vs 0.060 (exact 0/46 both); the batch size is not recorded in eval.json",
+      "caused_by": [
+        "c36"
+      ],
+      "evidence_refs": [],
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false
+    },
+    {
+      "id": "b3",
+      "kind": "added",
+      "behavior_text": "sloth eval rejects --batch-size < 1 with exit 1 before any launch; sloth validate --suite always uses the task schema and rejects an explicit non-task --schema; compare reports an eval delta only when the projected metrics differ (review fixes on #25)",
+      "caused_by": [
+        "c43",
+        "c35"
+      ],
+      "evidence_refs": [],
+      "origin": "llm",
+      "status": "proposed",
+      "superseded": false
+    }
+  ],
   "supersessions": []
 }
