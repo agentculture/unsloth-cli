@@ -47,11 +47,21 @@ import subprocess  # nosec B404 - scoring a GGUF means invoking llama-completion
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from sloth.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 from sloth.cli._output import emit_diagnostic
-from sloth.tune._trainer import _detect_dataset_schema, _format_records, _is_gpu_oom
+from sloth.tune import metrics
+from sloth.tune._trainer import (
+    DEFAULT_EVAL_BATCH_SIZE,
+    _detect_dataset_schema,
+    _format_records,
+    _generate_predictions,
+    _is_gpu_oom,
+    eval_prompt,
+    resolve_suite_paths,
+    write_eval_json,
+)
 from sloth.tune.datasets import validate_dataset
 
 # Formats understood by this seam.
@@ -847,58 +857,63 @@ def _quant_info(model_dir: Path) -> tuple[str | None, str | None]:
     return (method if isinstance(method, str) else None, fmt if isinstance(fmt, str) else None)
 
 
-def _find_gguf(model_dir: Path) -> Path | None:
-    """Return the single ``*.gguf`` inside *model_dir* (``None`` if there is none).
+def _quant_matches(name: str, quant: str) -> bool:
+    """True when GGUF file *name* carries the quant tag *quant* (case-insensitive)."""
+    return quant.strip().lower() in name.lower()
 
-    Several GGUF files (e.g. a ``--quant q4_k_m,q8_0`` export, or a kept F16
-    intermediate) are ambiguous: rather than silently scoring the alphabetically
-    first one, exit 1 and ask for the exact file via ``--model <file.gguf>``.
+
+def _find_gguf(model_dir: Path, quant: str | None = None) -> Path | None:
+    """Return the ``*.gguf`` inside *model_dir* to score (``None`` if there is none).
+
+    With **one** GGUF present that file is returned and *quant* is ignored — which
+    is what ``sloth eval --quant`` documents ("ignored for a single-GGUF or
+    non-GGUF --model directory").
+
+    With **several** (e.g. a ``--quant q4_k_m,q8_0`` export, or a kept F16
+    intermediate) the directory is ambiguous:
+
+    * *quant* given → the file whose name contains that tag, matched
+      case-insensitively (``q4_k_m`` selects ``…-Q4_K_M.gguf``). No match is a
+      user error whose hint lists the names actually present; an ambiguous match
+      (several files carrying the tag) is a user error too.
+    * *quant* omitted → the historical error: exit 1 and ask for the exact file
+      via ``--model <file.gguf>``, rather than silently scoring the
+      alphabetically first one.
     """
     candidates = sorted(model_dir.glob("*.gguf"))
-    if len(candidates) > 1:
-        names = ", ".join(c.name for c in candidates)
+    if len(candidates) <= 1:
+        return candidates[0] if candidates else None
+
+    names = ", ".join(c.name for c in candidates)
+    if quant:
+        matches = [c for c in candidates if _quant_matches(c.name, quant)]
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=f"no GGUF file in {model_dir} matches --quant {quant}",
+                remediation=(
+                    f"The directory holds: {names}. Pass --quant with one of those "
+                    "tags, or point --model at the exact file, e.g. "
+                    "--model <dir>/<name>.gguf."
+                ),
+            )
+        matched = ", ".join(m.name for m in matches)
         raise CliError(
             code=EXIT_USER_ERROR,
-            message=f"{model_dir} holds several GGUF files: {names}",
+            message=f"--quant {quant} matches several GGUF files in {model_dir}: {matched}",
             remediation="Point --model at the exact file, e.g. --model <dir>/<name>.gguf.",
         )
-    return candidates[0] if candidates else None
 
-
-def _eval_prompt(record: dict[str, Any]) -> str:
-    """Render one task-schema record into the prompt shape used by ``run_eval``."""
-    return f"Task: {record['task']}\nInput: {record['input']}\nOutput:"
-
-
-def _score_predictions(records: list[dict[str, Any]], predictions: list[str]) -> dict[str, Any]:
-    """Score *predictions* against *records* exactly as ``run_eval`` scores an adapter.
-
-    Deliberately a **duplicate** of the comparison run_eval performs inline
-    (``prediction.strip() == expected.strip()``, same per-record keys, same
-    ``exact_match_pct`` rounding): extracting it from ``_trainer.run_eval`` would mean
-    editing that function, and this seam must not change its behaviour.
-    """
-    results: list[dict[str, Any]] = []
-    for index, (record, prediction) in enumerate(zip(records, predictions)):
-        expected = record["expected_output"]
-        results.append(
-            {
-                "index": index,
-                "task": record["task"],
-                "input": record["input"],
-                "expected_output": expected,
-                "prediction": prediction,
-                "exact_match": prediction.strip() == expected.strip(),
-            }
-        )
-    total = len(results)
-    exact = sum(1 for r in results if r["exact_match"])
-    return {
-        "total": total,
-        "exact_match": exact,
-        "exact_match_pct": round(exact / total * 100, 2) if total else 0.0,
-        "results": results,
-    }
+    raise CliError(
+        code=EXIT_USER_ERROR,
+        message=f"{model_dir} holds several GGUF files: {names}",
+        remediation=(
+            "Select one with --quant <tag> (e.g. --quant q4_k_m), or point --model "
+            "at the exact file, e.g. --model <dir>/<name>.gguf."
+        ),
+    )
 
 
 def _llama_cpp_dir() -> Path:
@@ -961,8 +976,13 @@ def _run_llama_completion(gguf: Path, prompt: str, max_tokens: int) -> str:
 
 
 def _predict_gguf(gguf: Path, records: list[dict[str, Any]], max_tokens: int) -> list[str]:
-    """Return one completion per record, scored through llama.cpp."""
-    return [_run_llama_completion(gguf, _eval_prompt(record), max_tokens) for record in records]
+    """Return one completion per record, scored through llama.cpp.
+
+    llama.cpp's ``llama-completion`` takes exactly one prompt per process, so this
+    path is inherently unbatched — ``--batch-size`` applies to the transformers
+    path only.
+    """
+    return [_run_llama_completion(gguf, eval_prompt(record), max_tokens) for record in records]
 
 
 def _predict_transformers(
@@ -970,6 +990,7 @@ def _predict_transformers(
     model_dir: Path,
     records: list[dict[str, Any]],
     max_tokens: int,
+    batch_size: int = DEFAULT_EVAL_BATCH_SIZE,
 ) -> list[str]:
     """Return one completion per record from a transformers-loadable directory.
 
@@ -977,6 +998,10 @@ def _predict_transformers(
     compressed-tensors checkpoint (AWQ ``pack-quantized`` / NVFP4
     ``nvfp4-pack-quantized``) from ``config.json``; a bf16 merged dir loads plainly.
     ``local_files_only=True`` keeps the run offline.
+
+    Generation itself is delegated to :func:`sloth.tune._trainer._generate_predictions`
+    — the same left-padded, batched loop the ``--adapter`` seam uses — so both
+    seams slice the prompt off identically and cannot drift apart.
     """
     tokenizer = backend.auto_tokenizer.from_pretrained(  # nosec B615
         str(model_dir), local_files_only=True
@@ -988,40 +1013,24 @@ def _predict_transformers(
     # Tokenized inputs must share the model's device, else generate() raises
     # "Expected all tensors to be on the same device" (same constraint as run_eval).
     device = next(model.parameters()).device
-    predictions: list[str] = []
-    for record in records:
-        inputs = tokenizer(_eval_prompt(record), return_tensors="pt").to(device)
-        with backend.torch.no_grad():
-            outputs = model.generate(**inputs, max_new_tokens=max_tokens)
-        # Score the continuation only: generate() returns prompt + new tokens, and
-        # exact-match against expected_output must not include the "Task:/Input:/
-        # Output:" prompt (same fix as run_eval).
-        predictions.append(
-            tokenizer.decode(_continuation(outputs[0], inputs), skip_special_tokens=True)
-        )
-    return predictions
-
-
-def _continuation(sequence: Any, inputs: Any) -> Any:
-    """Slice the generated continuation off a ``generate()`` output row."""
-    ids = inputs["input_ids"] if isinstance(inputs, dict) else getattr(inputs, "input_ids", None)
-    shape = getattr(ids, "shape", None)
-    if shape is not None:
-        prompt_len = int(shape[-1])
-    elif ids is not None:
-        prompt_len = len(ids)
-    else:
-        prompt_len = 0
-    try:
-        return sequence[prompt_len:]
-    except TypeError:
-        return sequence
+    return _generate_predictions(
+        backend.torch,
+        model,
+        tokenizer,
+        [eval_prompt(record) for record in records],
+        batch_size=batch_size,
+        max_new_tokens=max_tokens,
+        device=device,
+    )
 
 
 def run_eval_model(
     model_dir: str,
-    suite_path: str,
+    suite_path: str | None = None,
     *,
+    suite_paths: Sequence[str | Path] | None = None,
+    quant: str | None = None,
+    batch_size: int = DEFAULT_EVAL_BATCH_SIZE,
     max_new_tokens: int = EVAL_MAX_NEW_TOKENS,
 ) -> dict[str, Any]:
     """Evaluate a merged / quantized model **directory** against a task-schema suite.
@@ -1037,27 +1046,42 @@ def run_eval_model(
     Parameters
     ----------
     model_dir:
-        Directory holding a merged (bf16/4-bit), AWQ, NVFP4 or GGUF export.
+        Directory holding a merged (bf16/4-bit), AWQ, NVFP4 or GGUF export — or a
+        single ``.gguf`` file. ``eval.json`` is written into that directory.
     suite_path:
-        Path to a task-schema JSONL eval suite.
+        A single task-schema JSONL suite — the historical positional argument,
+        still honoured for direct/legacy callers.
+    suite_paths:
+        Every resolved suite file, in order (what ``sloth eval`` passes once it
+        detects this signature). Wins over *suite_path* when both are given.
+    quant:
+        Which GGUF to score when the directory holds several (case-insensitive
+        tag, e.g. ``q4_k_m``); ignored for a single-GGUF or transformers-loadable
+        directory. See :func:`_find_gguf`.
+    batch_size:
+        Prompts per ``generate()`` call on the transformers path (left-padded;
+        the llama.cpp path is one process per prompt and ignores it).
     max_new_tokens:
         Generation budget per item.
 
     Returns
     -------
     dict
-        The same score fields as adapter eval — ``total``, ``exact_match``,
-        ``exact_match_pct``, ``results`` — plus ``model_dir``, ``quant_method`` and
-        ``quant_format`` (from ``config.json``'s ``quantization_config``; ``None``
-        for a plain bf16 merged dir or a GGUF).
+        The same shape as adapter eval — the aggregate ``total``,
+        ``exact_match``, ``exact_match_pct``, ``f1``, ``results`` plus per-file
+        ``files`` entries — with ``model_dir``, ``quant_method`` and
+        ``quant_format`` added (from ``config.json``'s ``quantization_config``;
+        ``None`` for a plain bf16 merged dir or a GGUF).
 
     Raises
     ------
     CliError(code=1)
-        When *model_dir* is not a directory (or the suite fails task-schema validation).
+        When *model_dir* is not a directory, the suite fails task-schema
+        validation, or *quant* matches no GGUF in an ambiguous directory.
     CliError(code=2)
         When the ML stack is unavailable, llama.cpp is missing, or the GPU OOMs.
     """
+    resolved_suites = resolve_suite_paths(suite_path, suite_paths)
     directory = Path(model_dir)
     if directory.is_file() and directory.suffix == ".gguf":
         gguf_file = directory
@@ -1074,11 +1098,16 @@ def run_eval_model(
             ),
         )
 
-    # Validate the suite BEFORE any model load — a broken suite must cost no GPU time.
-    records = validate_dataset(Path(suite_path), schema="task")
+    # Validate every suite file BEFORE any model load — a broken suite must cost no
+    # GPU time. Records are then scored as one flat batch so the model is loaded
+    # once, and split back per file for the ``files`` entries afterwards.
+    records_by_file = [
+        (path, validate_dataset(Path(path), schema="task")) for path in resolved_suites
+    ]
+    records = [record for _, file_records in records_by_file for record in file_records]
     quant_method, quant_format = _quant_info(directory)
 
-    gguf = gguf_file if gguf_file is not None else _find_gguf(directory)
+    gguf = gguf_file if gguf_file is not None else _find_gguf(directory, quant)
     try:
         if gguf is not None:
             predictions = _predict_gguf(gguf, records, max_new_tokens)
@@ -1091,7 +1120,9 @@ def run_eval_model(
                     message=f"The eval backend is not installed: {exc}",
                     remediation=_EVAL_NGC_HINT,
                 ) from exc
-            predictions = _predict_transformers(backend, directory, records, max_new_tokens)
+            predictions = _predict_transformers(
+                backend, directory, records, max_new_tokens, batch_size
+            )
     except CliError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -1103,8 +1134,17 @@ def run_eval_model(
             ) from exc
         raise
 
-    summary = _score_predictions(records, predictions)
+    files: list[dict[str, Any]] = []
+    cursor = 0
+    for path, file_records in records_by_file:
+        chunk = predictions[cursor : cursor + len(file_records)]
+        scored = metrics.score_records(file_records, chunk, start_index=cursor, source=str(path))
+        cursor += len(file_records)
+        files.append(metrics.file_entry(path, scored))
+
+    summary = metrics.aggregate(files)
     summary["model_dir"] = str(directory)
     summary["quant_method"] = quant_method
     summary["quant_format"] = quant_format
+    write_eval_json(directory, summary, resolved_suites, target="model")
     return summary
