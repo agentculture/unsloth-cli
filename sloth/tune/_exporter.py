@@ -128,6 +128,7 @@ class _Backend:
     quantization_modifier: Any = None  # llmcompressor QuantizationModifier
     awq_mapping: Any = None  # llmcompressor AWQMapping
     compressed_tensors: Any = None  # the compressed_tensors module (for the shim)
+    dataset_from_list: Any = None  # datasets.Dataset.from_list (oneshot needs a Dataset)
 
 
 def _load_backend(*, need_compressor: bool = False) -> _Backend:
@@ -182,6 +183,12 @@ def _attach_compressor(backend: _Backend) -> None:
         # 0.10 keeps both in modifiers.awq.
         from llmcompressor.modifiers.awq import AWQMapping, AWQModifier  # noqa: PLC0415
 
+    # llmcompressor.oneshot reads ``dataset.column_names``: a plain list of dicts
+    # fails with "'list' object has no attribute 'column_names'" (live-measured),
+    # so calibration rows are wrapped in a datasets.Dataset (in the dep layer).
+    from datasets import Dataset  # noqa: PLC0415
+
+    backend.dataset_from_list = Dataset.from_list
     backend.oneshot = oneshot
     backend.awq_modifier = AWQModifier
     backend.quantization_modifier = QuantizationModifier
@@ -499,7 +506,7 @@ def _export_compressed(
     rows = _format_records(calibration.records, calibration.schema, tokenizer)
     backend.oneshot(
         model=model,
-        dataset=rows,
+        dataset=(backend.dataset_from_list(rows) if backend.dataset_from_list else rows),
         recipe=_build_recipe(backend, plan["format"], model),
         # MANDATORY for LFM2: the default sequential pipeline traces the model with
         # torch.fx and dies in create_causal_mask ("'NoneType' object has no
