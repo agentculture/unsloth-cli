@@ -14,7 +14,8 @@ path, and the torch shim deliberately kept. The plan (11 tasks, 5 waves) was
 executed via `/assign-to-workforce` on the integration branch
 `feat/follow-ups-22-a`, shipped as PR #25 (code + live batch 1) with PR #26
 (live batch 2 + closeout) stacked on it; both squash-merged to `main` at
-`a072b88`. Version 0.7.2 → 0.8.1.
+`a072b88`. The run itself moved the package from 0.7.2 (main before #25) to
+0.8.1 (after #26); this summary lands separately as 0.8.2.
 
 ## Planned Work
 
