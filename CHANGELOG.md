@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2] - 2026-09-15
+
+### Added
+
+- Spec (devague, live-probed on DGX Spark): explicit `target_modules` with an `lfm2` regex preset, and container-backed `sloth export` formats merged-16bit / merged-4bit / gguf / awq / nvfp4 with `eval --model` for quantization loss (issues #16, #18) — docs/specs/2026-09-15-lfm2-5-target-modules-quantized-export.md
+
 ## [0.6.1] - 2026-09-14
 
 ### Changed

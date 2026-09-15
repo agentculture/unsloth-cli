@@ -235,3 +235,5 @@ runs/
 
 # unsloth writes a compiled-kernel cache to the working dir during training
 unsloth_compiled_cache/
+
+.devague/questions/
