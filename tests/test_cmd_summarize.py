@@ -222,6 +222,84 @@ def test_register_target_required() -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Exports block (t10)
+# ---------------------------------------------------------------------------
+
+
+def test_summary_json_includes_exports_list(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output_dir = tmp_path / "adapter"
+    output_dir.mkdir()
+    (output_dir / "exports.json").write_text(
+        json.dumps(
+            [
+                {
+                    "format": "gguf",
+                    "quant": ["q4_k_m"],
+                    "base": "unsloth/Qwen3-4B",
+                    "adapter": str(output_dir),
+                    "files": {"model.gguf": 100},
+                    "calibration": None,
+                    "versions": {},
+                    "timestamp": "2026-07-06T00:00:00+00:00",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    rc = cmd_summarize(_args(str(output_dir), json_mode=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["exports"][0]["format"] == "gguf"
+
+
+def test_summary_text_mode_prints_one_line_per_export(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output_dir = tmp_path / "adapter"
+    output_dir.mkdir()
+    (output_dir / "exports.json").write_text(
+        json.dumps(
+            [
+                {
+                    "format": "awq",
+                    "quant": ["int4"],
+                    "base": "unsloth/Qwen3-4B",
+                    "adapter": str(output_dir),
+                    "files": {"model.safetensors": 900, "config.json": 100},
+                    "calibration": {"source": "train.jsonl", "count": 64},
+                    "versions": {},
+                    "timestamp": "2026-07-06T00:00:00+00:00",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    rc = cmd_summarize(_args(str(output_dir)))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "awq" in out
+    assert "int4" in out
+    assert "files=2" in out
+    assert "bytes=1000" in out
+
+
+def test_summary_text_mode_no_exports_no_export_lines(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output_dir = tmp_path / "adapter"
+    output_dir.mkdir()
+
+    rc = cmd_summarize(_args(str(output_dir)))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "export" not in out.lower()
+
+
 def test_main_summarize_end_to_end(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """``sloth summarize`` resolves through sloth.cli.main (regression: the verb
     must be both imported AND registered in _build_parser)."""
