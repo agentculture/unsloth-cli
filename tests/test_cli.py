@@ -8,6 +8,7 @@ import pytest
 
 from sloth import __version__
 from sloth.cli import main
+from sloth.cli._output import emit_result
 from sloth.explain import known_paths
 
 
@@ -121,3 +122,18 @@ def test_every_catalog_path_resolves(capsys: pytest.CaptureFixture[str]) -> None
         rc = main(["explain", *path])
         assert rc == 0, f"explain {' '.join(path)} failed"
         capsys.readouterr()
+
+
+# --- output contract ------------------------------------------------------
+
+
+def test_emit_result_json_is_single_line(capsys: pytest.CaptureFixture[str]) -> None:
+    # Agents read stdout line by line: a nested payload must stay on ONE line
+    # (no `indent=` in sloth/cli/_output.py), so the last stdout line of a
+    # container run is a complete JSON document.
+    payload = {"ok": True, "nested": {"a": [1, 2, {"b": "c"}]}, "n": 3}
+    emit_result(payload, json_mode=True)
+    out = capsys.readouterr().out
+    assert out.endswith("\n")
+    assert out.count("\n") == 1
+    assert json.loads(out) == payload
