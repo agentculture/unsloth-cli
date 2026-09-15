@@ -5,7 +5,7 @@
   "schema_version": 5,
   "status": "exported",
   "created": "2026-09-15T16:03:25Z",
-  "updated": "2026-09-15T17:34:20Z",
+  "updated": "2026-09-15T19:46:34Z",
   "targets": [
     {
       "id": "c1",
@@ -809,8 +809,8 @@
       "text": "Live (t10): batched eval at batch 8 and batch 1 on the same adapter and 46-item suite give exact_match 0/46 both, but token-F1 0.038 vs 0.060 \u2014 left-padded batched generation does not reproduce the unpadded outputs exactly; benchmarks must state the batch size used, and a serial-vs-batched equivalence check on a model with non-zero scores is still owed",
       "kind": "follow_up",
       "task_id": "t10",
-      "resolved": false,
-      "resolution": ""
+      "resolved": true,
+      "resolution": "Tracked in issue #28 (with the trained-adapter prerequisite); not fixed in this run."
     }
   ],
   "obligations": []
