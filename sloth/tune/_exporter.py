@@ -327,19 +327,26 @@ def _resolve_calibration(plan: dict[str, Any]) -> _Calibration:
 # ---------------------------------------------------------------------------
 
 
-def _load_adapter(backend: _Backend, plan: dict[str, Any]) -> tuple[Any, Any]:
+def _load_adapter(
+    backend: _Backend, plan: dict[str, Any], *, load_in_4bit: bool = False
+) -> tuple[Any, Any]:
     """Load the trained adapter (base + LoRA deltas) through Unsloth."""
     return backend.fast_model.from_pretrained(
         model_name=plan["adapter"],
-        load_in_4bit=False,
+        load_in_4bit=load_in_4bit,
         dtype=None,
     )
 
 
 def _export_merged(backend: _Backend, plan: dict[str, Any], output: Path) -> None:
-    """Merge the adapter into the base weights and save 16-bit or 4-bit."""
+    """Merge the adapter into the base weights and save 16-bit or 4-bit.
+
+    ``merged_4bit`` requires the base to be *loaded* quantised — Unsloth raises
+    "Model does not appear to be quantized" otherwise (live-measured) — so the
+    4-bit format loads the base with ``load_in_4bit=True`` before merging.
+    """
     save_method = MERGED_FORMATS[plan["format"]]
-    model, tokenizer = _load_adapter(backend, plan)
+    model, tokenizer = _load_adapter(backend, plan, load_in_4bit=(plan["format"] == "merged-4bit"))
     model.save_pretrained_merged(str(output), tokenizer, save_method=save_method)
 
 

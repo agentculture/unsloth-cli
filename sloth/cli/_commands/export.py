@@ -676,7 +676,9 @@ def cmd_export(args: argparse.Namespace) -> int:
                 output=partial,
                 base=base,
                 quant=quant,
-                calib=calib,
+                # The resolved training dataset rides into the container as the
+                # calibration source; the container never re-resolves host paths.
+                calib=calib if calib is not None else dataset_path,
                 calib_samples=calib_samples,
                 keep_intermediate=keep_intermediate,
                 json_mode=json_mode,
@@ -777,7 +779,7 @@ def cmd_export(args: argparse.Namespace) -> int:
         output=partial,
         base=base,
         quant=quant,
-        calib=calib,
+        calib=calib if calib is not None else dataset_path,
         calib_samples=calib_samples,
         keep_intermediate=keep_intermediate,
         json_mode=json_mode,

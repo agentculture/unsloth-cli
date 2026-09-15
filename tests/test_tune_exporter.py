@@ -309,6 +309,9 @@ def test_merged_export_calls_save_pretrained_merged(tmp_path, install_backend, f
     call = events["merged"][0]
     assert call["path"] == plan["output"]
     assert call["save_method"] == save_method
+    # merged_4bit needs a quantised base: only the 4-bit format loads in 4-bit.
+    if events.get("from_pretrained"):
+        assert events["from_pretrained"][0].get("load_in_4bit") is (fmt == "merged-4bit")
     assert isinstance(call["tokenizer"], _FakeTokenizer)
 
     assert result["format"] == fmt
