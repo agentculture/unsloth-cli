@@ -147,8 +147,11 @@ the same pattern `sloth eval`'s `--adapter`/`--model` uses):
   passes here is guaranteed to pass `sloth eval`'s host-side validation too.
   `PATH` may be a single `.jsonl` file or a directory — a directory is
   expanded to its sorted `*.jsonl` children and every one is validated
-  (task schema by default), reporting a per-file record count plus the
-  aggregate total.
+  **always against the task schema** (eval suites are task-schema only, the
+  same rule `sloth eval` enforces), reporting a per-file record count plus
+  the aggregate total. Passing an explicit `--schema` other than `task`
+  together with `--suite` exits `1` with a `hint:` — it would otherwise
+  report a suite as valid against a schema `sloth eval` will not accept.
 
 This module is pure stdlib — no torch/unsloth import, so it stays usable on a
 machine with no GPU stack installed.
@@ -169,7 +172,9 @@ machine with no GPU stack installed.
   them (every `*.jsonl` child is validated). Mutually exclusive with
   `--dataset`.
 - `--schema {chat,task}` — schema to validate against. With `--dataset`:
-  default auto-detect from the first record. With `--suite`: default `task`.
+  default auto-detect from the first record. With `--suite`: always `task`
+  (eval suites are task-schema only); passing `--schema chat` (or any value
+  other than `task`) together with `--suite` exits `1` with a `hint:`.
 - `--json` — emit the result as structured JSON: `{valid, schema, line_count}`
   for `--dataset`, or `{valid, schema, files, total_records}` for `--suite`
   (`files` is a list of `{path, line_count}`, one per resolved file).
@@ -180,7 +185,8 @@ machine with no GPU stack installed.
 - `1` user-input error — missing file, invalid JSON, a record that fails
   schema validation (the validator's own `CliError` propagates verbatim,
   naming the file and line for a `--suite` directory), an empty `--suite`
-  directory, or both/neither of `--dataset`/`--suite` passed.
+  directory, an explicit non-`task` `--schema` passed with `--suite`, or
+  both/neither of `--dataset`/`--suite` passed.
 - `2` environment error — the dataset file exists but cannot be opened
   (e.g. a permission error).
 """
@@ -279,9 +285,16 @@ or a directory — a directory is expanded to its sorted `*.jsonl` children — 
 is repeatable (`--suite a.jsonl --suite dir/`). Every resolved file is validated
 against the task schema **before any container is launched**: a malformed file
 anywhere in a `--suite` directory exits `1` naming the file and line, and costs
-no docker/GPU spend. Each record's prediction is compared to its
-`expected_output` for an exact match, and a summary (`total`, `exact_match`,
-`exact_match_pct`) plus per-record results is emitted.
+no docker/GPU spend. `--batch-size` is validated on the host too — a value
+below `1` exits `1` before the suite is even checked. Each record's prediction
+is compared to its `expected_output` for an exact match and scored with a
+stdlib token-level F1 (`f1`, no external scoring dependency). The result is an
+aggregate summary (`total`, `exact_match`, `exact_match_pct`, `f1`) at the top
+level, plus a per-file `files` list (the same fields, scoped to each resolved
+suite file) and per-record `results`. `eval.json` (the summary plus
+`suite_paths` / `target` / `written_at`) is written into the directory that
+was evaluated: the adapter directory for `--adapter`, or the export directory
+for `--model` — the parent directory when a single `.gguf` file is passed.
 
 ## Two targets: `--adapter` or `--model`
 
@@ -317,16 +330,18 @@ for a plain bf16 merged directory or a GGUF).
 - `--quant NAME` — when `--model` holds several GGUF files, the quant tag to
   score (case-insensitive, e.g. `q4_k_m`); ignored for a single-GGUF or
   non-GGUF `--model` directory, and for `--adapter`.
-- `--batch-size N` — generation batch size for the eval loop (default: `8`).
+- `--batch-size N` — generation batch size for the eval loop (default: `8`);
+  must be `>= 1` (`1` is the explicit unbatched mode) or the run exits `1`
+  before any suite validation or container launch.
 - `--json` — emit the scored summary and per-record results as structured JSON.
 
 ## Exit codes
 
 - `0` success
 - `1` user-input error (both/neither target, missing adapter or model dir,
-  a missing `--suite` path, an empty `--suite` directory, or a malformed
-  record anywhere in the suite — named by file and line, before any
-  container launch)
+  a `--batch-size` below `1`, a missing `--suite` path, an empty `--suite`
+  directory, or a malformed record anywhere in the suite — named by file and
+  line, before any container launch)
 - `2` environment / setup error (ML stack not installed, llama.cpp missing, OOM)
 """
 
