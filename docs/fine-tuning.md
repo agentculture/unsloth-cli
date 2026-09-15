@@ -45,6 +45,18 @@ adapter, runs each **task-schema** item through `generate()`, and reports
 exact-match. Fully local — no network. Returns
 `{total, exact_match, exact_match_pct, results}`.
 
+**Starter suite:** [`examples/eval/`](../examples/eval/) holds the starter eval
+suite — three task-schema JSONL files (`cli-contract.jsonl`,
+`agentculture-terms.jsonl`, `task-format.jsonl`, ~40+ items total) covering the
+CLI output contract, AgentCulture sibling/naming terminology, and short
+instruction-following items (rewrite/extract/classify). Each line is
+`{"task", "input", "expected_output"}` with a short, one-sentence-or-shorter
+`expected_output` so exact-match has a chance. [`examples/eval-suite.jsonl`](../examples/eval-suite.jsonl)
+remains the original 4-item smoke suite for quick sanity checks. To add a new
+domain, drop another `<domain>.jsonl` file into `examples/eval/` with the same
+three-key schema and validate it with
+`sloth validate --dataset examples/eval/<domain>.jsonl --schema task`.
+
 ### `sloth export --adapter DIR --output OUT`
 
 Exports a trained adapter to one of **six formats** (`--format FMT`, default
