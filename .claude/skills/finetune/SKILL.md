@@ -37,7 +37,9 @@ bash .claude/skills/finetune/scripts/finetune.sh run \
     --config <run.toml> \
     --suite <suite.jsonl> \
     [--dry-run] \
-    [--json]
+    [--json] \
+    [--export-format <fmt>] \
+    [--quant <list>]
 ```
 
 The loop runs four steps in order:
@@ -47,7 +49,13 @@ The loop runs four steps in order:
 | 1 — validate + plan | `sloth train --config <c> --dry-run` | no |
 | 2 — train | `sloth train --config <c>` | **yes** |
 | 3 — eval | `sloth eval --adapter <out> --suite <suite>` | yes |
-| 4 — export | `sloth export --adapter <out> --format safetensors` | no |
+| 4 — export | `sloth export --adapter <out> --format <fmt>` | no for `safetensors`; **yes** for `merged-16bit`/`merged-4bit`/`gguf`/`awq`/`nvfp4` |
+
+Export format is `--export-format` (default `safetensors`), forwarded to
+`sloth export --format <fmt>`: `safetensors`, `merged-16bit`, `merged-4bit`,
+`gguf`, `awq`, `nvfp4`. `--quant` (comma-separated ggml quant list, e.g.
+`q4_k_m,q8_0`) is forwarded to `sloth export --quant <list>` and applies to
+`--export-format gguf` only.
 
 **With `--dry-run`**: only step 1 runs (validate the dataset, scope-guard the
 model+method, print the resolved plan). Exits 0 on success. No torch import,
@@ -90,6 +98,8 @@ bash .claude/skills/finetune/scripts/finetune.sh help
 | `--suite <suite.jsonl>` | yes | Path to a task-schema JSONL eval suite (`{"task","input","expected_output"}`). |
 | `--dry-run` | no | Run step 1 only (validate + plan, GPU-free). |
 | `--json` | no | Forward `--json` to every `sloth` call for machine-readable output. |
+| `--export-format <fmt>` | no | Format for step 4: `safetensors` (default), `merged-16bit`, `merged-4bit`, `gguf`, `awq`, `nvfp4`. Forwarded to `sloth export --format <fmt>`. |
+| `--quant <list>` | no | Comma-separated ggml quantizations for `--export-format gguf` (e.g. `q4_k_m,q8_0`). Forwarded to `sloth export --quant <list>`. |
 
 ## Dataset schemas
 
@@ -147,7 +157,11 @@ bash .claude/skills/finetune/scripts/finetune.sh run \
 ```
 
 Runs all four steps, writing the adapter to the `output` dir in the TOML and
-emitting a summary of each step to stderr.
+emitting a summary of each step to stderr. Add `--export-format gguf --quant
+q4_k_m` (or `merged-16bit` / `merged-4bit` / `awq` / `nvfp4`) to export a
+deployable format instead of the default `safetensors` — see
+[deployment targets](../../../docs/fine-tuning.md#deployment-targets) for which
+format each target platform expects.
 
 ## Exit codes
 

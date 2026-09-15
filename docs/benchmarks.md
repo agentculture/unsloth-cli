@@ -81,6 +81,28 @@ standard PEFT/safetensors layout: `adapter_config.json`,
 [lobes](https://github.com/agentculture/lobes-cli) to serve or
 [colleague](https://github.com/agentculture/colleague) to run as a backend.
 
+### `sloth export` — container formats, measured sizes (LFM2.5-1.2B)
+
+> **Status:** validated 2026-09-15, on the same DGX Spark (GB10, Blackwell)
+> environment as above. Adapter: `LFM2.5-1.2B-Base` (`preset:lfm2`
+> `target_modules`, see [`fine-tuning.md`](fine-tuning.md#target_modules)).
+> `gguf` used the prebuilt `llama.cpp` `b10909` (arm64) conversion tool.
+
+| `--format` | Lane | Measured output size |
+|------------|------|-----------------------|
+| `merged-16bit` (bf16) | container | **2.34 GB** |
+| `gguf` (`--quant q4_k_m`) | container | **0.73 GB** |
+| `awq` (W4A16) | container | **1.08 GB** |
+| `nvfp4` | container | **1.12 GB** |
+
+The `merged-16bit` size (2.34 GB) matches the bf16 base-model size, as
+expected — merging LoRA deltas into a bf16 checkpoint does not change its
+dtype footprint. The other three formats compress the merged model roughly
+2–3x relative to bf16, consistent with 4-bit-class weight quantization. These
+are the numbers the [deployment targets](fine-tuning.md#deployment-targets)
+table's `gguf`/`awq`/`nvfp4` rows produce in practice — see that table for
+which platform each target format maps to.
+
 ## Run metadata (written next to the adapter)
 
 `sloth train` writes `training_metadata.json` alongside the adapter, e.g. for the
