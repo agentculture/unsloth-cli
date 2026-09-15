@@ -58,7 +58,9 @@ NGC 25.11's torch 2.10:
 | `hf_transfer` | unpinned | Download accelerator only; no API surface. |
 | `llmcompressor` | `0.11.0` | Quantized export (NVFP4 / AWQ). See the note below. |
 | `compressed-tensors` | `0.16.0` | Must match llmcompressor 0.11.0. Needs a torch-2.11 shim. |
-| `unsloth`, `unsloth_zoo`, `bitsandbytes` | unpinned, `--no-deps` | Must not drag their own torch/transformers in. |
+| `unsloth` | `2026.9.4` | `--no-deps`, must not drag its own torch/transformers in; measured live 2026-09-15. |
+| `unsloth_zoo` | `2026.9.3` | `--no-deps`, paired with the `unsloth` pin above; measured live 2026-09-15. |
+| `bitsandbytes` | `0.50.2` | `--no-deps`, must not drag its own torch/transformers in; measured live 2026-09-15. |
 | `torchao` | **left** at the container's `0.14.0+git` | Not upgraded — 0.17+ needs torch 2.11. |
 
 The reason this exact set matters — a real version-matrix deadlock:
@@ -82,6 +84,50 @@ is cheaper than a broken AWQ path, so **0.11.0 / 0.16.0** are the pins.
 → Hold **peft at 0.18.x** (≥ unsloth's floor, < the torchao-0.16 demand), pair it
 with **transformers 4.57.1** and **trl 0.24.0**, and leave torchao alone. These
 are the values in `sloth/tune/container.py::DEP_LAYER_PACKAGES`.
+
+## Bumping the unsloth / unsloth_zoo / bitsandbytes pins
+
+`sloth/tune/container.py::DEP_LAYER_NODEPS_PACKAGES` pins `unsloth`,
+`unsloth_zoo`, and `bitsandbytes` (installed with `uv pip install --no-deps`, so
+they must not drag their own torch/transformers in). Unlike `DEP_LAYER_PACKAGES`
+these three used to float; they are now pinned like everything else, so a bump is
+a deliberate, re-validated edit rather than something that drifts on its own.
+To bump them:
+
+1. **Read the live versions with `uv pip list` inside the container**, using the
+   exact install line `container.py` composes (`DEP_LAYER_PACKAGES` into the
+   `--system-site-packages` venv, then `DEP_LAYER_NODEPS_PACKAGES` with
+   `--no-deps`) — do not guess a version from PyPI's web page, since the
+   `--no-deps` install can still resolve differently against the container's
+   pre-existing site-packages:
+
+   ```bash
+   docker run --rm nvcr.io/nvidia/pytorch:25.11-py3 bash -lc '
+     set -euo pipefail
+     export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+     command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/0.9.2/install.sh | sh
+     uv venv --system-site-packages "$HOME/.unsloth-cli-venv"
+     . "$HOME/.unsloth-cli-venv/bin/activate"
+     uv pip install transformers==4.57.1 peft==0.18.0 hf_transfer datasets==4.8.5 trl==0.24.0 llmcompressor==0.11.0 compressed-tensors==0.16.0
+     uv pip uninstall torch 2>/dev/null || true
+     uv pip uninstall torchvision 2>/dev/null || true
+     uv pip install --no-deps unsloth unsloth_zoo bitsandbytes
+     uv pip list | grep -iE "unsloth|bitsandbytes"
+   '
+   ```
+
+   (No `--gpus all` is needed for this — it is a plain package install, not a
+   training run. GPU access is only required if the plain `docker run --rm`
+   above fails for some other reason.)
+2. **Edit the tuple** in `sloth/tune/container.py::DEP_LAYER_NODEPS_PACKAGES`
+   to the three `name==version` pins the command printed, and update its
+   adjacent comment with the new measurement date.
+3. **Run one export** (`uv run sloth export ...` against an existing adapter,
+   or at minimum `uv run sloth train --dry-run`) to confirm the new pins don't
+   break the resolved plan before committing.
+4. **Record the row** in [`docs/tested.md`](tested.md) — date, the three new
+   versions, and the command used — so the next bump has a baseline to diff
+   against.
 
 ## Gotchas discovered on hardware
 

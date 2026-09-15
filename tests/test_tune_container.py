@@ -161,8 +161,8 @@ class TestBuildCommand:
         assert "peft==0.18.0" in joined
         assert "datasets==4.8.5" in joined
         assert "trl==0.24.0" in joined
-        # --no-deps layer
-        assert "uv pip install --no-deps unsloth unsloth_zoo bitsandbytes" in joined
+        # --no-deps layer (pinned — see TestNodepsLayerPins below)
+        assert "uv pip install --no-deps " + " ".join(DEP_LAYER_NODEPS_PACKAGES) in joined
         for pkg in DEP_LAYER_NODEPS_PACKAGES:
             assert pkg in joined, f"missing --no-deps package: {pkg}"
 
@@ -1038,3 +1038,49 @@ class TestLaunchResultCapture:
         with pytest.raises(CliError) as exc_info:
             launch(["train"], workdir=tmp_path, checkout=tmp_path, skip_preflight=True)
         assert exc_info.value.code == 1
+
+
+class TestNodepsLayerPins:
+    """DEP_LAYER_NODEPS_PACKAGES pins (t8) — unsloth / unsloth_zoo / bitsandbytes.
+
+    Versions measured 2026-09-15 on NGC 25.11 (torch 2.10) via a plain
+    ``docker run --rm`` of the exact install line ``container.py`` composes
+    (DEP_LAYER_PACKAGES then DEP_LAYER_NODEPS_PACKAGES into a
+    ``uv venv --system-site-packages`` venv), followed by ``uv pip list``.
+    Recorded in docs/tested.md (2026-09-15 row) and docs/dgx-spark.md.
+    """
+
+    def test_exactly_three_pinned_entries(self) -> None:
+        assert len(DEP_LAYER_NODEPS_PACKAGES) == 3
+        for pkg in DEP_LAYER_NODEPS_PACKAGES:
+            assert "==" in pkg, f"expected a pin, got unpinned entry: {pkg}"
+
+    def test_pins_match_the_live_validated_versions(self) -> None:
+        assert "unsloth==2026.9.4" in DEP_LAYER_NODEPS_PACKAGES
+        assert "unsloth_zoo==2026.9.3" in DEP_LAYER_NODEPS_PACKAGES
+        assert "bitsandbytes==0.50.2" in DEP_LAYER_NODEPS_PACKAGES
+
+    def test_pins_reach_the_built_docker_command(self, tmp_path: Path) -> None:
+        joined = _joined(
+            build_command(
+                ["train"],
+                workdir=tmp_path,
+                checkout=tmp_path / "checkout",
+                hf_cache=tmp_path / "none",
+            )
+        )
+        for pkg in DEP_LAYER_NODEPS_PACKAGES:
+            assert pkg in joined, f"pin did not reach the docker command: {pkg}"
+
+    def test_dep_layer_packages_untouched(self) -> None:
+        # t1 owns DEP_LAYER_PACKAGES in this task; it must stay byte-identical to
+        # main's current pinned set (this task only touches DEP_LAYER_NODEPS_PACKAGES).
+        assert DEP_LAYER_PACKAGES == (
+            "transformers==4.57.1",
+            "peft==0.18.0",
+            "hf_transfer",
+            "datasets==4.8.5",
+            "trl==0.24.0",
+            "llmcompressor==0.11.0",
+            "compressed-tensors==0.16.0",
+        )
