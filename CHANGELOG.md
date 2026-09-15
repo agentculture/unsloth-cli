@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-09-15
+
+### Added
+
+- Spec for the nine follow-ups from the LFM2.5 `target_modules` + quantized
+  export delivery (#22): `docs/specs/2026-09-15-lfm2-5-delivery-follow-ups-22.md`,
+  scoped with file-and-line provenance, challenge-passed at rigorous depth, and
+  carrying the decisions on the `/finetune` resolver order, Jetson coverage
+  (Orin Nano deferred to #23), directory eval suites with token-F1, and an
+  on-disk `eval.json`.
+
 ## [0.7.1] - 2026-09-15
 
 ### Changed
