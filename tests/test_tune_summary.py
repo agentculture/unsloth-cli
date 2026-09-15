@@ -314,3 +314,71 @@ def test_build_summary_export_entry_omits_eval_key_when_absent(tmp_path: Path) -
 
     assert len(summary["exports"]) == 1
     assert "eval" not in summary["exports"][0]
+
+
+def test_build_summary_export_index_with_int_output_is_skipped(tmp_path: Path) -> None:
+    """qodo finding: a malformed export index entry whose 'output' is an int
+    (not a str/PathLike) must be skipped rather than reaching Path() and
+    raising TypeError."""
+    output_dir = tmp_path / "adapter"
+    output_dir.mkdir()
+    entry = dict(_record(_RECORD_A, output_dir))
+    entry["output"] = 12345
+    _write_exports_index(output_dir, [entry])
+
+    summary = build_summary(output_dir)
+
+    assert len(summary["exports"]) == 1
+    assert "eval" not in summary["exports"][0]
+
+
+def test_build_summary_export_index_with_list_output_is_skipped(tmp_path: Path) -> None:
+    """Same as above but with a list 'output' value."""
+    output_dir = tmp_path / "adapter"
+    output_dir.mkdir()
+    entry = dict(_record(_RECORD_B, output_dir))
+    entry["output"] = ["not", "a", "path"]
+    _write_exports_index(output_dir, [entry])
+
+    summary = build_summary(output_dir)
+
+    assert len(summary["exports"]) == 1
+    assert "eval" not in summary["exports"][0]
+
+
+def test_read_eval_invalid_utf8_returns_none(tmp_path: Path) -> None:
+    """qodo finding: read_eval must tolerate invalid UTF-8 (UnicodeDecodeError)
+    exactly like it tolerates OSError/JSON errors — never raise."""
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "eval.json").write_bytes(b"\xff\xfe\x00invalid-utf8")
+
+    assert read_eval(adapter) is None
+
+
+def test_build_summary_invalid_utf8_eval_at_run_level_degrades(tmp_path: Path) -> None:
+    """Invalid UTF-8 in the run's own eval.json must not crash build_summary;
+    the eval block just degrades to None."""
+    output_dir = tmp_path / "adapter"
+    output_dir.mkdir()
+    (output_dir / "eval.json").write_bytes(b"\xff\xfe\x00invalid-utf8")
+
+    summary = build_summary(output_dir)
+
+    assert summary["eval"] is None
+
+
+def test_build_summary_invalid_utf8_eval_at_export_level_degrades(tmp_path: Path) -> None:
+    """Invalid UTF-8 in an export's own eval.json must not crash build_summary;
+    that export entry just has no 'eval' key."""
+    output_dir = tmp_path / "adapter"
+    output_dir.mkdir()
+    record_a = _record(_RECORD_A, output_dir)
+    export_dir = output_dir / "gguf-export"
+    _write_export_json(export_dir, record_a)
+    (export_dir / "eval.json").write_bytes(b"\xff\xfe\x00invalid-utf8")
+
+    summary = build_summary(output_dir)
+
+    assert len(summary["exports"]) == 1
+    assert "eval" not in summary["exports"][0]
