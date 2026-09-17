@@ -135,12 +135,21 @@ def _read_json_file(path: Path) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def read_eval(output_dir: str | Path) -> dict[str, dict[str, Any]]:
+def read_eval(output_dir: str | Path, subdir: str = EVAL_JSON_DIR) -> dict[str, dict[str, Any]]:
     """Read every eval result recorded for *output_dir* as ``{suite: payload}``.
+
+    *subdir* names the directory the suite-keyed files are read from, relative
+    to *output_dir* (default :data:`~sloth.tune.metrics.EVAL_JSON_DIR`, i.e.
+    ``eval/``) — the default behaviour is unchanged. ``sloth compare --base``
+    writes the **base** model's results to a sibling directory
+    (``<adapter>/eval-base/``) so they never collide with the adapter's own,
+    and reads them back with ``subdir="eval-base"``. The legacy flat
+    ``eval.json`` is merged in **only** for the default subdir: it belongs to
+    the target itself, never to a sibling result set.
 
     Two sources are merged:
 
-    * ``<output_dir>/eval/<suite>.json`` — the newer, suite-keyed files
+    * ``<output_dir>/<subdir>/<suite>.json`` — the newer, suite-keyed files
       written by :func:`sloth.tune.metrics.write_eval_json`'s three-argument
       call shape. Each file's own ``suite`` field names its key (falling back
       to the file's stem when that field is missing/not a string).
@@ -158,7 +167,7 @@ def read_eval(output_dir: str | Path) -> dict[str, dict[str, Any]]:
     output_path = Path(output_dir)
     suites: dict[str, dict[str, Any]] = {}
 
-    eval_dir = output_path / EVAL_JSON_DIR
+    eval_dir = output_path / subdir
     if eval_dir.is_dir():
         for path in sorted(eval_dir.glob("*.json")):
             payload = _read_json_file(path)
@@ -168,11 +177,26 @@ def read_eval(output_dir: str | Path) -> dict[str, dict[str, Any]]:
             suite_name = suite if isinstance(suite, str) and suite else path.stem
             suites[suite_name] = payload
 
-    legacy_payload = _read_json_file(output_path / EVAL_JSON_NAME)
-    if legacy_payload is not None:
-        suites[_LEGACY_SUITE_NAME] = legacy_payload
+    if subdir == EVAL_JSON_DIR:
+        legacy_payload = _read_json_file(output_path / EVAL_JSON_NAME)
+        if legacy_payload is not None:
+            suites[_LEGACY_SUITE_NAME] = legacy_payload
 
     return suites
+
+
+def build_eval_summary(
+    output_dir: str | Path, subdir: str = EVAL_JSON_DIR
+) -> dict[str, Any] | None:
+    """Return just the ``eval`` block of :func:`build_summary` for *output_dir*.
+
+    Same shape (``{"suites": {...}, "exact_match_pct", "f1"}``) and same
+    silent-``None``-when-absent contract, without reading metadata,
+    checkpoints or exports — what ``sloth compare --base`` needs for a result
+    set that is not a run directory at all (the base model's scores under
+    ``<adapter>/eval-base/``, read with ``subdir="eval-base"``).
+    """
+    return _build_eval_block(read_eval(output_dir, subdir=subdir))
 
 
 def _eval_summary(payload: dict[str, Any]) -> dict[str, Any]:

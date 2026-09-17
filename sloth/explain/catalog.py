@@ -352,7 +352,10 @@ in `--json` mode, and one text block per suite otherwise. One invocation
 writes `eval/<name>.json` for every named suite (batch size and target
 included) into the directory that was evaluated: the adapter directory for
 `--adapter`, or the export directory for `--model` — the parent directory
-when a single `.gguf` file is passed.
+when a single `.gguf` file is passed. `--results-dir DIR` redirects those
+writes: the same records, written flat into `DIR` instead. That is how
+`unsloth-cli compare --base` keeps a base model's scores in
+`<adapter>/eval-base/` without disturbing the adapter's own `eval/`.
 
 ## Two targets: `--adapter` or `--model`
 
@@ -364,6 +367,11 @@ Exactly one is required — passing both, or neither, exits `1` with a `hint:`.
   (bf16/4-bit) checkpoint, an AWQ or NVFP4 compressed-tensors checkpoint (both
   auto-detected by transformers from `config.json`), or a GGUF — which is scored
   with llama.cpp's `llama-completion` from the mounted llama.cpp cache.
+  `--model` also accepts a **Hugging Face repo id** (`org/name`) for a base
+  model that was never exported — the base-eval form `compare --base` drives.
+  A repo id owns no directory, so `--results-dir` is required with it; a
+  path-shaped `--model` that does not exist is still an error, never taken for
+  a hub id.
 
 A `--model` run reports the same score fields plus `model_dir`, `quant_method`
 and `quant_format` (read from `config.json`'s `quantization_config`; both `null`
@@ -403,6 +411,9 @@ for a plain bf16 merged directory or a GGUF).
 - `--train-dataset PATH` — the training dataset to check every `--suite`
   against for train/eval overlap before any container launch. Defaults to the
   dataset recorded in the target's `training_metadata.json` when present.
+- `--results-dir DIR` — write the per-suite result files flat into `DIR`
+  instead of into `<target>/eval/`. Only *where* changes, never *what* is
+  written. Required when `--model` names a Hugging Face repo id.
 - `--json` — emit the scored summary, keyed by suite name, as structured JSON.
 
 ## Exit codes
@@ -412,7 +423,8 @@ for a plain bf16 merged directory or a GGUF).
   a `--batch-size` below `1`, a missing `--suite` path, an empty `--suite`
   directory, a `--suite` name collision, an undetectable/malformed record
   anywhere in a suite — named by file and line, before any container launch —
-  or a train/eval overlap naming every duplicated `file:line`)
+  a train/eval overlap naming every duplicated `file:line`, or a `--model`
+  repo id passed without `--results-dir`)
 - `2` environment / setup error (ML stack not installed, llama.cpp missing, OOM)
 """
 
@@ -588,28 +600,79 @@ working unchanged.
 _COMPARE = """\
 # unsloth-cli compare
 
-Side-by-side comparison of two past runs: the `training_metadata.json`
+Two comparisons, one verb.
+
+**Run vs. run** — `compare <a> <b>`: the `training_metadata.json`
 hyperparameter/config keys that differ between `<a>` and `<b>`, plus each
 run's full `unsloth-cli summarize` summary. Each of `<a>`/`<b>` resolves the
 same way `summarize`'s `<target>` does (a `run_id` or a literal output
-directory).
+directory). When both sides have eval results, an `eval` delta is added: the
+flat `exact_match_pct`/`f1` projection plus a per-suite, per-metric breakdown.
+
+**Adapter vs. its base model** — `compare --base <hf-id-or-dir> <adapter-dir>`:
+scores the base model on **every suite the adapter already has results for**
+(read from `<adapter>/eval/*.json` and re-run over the same suite files), then
+reports per-suite, per-metric deltas and checks them against the
+`[eval.thresholds]` gate. A raw Hugging Face id needs no export first.
+
+The two models run in **two separate, sequential container invocations** — the
+adapter first, then the base — so they are never resident on the GPU at the
+same time. The base run's per-suite results land under
+`<adapter-dir>/eval-base/<suite>.json` (via `eval --results-dir`), leaving the
+adapter's own `eval/` untouched. When the second run fails (an out-of-memory
+container exit is `2`), the first run's results stay on disk.
+
+## The `--base` gate
+
+The comparison exits `1`, naming every failed check in the `hint:`, when:
+
+- a **regression-tagged** suite's `exact_match_pct` drops by more than
+  `regression_drop_pp` percentage points (tagged = a suite named `regression`,
+  or one named by `--regression-suite`);
+- the adapter's `compliance_pct` is below `compliance_min_pct`;
+- the adapter/base median-latency ratio is above `latency_max_ratio`;
+- either side's suite holds fewer rows than `min_suite_rows`;
+- `base_load_in_4bit` differs between the two result sets — the runs used
+  different base precision, so no other number between them is comparable.
+
+A metric a suite does not record is skipped, never read as a failure. The
+thresholds actually applied (and where they came from) are echoed in the
+report under `thresholds`, on the exit-`1` path too: the report goes to stdout
+**before** the error goes to stderr.
 
 ## Usage
 
     unsloth-cli compare <run_id_a> <run_id_b>
     unsloth-cli compare adapters/exp-1 adapters/exp-2 --json
+    unsloth-cli compare --base unsloth/Qwen3-4B adapters/qwen3-4b-qlora
+    unsloth-cli compare --base unsloth/Qwen3-4B adapters/qwen3-4b-qlora \\
+        --config run.toml --regression-suite holdout --json
 
 ## Key flags
 
+- `--base REF` — compare the single positional (an adapter directory) against
+  this base model: a Hugging Face repo id or a local model directory. With
+  `--base`, the second positional must be omitted.
+- `--config PATH` — run config whose `[eval.thresholds]` section gates the
+  `--base` comparison (default: the built-in baseline — 2 pp regression drop,
+  95% compliance, 1.10 latency ratio, 100 rows per suite).
+- `--regression-suite NAME` (repeatable) — also treat this suite as
+  regression-tagged.
 - `--runs-root DIR` — directory containing `runs.jsonl`, used to resolve a
   `run_id` on either side (default: the current directory).
-- `--json` — emit `{a, b, deltas}` as structured JSON.
+- `--json` — emit `{a, b, deltas}` for a run-vs-run compare, or
+  `{a, b, deltas: {suites: {<suite>: {<metric>: {a, b, delta}}}}, thresholds,
+  verdict: {passed, failures}}` for `--base`.
 
 ## Exit codes
 
 - `0` success
-- `1` user-input error — either `<a>` or `<b>` resolves to neither a `run_id`
-  nor an existing directory.
+- `1` user-input error — a target resolves to neither a `run_id` nor an
+  existing directory, `<b>` is missing without `--base`, both `<b>` and
+  `--base` are given, the adapter has no eval results to compare against — or
+  a `--base` threshold check failed.
+- `2` environment error — the container could not run (an out-of-memory eval
+  arrives here, with the memory `hint:`).
 """
 
 
