@@ -27,6 +27,7 @@ nested under a noun.
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -262,6 +263,29 @@ def _adapter_suites(adapter_dir: Path) -> tuple[list[str], int | None]:
             ),
         )
     return files, batch_size
+
+
+def _ensure_writable_results_dir(base_dir: Path) -> None:
+    """Create ``<adapter>/eval-base/`` AS THE HOST USER and require it writable.
+
+    Docker creates a bind-mounted host path that does not exist yet as *root*,
+    and the container runs as the host uid, so its writer would get EACCES on
+    every suite and the base side would come back empty (live-measured
+    2026-09-17, plan risk r15). A leftover root-owned directory from such a run
+    is the same trap, so this runs *before* the adapter re-eval: failing here
+    costs seconds, failing after the base run costs the whole hour.
+    """
+    base_dir.mkdir(parents=True, exist_ok=True)
+    if not os.access(base_dir, os.W_OK):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"base results directory is not writable: {base_dir}",
+            remediation=(
+                "It was probably created as root by an earlier container run. Remove it "
+                f"(`rmdir {base_dir}` works when it is empty) or chown it to your user, "
+                "then re-run."
+            ),
+        )
 
 
 def _launch_eval(
@@ -519,6 +543,7 @@ def _cmd_compare_base(args: argparse.Namespace) -> int:
     thresholds, source = _resolve_thresholds(getattr(args, "config", None))
     suite_files, batch_size = _adapter_suites(adapter_dir)
     base_dir = adapter_dir / BASE_EVAL_DIR
+    _ensure_writable_results_dir(base_dir)
 
     # Sequential, one model at a time: the adapter is re-scored first (its
     # results stay under <adapter>/eval/), then the base (under eval-base/).
@@ -531,11 +556,8 @@ def _cmd_compare_base(args: argparse.Namespace) -> int:
         batch_size=batch_size,
         workdir=adapter_dir.resolve(),
     )
-    # Pre-create the base results dir AS THE HOST USER: docker creates a
-    # bind-mounted host path that does not exist yet as root, and the container
-    # runs as the host uid, so its writer would get EACCES on every suite and
-    # the base side would silently come back empty (live-measured 2026-09-17).
-    base_dir.mkdir(parents=True, exist_ok=True)
+    # Created as the host user (and checked writable) before the adapter run —
+    # see _ensure_writable_results_dir.
     _launch_eval(
         "--model",
         args.base,

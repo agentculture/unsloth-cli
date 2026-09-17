@@ -1005,3 +1005,24 @@ def test_compare_base_precreates_results_dir_and_fails_on_empty_base_side(
     assert "produced no results" in exc_info.value.message
     assert exc_info.value.remediation
     assert seen_existing == [True], "eval-base/ must be created by the host user before launch"
+
+
+def test_compare_base_refuses_an_unwritable_results_dir_before_any_launch(
+    base_fixture: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r15: a leftover root-owned eval-base/ must fail in seconds, before the
+    25-minute adapter re-eval, with a hint naming the directory."""
+    adapter, suite_file = base_fixture
+    adapter_results = {"regression": _suite_payload("regression", suite_file)}
+    fake = _install(monkeypatch, _FakeLaunch(adapter_results, {}))
+    base_dir = adapter / "eval-base"
+    base_dir.mkdir()
+    monkeypatch.setattr(compare_mod.os, "access", lambda path, mode: False)
+    args = _base_args(str(adapter), "unsloth/Qwen3-4B", json_mode=True)
+    with pytest.raises(CliError) as exc_info:
+        cmd_compare(args)
+    assert exc_info.value.code == 1
+    assert "not writable" in exc_info.value.message
+    assert str(base_dir) in exc_info.value.remediation
+    assert fake.calls == []
