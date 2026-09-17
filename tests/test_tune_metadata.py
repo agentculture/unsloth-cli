@@ -132,8 +132,8 @@ class TestWriteMetadata:
         )
         data = json.loads((adapter_dir / "training_metadata.json").read_text(encoding="utf-8"))
         assert data["dataset"]["path"] == str(dataset)
-        # existing keys unchanged, one new key added
-        assert set(data["dataset"]) == {"path", "sha256", "line_count"}
+        # existing keys unchanged, plus the dataset-kind marker
+        assert set(data["dataset"]) == {"path", "sha256", "line_count", "source"}
 
     def test_timestamp_defaults_to_utc_iso(self, tmp_path: Path) -> None:
         dataset = _make_dataset(tmp_path, ['{"x": 1}'])
@@ -264,6 +264,7 @@ class TestWriteMetadataHfDataset:
             "hf_id": "my-org/my-dataset",
             "split": "train",
             "revision": "abc123",
+            "source": "hf",
         }
         assert "sha256" not in data["dataset"]
         assert "line_count" not in data["dataset"]
@@ -316,6 +317,7 @@ class TestWriteMetadataHfDataset:
             "hf_id": "my-org/my-dataset",
             "split": "train",
             "revision": "v2",
+            "source": "hf",
         }
 
 
@@ -394,3 +396,99 @@ class TestWriteMetadataLossHistory:
         }
         data = self._write(tmp_path, holdout=holdout)
         assert data["holdout"] == holdout
+
+
+# ---------------------------------------------------------------------------
+# dataset.source + resolved.load_in_4bit (qodo PR #29 findings 2 and 4)
+# ---------------------------------------------------------------------------
+
+
+class TestDatasetSourceField:
+    """Every dataset record says *what kind* of dataset it was.
+
+    A hub dataset carries no ``dataset.path``, so a consumer that keys off the
+    path alone (the eval-side train/eval overlap check) silently skipped hub
+    runs. ``dataset.source`` states it outright.
+    """
+
+    def test_local_dataset_records_source_file(self, tmp_path: Path) -> None:
+        dataset = _make_dataset(tmp_path, ['{"a": 1}'])
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        write_metadata(
+            adapter_dir,
+            model="m",
+            method="lora",
+            dataset_path=dataset,
+            hyperparameters={},
+            timestamp=FIXED_TS,
+        )
+        data = json.loads((adapter_dir / "training_metadata.json").read_text(encoding="utf-8"))
+        assert data["dataset"]["source"] == "file"
+        assert data["dataset"]["path"] == str(dataset)
+
+    def test_hf_dataset_records_source_hf(self, tmp_path: Path) -> None:
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        write_metadata(
+            adapter_dir,
+            model="m",
+            method="qlora",
+            dataset_path="hf:my-org/my-dataset:train",
+            hyperparameters={},
+            timestamp=FIXED_TS,
+        )
+        data = json.loads((adapter_dir / "training_metadata.json").read_text(encoding="utf-8"))
+        assert data["dataset"]["source"] == "hf"
+        assert "path" not in data["dataset"]
+
+
+class TestResolvedLoadIn4bit:
+    """``resolved.load_in_4bit`` is the *effective* precision the run trained at.
+
+    ``hyperparameters.load_in_4bit`` is the raw config value; training forces
+    4-bit for a ``qlora`` method regardless, so a downstream bench reading the
+    raw value alone would benchmark a QLoRA adapter at the wrong precision.
+    """
+
+    def test_qlora_run_resolves_to_true_even_when_the_flag_is_off(self, tmp_path: Path) -> None:
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        write_metadata(
+            adapter_dir,
+            model="m",
+            method="qlora",
+            dataset_path="hf:my-org/my-dataset",
+            hyperparameters={"load_in_4bit": False},
+            timestamp=FIXED_TS,
+        )
+        data = json.loads((adapter_dir / "training_metadata.json").read_text(encoding="utf-8"))
+        assert data["resolved"]["load_in_4bit"] is True
+
+    def test_lora_run_resolves_to_the_configured_flag(self, tmp_path: Path) -> None:
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        write_metadata(
+            adapter_dir,
+            model="m",
+            method="lora",
+            dataset_path="hf:my-org/my-dataset",
+            hyperparameters={"load_in_4bit": False},
+            timestamp=FIXED_TS,
+        )
+        data = json.loads((adapter_dir / "training_metadata.json").read_text(encoding="utf-8"))
+        assert data["resolved"]["load_in_4bit"] is False
+
+    def test_lora_run_with_the_flag_on_resolves_to_true(self, tmp_path: Path) -> None:
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        write_metadata(
+            adapter_dir,
+            model="m",
+            method="lora",
+            dataset_path="hf:my-org/my-dataset",
+            hyperparameters={"load_in_4bit": True},
+            timestamp=FIXED_TS,
+        )
+        data = json.loads((adapter_dir / "training_metadata.json").read_text(encoding="utf-8"))
+        assert data["resolved"]["load_in_4bit"] is True

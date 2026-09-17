@@ -60,7 +60,9 @@ values are the source column name in the hub dataset::
 Accepted keys: ``messages`` (chat schema), and ``task`` / ``input`` /
 ``expected_output`` (task schema). ``dataset_map`` is optional for a local
 JSONL ``dataset`` (ignored there) but required to resolve an ``hf:`` dataset's
-column names to a known schema.
+column names to a known schema. The table must describe **one** schema
+*completely* — ``messages`` alone, or all three task keys; a partial task map
+or a mix of the two raises ``CliError(code=1)`` at load time.
 """
 
 from __future__ import annotations
@@ -429,6 +431,61 @@ _DATASET_MAP_REMEDIATION = (
 )
 
 
+#: The complete key set each schema requires in ``[run.dataset_map]``. A map is
+#: only usable when it carries *all* of one set and none of the other: the
+#: renderer indexes every task key, so a partial task map (e.g. ``task`` alone)
+#: inferred the task schema and then crashed mid-run on the first row.
+_DATASET_MAP_CHAT_KEYS: frozenset[str] = frozenset({"messages"})
+_DATASET_MAP_TASK_KEYS: frozenset[str] = frozenset({"task", "input", "expected_output"})
+
+
+def validate_dataset_map(
+    dataset_map: "dict[str, str] | None",
+    *,
+    remediation: str = _DATASET_MAP_REMEDIATION,
+) -> str:
+    """Return the schema (``"chat"``/``"task"``) *dataset_map* completely describes.
+
+    A usable map names **either** ``messages`` (chat) **or** all three of
+    ``task``/``input``/``expected_output`` (task). Anything else — an empty map,
+    a partial task map, or one mixing the two schemas — raises
+    ``CliError(code=1)`` naming the offending keys, because the renderer indexes
+    every key of the schema it picked.
+    """
+    keys = set(dataset_map or {})
+    if not keys:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message="cannot infer a schema from [run.dataset_map] (or it is missing)",
+            remediation=remediation,
+        )
+
+    chat_keys = keys & _DATASET_MAP_CHAT_KEYS
+    task_keys = keys & _DATASET_MAP_TASK_KEYS
+    if chat_keys and task_keys:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=(
+                "[run.dataset_map] mixes the chat and task schemas: "
+                f"{sorted(chat_keys)} + {sorted(task_keys)}"
+            ),
+            remediation=remediation,
+        )
+    if chat_keys:
+        return "chat"
+
+    missing = sorted(_DATASET_MAP_TASK_KEYS - keys)
+    if missing:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=(
+                "[run.dataset_map] is an incomplete task-schema mapping — " f"missing {missing}"
+            ),
+            remediation=remediation,
+        )
+    return "task"
+
+
 def _require_dataset_map(run_section: dict) -> "dict[str, str] | None":
     """Return ``run_section["dataset_map"]`` validated, or ``None`` if absent.
 
@@ -460,7 +517,10 @@ def _require_dataset_map(run_section: dict) -> "dict[str, str] | None":
                 ),
                 remediation=_DATASET_MAP_REMEDIATION,
             )
-    return dict(value)
+    mapping = dict(value)
+    # Reject a partial/mixed map at load time, before any hub fetch or GPU spend.
+    validate_dataset_map(mapping)
+    return mapping
 
 
 # ---------------------------------------------------------------------------
