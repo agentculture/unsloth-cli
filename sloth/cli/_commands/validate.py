@@ -35,11 +35,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
-from sloth.cli._errors import EXIT_USER_ERROR, CliError
+from sloth.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 from sloth.cli._output import emit_diagnostic, emit_result
+from sloth.tune._trainer import infer_hf_dataset_schema, is_hf_dataset_spec, load_external_records
 from sloth.tune.datasets import detect_schema, validate_dataset, validate_suite
 
 #: Schema assumed when the dataset's first record cannot be classified.
@@ -47,6 +49,9 @@ DEFAULT_SCHEMA = "chat"
 
 #: Schema a --suite is validated against (eval suites are always task-schema).
 SUITE_SCHEMA = "task"
+
+#: Rows sampled from an ``hf:`` dataset for a cache-only ``--dataset`` validation.
+HF_VALIDATE_SAMPLE_ROWS = 50
 
 
 # ---------------------------------------------------------------------------
@@ -148,12 +153,105 @@ def _detect_dataset_schema(dataset_path: Path) -> str:
     return schema
 
 
+def _parse_dataset_map_arg(pairs: list[str] | None) -> "dict[str, str] | None":
+    """Parse repeated ``--dataset-map FIELD=COLUMN`` args into a dict, or ``None``."""
+    if not pairs:
+        return None
+    mapping: dict[str, str] = {}
+    for pair in pairs:
+        key, sep, value = pair.partition("=")
+        if not sep or not key or not value:
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=f"invalid --dataset-map entry: {pair!r}",
+                remediation=(
+                    "Use --dataset-map <field>=<column>, e.g. "
+                    "--dataset-map messages=conversations."
+                ),
+            )
+        mapping[key] = value
+    return mapping
+
+
+def _cmd_validate_hf_dataset(args: argparse.Namespace) -> None:
+    """Handler for ``sloth validate --dataset hf:<org>/<name>[:split]``.
+
+    Validates the first :data:`HF_VALIDATE_SAMPLE_ROWS` rows *without launching
+    a container* when the dataset is already present in the local Hugging Face
+    cache — forcing an offline-only load via ``HF_HUB_OFFLINE``. When the
+    ``datasets`` library is absent, or the dataset is not cached (the offline
+    load raises), this exits ``2`` with a hint naming a container run.
+    """
+    json_mode = bool(getattr(args, "json", False))
+    spec = args.dataset
+    dataset_map = _parse_dataset_map_arg(getattr(args, "dataset_map", None))
+
+    previous_offline = os.environ.get("HF_HUB_OFFLINE")
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    try:
+        records = load_external_records(spec, dataset_map, limit=HF_VALIDATE_SAMPLE_ROWS)
+    except CliError:
+        raise
+    except ImportError as exc:
+        raise CliError(
+            code=EXIT_ENV_ERROR,
+            message=f"the 'datasets' library is not installed: {exc}",
+            remediation=(
+                "Install the tuning stack (uv tool install unsloth-cli), or run "
+                "`sloth train --config <run.toml>` — it loads `datasets` inside "
+                "the NGC container automatically."
+            ),
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 — any load failure means "not cached offline"
+        raise CliError(
+            code=EXIT_ENV_ERROR,
+            message=(
+                f"dataset {spec!r} could not be validated offline "
+                f"(not cached locally, or unreachable): {exc}"
+            ),
+            remediation=(
+                "Run `sloth train --config <run.toml>` — the container mounts the "
+                "shared Hugging Face cache and can download the dataset there — "
+                "then re-run `sloth validate` to check it offline."
+            ),
+        ) from exc
+    finally:
+        if previous_offline is None:
+            os.environ.pop("HF_HUB_OFFLINE", None)
+        else:
+            os.environ["HF_HUB_OFFLINE"] = previous_offline
+
+    schema = infer_hf_dataset_schema(dataset_map)
+    report: dict[str, Any] = {
+        "valid": True,
+        "schema": schema,
+        "line_count": len(records),
+        "source": spec,
+    }
+
+    if json_mode:
+        emit_result(report, json_mode=True)
+    else:
+        lines = [
+            f"dataset: {spec}",
+            f"schema:  {schema}",
+            f"records: {len(records)} (sampled, cache-only)",
+            "status:  valid",
+        ]
+        emit_result("\n".join(lines), json_mode=False)
+
+
 def _cmd_validate_dataset(args: argparse.Namespace) -> None:
     """Handler for ``sloth validate --dataset`` — delegates to :func:`validate_dataset`.
 
     Uses the *same* :func:`~sloth.tune.datasets.validate_dataset` function that
-    ``sloth train`` calls internally, so the accepted rules never drift.
+    ``sloth train`` calls internally, so the accepted rules never drift. An
+    ``hf:<org>/<name>[:split]`` dataset is handled separately — see
+    :func:`_cmd_validate_hf_dataset`.
     """
+    if is_hf_dataset_spec(args.dataset):
+        return _cmd_validate_hf_dataset(args)
+
     json_mode = bool(getattr(args, "json", False))
     dataset_path = Path(args.dataset)
     schema = args.schema
@@ -260,6 +358,19 @@ def register(sub: argparse._SubParsersAction) -> None:
             "Schema to validate against. With --dataset: default auto-detect "
             "from the first record. With --suite: always 'task' (eval suites "
             "are task-schema only); passing anything else with --suite exits 1."
+        ),
+    )
+    p.add_argument(
+        "--dataset-map",
+        action="append",
+        default=None,
+        metavar="FIELD=COLUMN",
+        help=(
+            "Column mapping for a --dataset hf:<org>/<name>[:split] value "
+            "(repeatable), e.g. --dataset-map messages=conversations for the "
+            "chat schema, or --dataset-map task=instruction --dataset-map "
+            "input=context --dataset-map expected_output=response for the "
+            "task schema. Ignored for a local JSONL --dataset."
         ),
     )
     p.add_argument("--json", action="store_true", help="Emit structured JSON.")

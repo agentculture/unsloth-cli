@@ -47,11 +47,12 @@ _VALID_TASK = '{"task": "reverse", "input": "abc", "expected_output": "cba"}\n'
 
 
 def _make_args(
-    dataset: Path | None = None,
+    dataset: Path | str | None = None,
     *,
     suite: Path | str | None = None,
     schema: str | None = None,
     json_mode: bool = False,
+    dataset_map: list[str] | None = None,
 ) -> argparse.Namespace:
     """Build the Namespace argparse would produce for ``sloth validate``."""
     return argparse.Namespace(
@@ -59,6 +60,7 @@ def _make_args(
         suite=str(suite) if suite is not None else None,
         schema=schema,
         json=json_mode,
+        dataset_map=dataset_map,
     )
 
 
@@ -568,3 +570,130 @@ def test_register_suite_flag(tmp_path: Path) -> None:
 
     args2 = parser.parse_args(["validate", "--suite", suite_path, "--json"])
     assert args2.json is True
+
+
+# ---------------------------------------------------------------------------
+# External (hf:) dataset support — t11 / c34
+# ---------------------------------------------------------------------------
+
+
+def _fake_datasets_module(rows: list[dict]):
+    return type("FakeDatasetsModule", (), {"load_dataset": staticmethod(lambda *a, **k: rows)})
+
+
+class TestValidateHfDataset:
+    def test_valid_cached_hf_dataset_reports_ok(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rows = [{"conversations": [{"role": "user", "content": "hi"}]}]
+        monkeypatch.setitem(__import__("sys").modules, "datasets", _fake_datasets_module(rows))
+
+        args = _make_args(
+            "hf:my-org/my-dataset:train",
+            dataset_map=["messages=conversations"],
+            json_mode=True,
+        )
+        rc = cmd_validate(args)
+        assert rc in (None, 0)
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["valid"] is True
+        assert payload["schema"] == "chat"
+        assert payload["line_count"] == 1
+        assert payload["source"] == "hf:my-org/my-dataset:train"
+
+    def test_valid_cached_hf_dataset_text_mode(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rows = [{"instruction": "x", "context": "y", "response": "z"}]
+        monkeypatch.setitem(__import__("sys").modules, "datasets", _fake_datasets_module(rows))
+
+        args = _make_args(
+            "hf:my-org/my-dataset",
+            dataset_map=[
+                "task=instruction",
+                "input=context",
+                "expected_output=response",
+            ],
+        )
+        rc = cmd_validate(args)
+        assert rc in (None, 0)
+        out = capsys.readouterr().out
+        assert "valid" in out.lower()
+
+    def test_not_cached_exits_2_with_container_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def _boom(*_a: object, **_k: object) -> None:
+            raise RuntimeError("offline mode is enabled, but dataset was not found in cache")
+
+        fake_module = type("FakeDatasetsModule", (), {"load_dataset": staticmethod(_boom)})
+        monkeypatch.setitem(__import__("sys").modules, "datasets", fake_module)
+
+        args = _make_args("hf:my-org/my-dataset:train", dataset_map=["messages=conversations"])
+        with pytest.raises(CliError) as exc_info:
+            cmd_validate(args)
+        assert exc_info.value.code == 2
+        assert exc_info.value.remediation
+        assert "sloth train" in exc_info.value.remediation
+
+    def test_missing_datasets_library_exits_2(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setitem(__import__("sys").modules, "datasets", None)  # None -> ImportError
+
+        args = _make_args("hf:my-org/my-dataset:train", dataset_map=["messages=conversations"])
+        with pytest.raises(CliError) as exc_info:
+            cmd_validate(args)
+        assert exc_info.value.code == 2
+
+    def test_missing_dataset_map_raises_cli_error_code_1(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rows = [{"conversations": []}]
+        monkeypatch.setitem(__import__("sys").modules, "datasets", _fake_datasets_module(rows))
+
+        args = _make_args("hf:my-org/my-dataset:train", dataset_map=None)
+        with pytest.raises(CliError) as exc_info:
+            cmd_validate(args)
+        assert exc_info.value.code == 1
+
+    def test_invalid_dataset_map_entry_raises_cli_error(self) -> None:
+        args = _make_args("hf:my-org/my-dataset:train", dataset_map=["no-equals-sign"])
+        with pytest.raises(CliError) as exc_info:
+            cmd_validate(args)
+        assert exc_info.value.code == 1
+
+    def test_sets_and_restores_hf_hub_offline_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The offline probe must not leak HF_HUB_OFFLINE into the environment."""
+        seen: dict[str, str | None] = {}
+
+        def _fake_load_dataset(*_a: object, **_k: object) -> list[dict]:
+            import os
+
+            seen["value"] = os.environ.get("HF_HUB_OFFLINE")
+            return [{"conversations": [{"role": "user", "content": "hi"}]}]
+
+        fake_module = type(
+            "FakeDatasetsModule", (), {"load_dataset": staticmethod(_fake_load_dataset)}
+        )
+        monkeypatch.setitem(__import__("sys").modules, "datasets", fake_module)
+        monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+
+        args = _make_args("hf:my-org/my-dataset:train", dataset_map=["messages=conversations"])
+        cmd_validate(args)
+
+        assert seen["value"] == "1"
+        import os
+
+        assert "HF_HUB_OFFLINE" not in os.environ
+
+    def test_register_wires_dataset_map_flag(self) -> None:
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="command")
+        register(sub)
+        args = parser.parse_args(
+            [
+                "validate",
+                "--dataset",
+                "hf:org/name",
+                "--dataset-map",
+                "messages=conversations",
+            ]
+        )
+        assert args.dataset_map == ["messages=conversations"]

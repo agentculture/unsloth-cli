@@ -34,6 +34,7 @@ GPU.
 from __future__ import annotations
 
 import json
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -178,6 +179,149 @@ def _load_backend() -> _Backend:
 
 
 # ---------------------------------------------------------------------------
+# External (hf:) dataset loading (t11 / c34) — the `datasets` import here is
+# lazy, same seam discipline as `_load_backend`; sloth/tune/datasets.py stays
+# stdlib-only and untouched, since rendered rows are validated by writing them
+# to a temp JSONL and re-using its `validate_dataset`.
+# ---------------------------------------------------------------------------
+
+#: Prefix marking a ``RunConfig.dataset`` value as a Hugging Face Hub dataset id
+#: rather than a local JSONL path, e.g. ``"hf:my-org/my-dataset:train"``.
+HF_DATASET_PREFIX = "hf:"
+
+#: Split used when a ``hf:<org>/<name>`` spec omits an explicit ``:<split>``.
+DEFAULT_HF_SPLIT = "train"
+
+
+def is_hf_dataset_spec(dataset: str) -> bool:
+    """True when *dataset* names a Hugging Face Hub dataset (``"hf:..."``)."""
+    return isinstance(dataset, str) and dataset.startswith(HF_DATASET_PREFIX)
+
+
+def parse_hf_dataset_spec(spec: str) -> tuple[str, str]:
+    """Return ``(dataset_id, split)`` parsed from ``"hf:<org>/<name>[:split]"``.
+
+    ``split`` defaults to :data:`DEFAULT_HF_SPLIT` when omitted. Raises
+    ``CliError(code=1)`` if *spec* has no dataset id after the prefix.
+    """
+    body = spec[len(HF_DATASET_PREFIX) :]
+    dataset_id, _, split = body.partition(":")
+    if not dataset_id:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"invalid hf dataset spec: {spec!r}",
+            remediation=(
+                'Use the form "hf:<org>/<name>" or "hf:<org>/<name>:<split>", '
+                'e.g. "hf:my-org/my-dataset:train".'
+            ),
+        )
+    return dataset_id, split or DEFAULT_HF_SPLIT
+
+
+_DATASET_MAP_REQUIRED_HINT = (
+    "hf: datasets need a [run.dataset_map] table naming the hub columns: "
+    '`messages = "<col>"` for the chat schema, or `task`/`input`/'
+    '`expected_output` = "<col>" for the task schema.'
+)
+
+
+def infer_hf_dataset_schema(dataset_map: "dict[str, str] | None") -> str:
+    """Return ``"chat"`` or ``"task"`` inferred from *dataset_map*'s keys.
+
+    Raises ``CliError(code=1)`` when *dataset_map* is absent/empty or names
+    neither a chat nor a task field — an ``hf:`` dataset cannot be rendered
+    without knowing which schema its columns map onto.
+    """
+    keys = set(dataset_map or {})
+    if "messages" in keys:
+        return "chat"
+    if keys & {"task", "input", "expected_output"}:
+        return "task"
+    raise CliError(
+        code=EXIT_USER_ERROR,
+        message="cannot infer a schema from [run.dataset_map] (or it is missing)",
+        remediation=_DATASET_MAP_REQUIRED_HINT,
+    )
+
+
+def _render_hf_row(row: dict, dataset_map: "dict[str, str]", schema: str) -> dict:
+    """Render one hub *row* into a chat/task-schema dict via *dataset_map*."""
+    if schema == "chat":
+        column = dataset_map.get("messages", "messages")
+        return {"messages": row[column]}
+    return {
+        "task": row[dataset_map.get("task", "task")],
+        "input": row[dataset_map.get("input", "input")],
+        "expected_output": row[dataset_map.get("expected_output", "expected_output")],
+    }
+
+
+def load_external_records(
+    spec: str,
+    dataset_map: "dict[str, str] | None",
+    limit: int | None = None,
+) -> list[dict]:
+    """Load, render, and validate rows from an ``hf:`` dataset spec.
+
+    Parameters
+    ----------
+    spec:
+        A ``"hf:<org>/<name>[:split]"`` string (see :func:`parse_hf_dataset_spec`).
+    dataset_map:
+        The ``[run.dataset_map]`` column mapping (see
+        :func:`infer_hf_dataset_schema`); required to resolve a schema.
+    limit:
+        When given, only the first *limit* rows of the split are loaded
+        (``datasets.load_dataset``'s slicing syntax, e.g. ``"train[:50]"``) —
+        used by ``sloth validate`` to check a sample without pulling the whole
+        dataset.
+
+    Returns
+    -------
+    list[dict]
+        The rendered rows, validated by :func:`sloth.tune.datasets.validate_dataset`
+        against the inferred schema (rendered to a temp JSONL file so
+        ``datasets.py`` itself never needs to know about hub datasets).
+
+    Raises
+    ------
+    CliError(code=1)
+        Invalid *spec*, or a schema that cannot be inferred from *dataset_map*.
+    ImportError
+        The ``datasets`` library is not installed (the caller decides how to
+        report this — ``sloth train`` runs inside the container where it is
+        always present; ``sloth validate`` reports it as an environment error).
+    """
+    dataset_id, split = parse_hf_dataset_spec(spec)
+    schema = infer_hf_dataset_schema(dataset_map)
+    resolved_map: dict[str, str] = dict(dataset_map or {})
+
+    # Lazy-imported so importing this module (or calling it without the
+    # `datasets` library present) never requires the ML stack at import time.
+    from datasets import load_dataset  # noqa: PLC0415 — intentional lazy import
+
+    load_split = f"{split}[:{limit}]" if limit is not None else split
+    # No revision pin: `hf:<org>/<name>[:split]` intentionally has no revision
+    # segment (see parse_hf_dataset_spec) — the run-config surface for pinning
+    # one is future work; `training_metadata.json` records whatever revision
+    # the caller supplies (default "main") for reproducibility after the fact.
+    hub_dataset = load_dataset(dataset_id, split=load_split)  # nosec B615
+
+    rendered = [_render_hf_row(dict(row), resolved_map, schema) for row in hub_dataset]
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".jsonl", delete=False, encoding="utf-8"
+    ) as tmp:
+        for record in rendered:
+            tmp.write(json.dumps(record) + "\n")
+        tmp_path = Path(tmp.name)
+    try:
+        return validate_dataset(tmp_path, schema=schema)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # Dataset loading for the real path (pure — no torch)
 # ---------------------------------------------------------------------------
 
@@ -255,10 +399,16 @@ def _run_real(config: RunConfig, plan: dict[str, Any], backend: _Backend) -> dic
 
     # Validate + load the dataset BEFORE the expensive model load, so a schema or
     # empty-dataset failure surfaces a CliError without spending any GPU/model-load
-    # time ("validate before spending GPU").
-    dataset_path = Path(config.dataset)
-    schema = _detect_dataset_schema(dataset_path)
-    train_records = validate_dataset(dataset_path, schema=schema)
+    # time ("validate before spending GPU"). An `hf:` dataset is loaded via the
+    # mounted HF cache and rendered through [run.dataset_map] instead of being
+    # read as a local JSONL path.
+    if is_hf_dataset_spec(config.dataset):
+        schema = infer_hf_dataset_schema(config.dataset_map)
+        train_records = load_external_records(config.dataset, config.dataset_map)
+    else:
+        dataset_path = Path(config.dataset)
+        schema = _detect_dataset_schema(dataset_path)
+        train_records = validate_dataset(dataset_path, schema=schema)
 
     # Lazy-imported here (not at module top) so the module stays importable without
     # ``datasets`` installed and tests can inject a fake via sys.modules.
@@ -328,7 +478,7 @@ def _run_real(config: RunConfig, plan: dict[str, Any], backend: _Backend) -> dic
         output_dir,
         model=config.model,
         method=config.method,
-        dataset_path=Path(config.dataset),
+        dataset_path=config.dataset,
         hyperparameters=plan["hyperparameters"],
     )
 

@@ -32,6 +32,35 @@ Required keys: ``model``, ``dataset``, ``output`` (all under ``[run]``).
 ``method`` is optional — defaults to ``"qlora"``.
 All ``[hyperparameters]`` fields are optional and fall back to the defaults
 documented below.
+
+External datasets (``[run.dataset_map]``)
+------------------------------------------
+``dataset`` may also name a Hugging Face Hub dataset instead of a local JSONL
+file, using the form ``"hf:<org>/<name>"`` or ``"hf:<org>/<name>:<split>"``
+(``split`` defaults to ``"train"``). The actual ``datasets.load_dataset`` call
+happens lazily, inside the NGC container (see ``sloth.tune._trainer``) — this
+module only parses and stores the mapping; it never imports ``datasets``.
+
+An optional ``[run.dataset_map]`` table documents how the hub dataset's
+columns map onto the chat or task schema. Keys are the target schema field,
+values are the source column name in the hub dataset::
+
+    [run]
+    dataset = "hf:my-org/my-chat-dataset:train"
+
+    [run.dataset_map]
+    messages = "conversations"      # chat schema
+
+    # -- or, for the task schema --
+    # [run.dataset_map]
+    # task            = "instruction"
+    # input           = "context"
+    # expected_output = "response"
+
+Accepted keys: ``messages`` (chat schema), and ``task`` / ``input`` /
+``expected_output`` (task schema). ``dataset_map`` is optional for a local
+JSONL ``dataset`` (ignored there) but required to resolve an ``hf:`` dataset's
+column names to a known schema.
 """
 
 from __future__ import annotations
@@ -157,6 +186,12 @@ class RunConfig:
     # sloth.tune.presets.resolve_target_modules(), not here.
     target_modules: list[str] | str | None = None
 
+    # Column mapping for an external ``hf:<org>/<name>[:split]`` dataset — see
+    # the "External datasets" section of this module's docstring. ``None`` when
+    # the config has no ``[run.dataset_map]`` table (the common case for a
+    # local JSONL ``dataset``).
+    dataset_map: "dict[str, str] | None" = None
+
     # [eval] / [eval.thresholds] — both None when the config omits [eval]
     # entirely, so a pre-existing config's compute_config_hash() is untouched
     # (the hash formula drops None-valued top-level fields; see
@@ -205,6 +240,11 @@ _EVAL_KNOWN_KEYS: frozenset[str] = frozenset(
 )
 _THRESHOLDS_KNOWN_KEYS: frozenset[str] = frozenset(
     {"regression_drop_pp", "compliance_min_pct", "latency_max_ratio", "min_suite_rows"}
+)
+
+#: Accepted keys in ``[run.dataset_map]`` — one chat-schema key, three task-schema keys.
+_DATASET_MAP_KNOWN_KEYS: frozenset[str] = frozenset(
+    {"messages", "task", "input", "expected_output"}
 )
 
 
@@ -377,6 +417,53 @@ def _require_target_modules(hp: dict) -> list[str] | str | None:
 
 
 # ---------------------------------------------------------------------------
+# [run.dataset_map] parsing
+# ---------------------------------------------------------------------------
+
+_DATASET_MAP_REMEDIATION = (
+    "Set [run.dataset_map] keys to column names in the hub dataset, e.g. "
+    '`messages = "conversations"` for the chat schema, or '
+    '`task = "instruction"` / `input = "context"` / '
+    '`expected_output = "response"` for the task schema. '
+    f"Accepted keys: {sorted(_DATASET_MAP_KNOWN_KEYS)}."
+)
+
+
+def _require_dataset_map(run_section: dict) -> "dict[str, str] | None":
+    """Return ``run_section["dataset_map"]`` validated, or ``None`` if absent.
+
+    ``[run.dataset_map]`` documents how an ``hf:<org>/<name>[:split]`` dataset's
+    hub columns map onto the chat/task schema fields. Absent -> ``None`` (the
+    common case for a local JSONL ``dataset``). Present but not a table, an
+    unknown key, or a non-string value all raise ``CliError(code=1)``.
+    """
+    if "dataset_map" not in run_section:
+        return None
+
+    value = run_section["dataset_map"]
+    if not isinstance(value, dict):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=(
+                f"'dataset_map' must be a table ([run.dataset_map]), got " f"{type(value).__name__}"
+            ),
+            remediation=_DATASET_MAP_REMEDIATION,
+        )
+    _reject_unknown_keys(value, _DATASET_MAP_KNOWN_KEYS, "run.dataset_map")
+    for key, column in value.items():
+        if not isinstance(column, str) or not column:
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=(
+                    f"[run.dataset_map] key '{key}' must map to a non-empty string "
+                    f"column name, got {column!r}"
+                ),
+                remediation=_DATASET_MAP_REMEDIATION,
+            )
+    return dict(value)
+
+
+# ---------------------------------------------------------------------------
 # [eval] / [eval.thresholds] parsing
 # ---------------------------------------------------------------------------
 
@@ -545,6 +632,7 @@ def load_config(path: str | Path) -> RunConfig:
         seed=_require_int(hp, "seed", DEFAULT_SEED, minimum=0),
         load_in_4bit=_require_bool(hp, "load_in_4bit", DEFAULT_LOAD_IN_4BIT),
         target_modules=_require_target_modules(hp),
+        dataset_map=_require_dataset_map(run_section),
         eval=eval_config,
         thresholds=thresholds_config,
     )

@@ -239,3 +239,81 @@ class TestDatasetDigestLineCount:
         path.write_text('{"a": 1}\n\n{"b": 2}\n   \n', encoding="utf-8")
         _, count = dataset_digest(path)
         assert count == 2
+
+
+# ---------------------------------------------------------------------------
+# write_metadata for an external (hf:) dataset — t11 / c34
+# ---------------------------------------------------------------------------
+
+
+class TestWriteMetadataHfDataset:
+    def test_records_hf_id_split_and_revision_instead_of_sha256(self, tmp_path: Path) -> None:
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        write_metadata(
+            adapter_dir,
+            model="unsloth/Qwen3-4B",
+            method="qlora",
+            dataset_path="hf:my-org/my-dataset:train",
+            hyperparameters=HYPERPARAMS,
+            timestamp=FIXED_TS,
+            hf_revision="abc123",
+        )
+        data = json.loads((adapter_dir / "training_metadata.json").read_text(encoding="utf-8"))
+        assert data["dataset"] == {
+            "hf_id": "my-org/my-dataset",
+            "split": "train",
+            "revision": "abc123",
+        }
+        assert "sha256" not in data["dataset"]
+        assert "line_count" not in data["dataset"]
+        assert "path" not in data["dataset"]
+
+    def test_split_defaults_to_train_when_omitted(self, tmp_path: Path) -> None:
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        write_metadata(
+            adapter_dir,
+            model="m",
+            method="lora",
+            dataset_path="hf:my-org/my-dataset",
+            hyperparameters={},
+            timestamp=FIXED_TS,
+        )
+        data = json.loads((adapter_dir / "training_metadata.json").read_text(encoding="utf-8"))
+        assert data["dataset"]["hf_id"] == "my-org/my-dataset"
+        assert data["dataset"]["split"] == "train"
+
+    def test_revision_defaults_to_main_when_not_given(self, tmp_path: Path) -> None:
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        write_metadata(
+            adapter_dir,
+            model="m",
+            method="lora",
+            dataset_path="hf:my-org/my-dataset:validation",
+            hyperparameters={},
+            timestamp=FIXED_TS,
+        )
+        data = json.loads((adapter_dir / "training_metadata.json").read_text(encoding="utf-8"))
+        assert data["dataset"]["split"] == "validation"
+        assert data["dataset"]["revision"] == "main"
+
+    def test_round_trips_through_read_metadata(self, tmp_path: Path) -> None:
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        write_metadata(
+            adapter_dir,
+            model="m",
+            method="qlora",
+            dataset_path="hf:my-org/my-dataset:train",
+            hyperparameters={},
+            timestamp=FIXED_TS,
+            hf_revision="v2",
+        )
+        recovered = read_metadata(adapter_dir)
+        assert recovered["dataset"] == {
+            "hf_id": "my-org/my-dataset",
+            "split": "train",
+            "revision": "v2",
+        }

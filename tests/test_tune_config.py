@@ -577,3 +577,71 @@ def test_config_hash_unchanged_for_config_without_eval_section() -> None:
         compute_config_hash(cfg)
         == "752c600641c508e00a4720ee7ce503530706e29be51915ee52ba71efd82f39a2"[:64]
     )
+
+
+# ---------------------------------------------------------------------------
+# [run.dataset_map] — external (hf:) dataset column mapping (t11 / c34)
+# ---------------------------------------------------------------------------
+
+_HF_RUN = """
+[run]
+model = "unsloth/Qwen3-4B"
+dataset = "hf:my-org/my-dataset:train"
+output = "adapters/out"
+"""
+
+
+def test_dataset_map_absent_defaults_to_none(tmp_path: Path) -> None:
+    toml_file = _write_toml(tmp_path, _BASE_RUN)
+    cfg = load_config(toml_file)
+    assert cfg.dataset_map is None
+
+
+def test_dataset_map_parses_chat_mapping(tmp_path: Path) -> None:
+    toml_file = _write_toml(tmp_path, _HF_RUN + '\n[run.dataset_map]\nmessages = "conversations"\n')
+    cfg = load_config(toml_file)
+    assert cfg.dataset_map == {"messages": "conversations"}
+
+
+def test_dataset_map_parses_task_mapping(tmp_path: Path) -> None:
+    toml_file = _write_toml(
+        tmp_path,
+        _HF_RUN + '\n[run.dataset_map]\ntask = "instruction"\ninput = "context"\n'
+        'expected_output = "response"\n',
+    )
+    cfg = load_config(toml_file)
+    assert cfg.dataset_map == {
+        "task": "instruction",
+        "input": "context",
+        "expected_output": "response",
+    }
+
+
+def test_dataset_map_unknown_key_raises_cli_error_with_hint(tmp_path: Path) -> None:
+    toml_file = _write_toml(tmp_path, _HF_RUN + '\n[run.dataset_map]\nbogus = "col"\n')
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
+    assert "bogus" in exc_info.value.message
+    assert exc_info.value.remediation
+
+
+def test_dataset_map_non_string_value_raises_cli_error(tmp_path: Path) -> None:
+    toml_file = _write_toml(tmp_path, _HF_RUN + "\n[run.dataset_map]\nmessages = 5\n")
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
+
+
+def test_dataset_map_empty_string_value_raises_cli_error(tmp_path: Path) -> None:
+    toml_file = _write_toml(tmp_path, _HF_RUN + '\n[run.dataset_map]\nmessages = ""\n')
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
+
+
+def test_dataset_map_not_a_table_raises_cli_error(tmp_path: Path) -> None:
+    toml_file = _write_toml(tmp_path, _HF_RUN + "\ndataset_map = 5\n")
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
