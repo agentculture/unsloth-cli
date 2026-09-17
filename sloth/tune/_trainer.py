@@ -46,7 +46,7 @@ from typing import Any, Sequence
 from sloth.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 from sloth.cli._output import emit_diagnostic
 from sloth.tune import metrics, scorers
-from sloth.tune.config import RunConfig
+from sloth.tune.config import RunConfig, validate_dataset_map
 from sloth.tune.datasets import (
     detect_schema,
     render_chat_prompt,
@@ -237,32 +237,85 @@ _DATASET_MAP_REQUIRED_HINT = (
 def infer_hf_dataset_schema(dataset_map: "dict[str, str] | None") -> str:
     """Return ``"chat"`` or ``"task"`` inferred from *dataset_map*'s keys.
 
-    Raises ``CliError(code=1)`` when *dataset_map* is absent/empty or names
-    neither a chat nor a task field — an ``hf:`` dataset cannot be rendered
-    without knowing which schema its columns map onto.
+    The mapping must describe **one** schema completely — ``messages`` for chat,
+    or all three of ``task``/``input``/``expected_output`` for task. A partial
+    task map used to infer ``"task"`` here and then crash in
+    :func:`_render_hf_row`, which indexes all three columns; an absent, empty,
+    partial, or mixed map is now ``CliError(code=1)`` naming the missing keys.
+
+    This is the *defensive* half of the check — :mod:`sloth.tune.config` runs
+    the same validator at config-load time, but a ``dataset_map`` can also be
+    built from CLI flags, so the trainer never trusts it unchecked.
     """
-    keys = set(dataset_map or {})
-    if "messages" in keys:
-        return "chat"
-    if keys & {"task", "input", "expected_output"}:
-        return "task"
-    raise CliError(
+    return validate_dataset_map(dataset_map, remediation=_DATASET_MAP_REQUIRED_HINT)
+
+
+#: The schema fields each mapping must resolve to a source column.
+_SCHEMA_FIELDS: dict[str, tuple[str, ...]] = {
+    "chat": ("messages",),
+    "task": ("task", "input", "expected_output"),
+}
+
+
+def _mapped_columns(dataset_map: "dict[str, str] | None", schema: str) -> dict[str, str]:
+    """Return ``{schema field: source column}`` for *schema*.
+
+    An unmapped field falls back to a column of its own name.
+    """
+    mapping = dataset_map or {}
+    return {name: mapping.get(name, name) for name in _SCHEMA_FIELDS[schema]}
+
+
+def _missing_column_error(name: str, column: str, available: Sequence[str]) -> CliError:
+    """Return the ``CliError`` for a mapped column that the hub dataset does not have."""
+    return CliError(
         code=EXIT_USER_ERROR,
-        message="cannot infer a schema from [run.dataset_map] (or it is missing)",
-        remediation=_DATASET_MAP_REQUIRED_HINT,
+        message=(
+            f"column {column!r} (mapped from the [run.dataset_map] key {name!r}) "
+            f"is not a column of the loaded dataset"
+        ),
+        remediation=(
+            f"Point the [run.dataset_map] key '{name}' at one of the dataset's actual "
+            f"columns: {sorted(available)}."
+        ),
     )
 
 
+def _check_dataset_columns(
+    hub_dataset: Any, dataset_map: "dict[str, str] | None", schema: str
+) -> None:
+    """Verify every mapped source column exists in *hub_dataset* before rendering.
+
+    A typo in ``[run.dataset_map]`` otherwise surfaced as a bare ``KeyError`` on
+    the first row — after the dataset had already been downloaded. The column
+    list comes from ``column_names`` when the object exposes one (a real
+    ``datasets.Dataset``) and from the first row's keys otherwise; when neither
+    is available the check is skipped rather than guessed at.
+    """
+    columns = getattr(hub_dataset, "column_names", None)
+    if columns is None:
+        first = next(iter(hub_dataset), None)
+        columns = list(first.keys()) if isinstance(first, dict) else None
+    if columns is None:
+        return
+    for name, column in _mapped_columns(dataset_map, schema).items():
+        if column not in columns:
+            raise _missing_column_error(name, column, columns)
+
+
 def _render_hf_row(row: dict, dataset_map: "dict[str, str]", schema: str) -> dict:
-    """Render one hub *row* into a chat/task-schema dict via *dataset_map*."""
-    if schema == "chat":
-        column = dataset_map.get("messages", "messages")
-        return {"messages": row[column]}
-    return {
-        "task": row[dataset_map.get("task", "task")],
-        "input": row[dataset_map.get("input", "input")],
-        "expected_output": row[dataset_map.get("expected_output", "expected_output")],
-    }
+    """Render one hub *row* into a chat/task-schema dict via *dataset_map*.
+
+    A mapped column the row does not carry raises ``CliError(code=1)`` naming it
+    (rows are normally pre-checked by :func:`_check_dataset_columns`; this keeps
+    a direct caller, or a ragged row, off the raw-``KeyError`` path).
+    """
+    rendered: dict[str, Any] = {}
+    for name, column in _mapped_columns(dataset_map, schema).items():
+        if column not in row:
+            raise _missing_column_error(name, column, list(row))
+        rendered[name] = row[column]
+    return rendered
 
 
 def load_external_records(
@@ -295,11 +348,11 @@ def load_external_records(
     Raises
     ------
     CliError(code=1)
-        Invalid *spec*, or a schema that cannot be inferred from *dataset_map*.
-    ImportError
-        The ``datasets`` library is not installed (the caller decides how to
-        report this — ``sloth train`` runs inside the container where it is
-        always present; ``sloth validate`` reports it as an environment error).
+        Invalid *spec*, a schema that cannot be inferred from *dataset_map*, or
+        a mapped column the loaded dataset does not have.
+    CliError(code=2)
+        The ``datasets`` library is not installed (``sloth train`` runs inside
+        the container where it always is; elsewhere this is the install hint).
     """
     dataset_id, split = parse_hf_dataset_spec(spec)
     schema = infer_hf_dataset_schema(dataset_map)
@@ -307,7 +360,14 @@ def load_external_records(
 
     # Lazy-imported so importing this module (or calling it without the
     # `datasets` library present) never requires the ML stack at import time.
-    from datasets import load_dataset  # noqa: PLC0415 — intentional lazy import
+    try:
+        from datasets import load_dataset  # noqa: PLC0415 — intentional lazy import
+    except ImportError as exc:
+        raise CliError(
+            code=EXIT_ENV_ERROR,
+            message=f"the `datasets` library is not installed: {exc}",
+            remediation=_INSTALL_HINT,
+        ) from exc
 
     load_split = f"{split}[:{limit}]" if limit is not None else split
     # No revision pin: `hf:<org>/<name>[:split]` intentionally has no revision
@@ -316,6 +376,9 @@ def load_external_records(
     # the caller supplies (default "main") for reproducibility after the fact.
     hub_dataset = load_dataset(dataset_id, split=load_split)  # nosec B615
 
+    # Check the mapping against the dataset's real columns BEFORE rendering, so a
+    # mistyped [run.dataset_map] value is a named user error, not a KeyError.
+    _check_dataset_columns(hub_dataset, resolved_map, schema)
     rendered = [_render_hf_row(dict(row), resolved_map, schema) for row in hub_dataset]
 
     with tempfile.NamedTemporaryFile(
@@ -363,8 +426,40 @@ def _first_json_record(path: Path) -> dict | None:
         ) from exc
 
 
+#: The only schemas a *training* dataset may use. ``instruction``/``structured``/
+#: ``toolcall`` are **eval-only** suite schemas: they carry a judgement target
+#: (constraints, a JSON schema, an expected tool call), not a target completion,
+#: so there is nothing for SFT to learn to emit — and the training-time eval's
+#: holdout split (which writes task-schema rows on both sides) cannot represent
+#: them either.
+TRAINING_SCHEMAS: frozenset[str] = frozenset({"chat", "task"})
+
+_EVAL_ONLY_SCHEMA_HINT = (
+    "This is an eval-only suite schema; train on chat or task rows. Chat rows are "
+    '{"messages": [...]}; task rows are {"task", "input", "expected_output"}. The '
+    "same restriction applies to the [eval] holdout split, which renders task-schema "
+    "rows on both sides. Use this file with `sloth eval --suite` instead."
+)
+
+
+def _require_training_schema(schema: str, source: Any) -> str:
+    """Return *schema* when a training dataset may use it, else ``CliError(code=1)``."""
+    if schema not in TRAINING_SCHEMAS:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=(f"dataset {source} uses the {schema!r} schema, which cannot be trained on"),
+            remediation=_EVAL_ONLY_SCHEMA_HINT,
+        )
+    return schema
+
+
 def _detect_dataset_schema(path: Path) -> str:
-    """Sniff the schema (``"chat"``/``"task"``) from the first record of *path*."""
+    """Sniff the schema (``"chat"``/``"task"``) from the first record of *path*.
+
+    An eval-only schema (``instruction``/``structured``/``toolcall``) is refused
+    here — before any model load — rather than being accepted and then crashing
+    inside :func:`_format_records`.
+    """
     first_record = _first_json_record(path)
     schema = detect_schema(first_record) if first_record is not None else None
     if schema is None:
@@ -376,7 +471,7 @@ def _detect_dataset_schema(path: Path) -> str:
                 '({"task", "input", "expected_output"}).'
             ),
         )
-    return schema
+    return _require_training_schema(schema, path)
 
 
 def _format_records(records: list[dict], schema: str, tokenizer: Any) -> list[dict]:
@@ -387,7 +482,12 @@ def _format_records(records: list[dict], schema: str, tokenizer: Any) -> list[di
     the tokenizer's EOS so the model learns to stop. Pre-rendering an explicit
     ``text`` column avoids trl/unsloth conversational auto-detection, which would
     otherwise raise ``"Unsloth: You must specify a `formatting_func`"``.
+
+    Only :data:`TRAINING_SCHEMAS` are renderable; an eval-only schema raises
+    ``CliError(code=1)`` (it would otherwise be treated as ``task`` and die on a
+    ``KeyError``).
     """
+    _require_training_schema(schema, "records")
     if schema == "chat":
         return [
             {"text": tokenizer.apply_chat_template(record["messages"], tokenize=False)}
@@ -1065,9 +1165,21 @@ def score_suite(
 
 
 def build_file_entry(
-    suite_file: Any, scored: Sequence[dict[str, Any]], *, perplexity: float | None = None
+    suite_file: Any,
+    scored: Sequence[dict[str, Any]],
+    *,
+    perplexity: float | None = None,
+    perplexity_nll: float | None = None,
+    perplexity_tokens: int | None = None,
 ) -> dict[str, Any]:
-    """Build one ``files`` entry: metrics, the timing rollups, compliance, perplexity."""
+    """Build one ``files`` entry: metrics, the timing rollups, compliance, perplexity.
+
+    ``perplexity_nll``/``perplexity_tokens`` are the un-reduced totals behind the
+    per-file perplexity; they are what :func:`build_summary` weights the
+    aggregate by. They may be passed explicitly, but a *perplexity* produced by
+    :func:`run_perplexity` (a :class:`PerplexityResult`) already carries them, so
+    both eval seams get the weighted aggregate without changing their call.
+    """
     entry = metrics.file_entry(suite_file, scored)
     entry.update(timing_summary(scored))
     pct = compliance_pct(scored)
@@ -1077,8 +1189,40 @@ def build_file_entry(
     if choice_pct is not None:
         entry["choice_acc_pct"] = choice_pct
     if perplexity is not None:
-        entry["perplexity"] = perplexity
+        entry["perplexity"] = float(perplexity)
+        nll = perplexity_nll if perplexity_nll is not None else getattr(perplexity, "nll_sum", None)
+        tokens = (
+            perplexity_tokens
+            if perplexity_tokens is not None
+            else getattr(perplexity, "tokens", None)
+        )
+        if nll is not None and tokens:
+            entry["perplexity_nll"] = float(nll)
+            entry["perplexity_tokens"] = int(tokens)
     return entry
+
+
+def _aggregate_perplexity(files: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Return the suite-level perplexity keys for *files* (empty when none scored).
+
+    The combined perplexity is ``exp(total_nll / total_tokens)`` over every
+    scored token — averaging the per-file values would weight a one-row suite the
+    same as a thousand-row one. Entries written before the totals existed fall
+    back to that mean, which is why the key can still be reported for them.
+    """
+    scored = [entry for entry in files if entry.get("perplexity") is not None]
+    if not scored:
+        return {}
+    weighted = [entry for entry in scored if entry.get("perplexity_tokens")]
+    if len(weighted) == len(scored):
+        total_nll = sum(float(entry["perplexity_nll"]) for entry in weighted)
+        total_tokens = sum(int(entry["perplexity_tokens"]) for entry in weighted)
+        return {
+            "perplexity": round(_exp_or_inf(total_nll / total_tokens), 4),
+            "perplexity_nll": total_nll,
+            "perplexity_tokens": total_tokens,
+        }
+    return {"perplexity": round(sum(e["perplexity"] for e in scored) / len(scored), 4)}
 
 
 def build_summary(
@@ -1096,9 +1240,7 @@ def build_summary(
     choice_pct = choice_acc_pct(summary["results"])
     if choice_pct is not None:
         summary["choice_acc_pct"] = choice_pct
-    perplexities = [f["perplexity"] for f in files if f.get("perplexity") is not None]
-    if perplexities:
-        summary["perplexity"] = round(sum(perplexities) / len(perplexities), 4)
+    summary.update(_aggregate_perplexity(files))
     summary["batch_size"] = batch_size
     summary["base_load_in_4bit"] = base_load_in_4bit
     return summary
@@ -1171,31 +1313,55 @@ def _suite_records(suite: Any) -> list[dict[str, Any]]:
     return list(suite)
 
 
-def run_perplexity(model: Any, tokenizer: Any, suite: Any, *, torch_mod: Any = None) -> float:
-    """Return ``exp(mean per-token NLL)`` of *suite* under *model*.
+class PerplexityResult(float):
+    """A perplexity value that also carries the totals it was computed from.
 
-    This is a **labelled forward pass**, never a ``generate`` call: each record is
-    rendered to ``prompt + expected_output``, tokenized, and run through
-    ``model(**inputs, labels=input_ids)``, whose ``loss`` is the mean
-    cross-entropy over that sequence's predicted tokens. The losses are combined
-    *token-weighted* (each row's loss times its label count, divided by the total
-    label count), so a long row counts for more than a short one — a plain mean
-    of per-row losses would silently reweight the suite by row count.
+    ``run_perplexity`` must keep returning a ``float`` (both eval seams, and any
+    direct caller, treat it as one), but the *aggregate* over several suites can
+    only be computed correctly from the summed NLL and token count — averaging
+    per-file perplexities reweights the run by file count. Subclassing ``float``
+    carries those totals along the existing call path, so
+    :func:`build_file_entry` picks them up without either seam changing.
+    """
 
-    *suite* is either a JSONL path (validated and parsed here) or an
-    already-parsed list of records. *torch_mod* lets a caller that has already
-    imported torch (both eval seams have) hand it in; when omitted torch is
-    imported lazily inside the function, exactly like this module's other heavy
-    seams — so the documented ``run_perplexity(model, tokenizer, suite)`` call
-    works on its own.
+    __slots__ = ("nll_sum", "tokens")
 
-    An astronomically bad model can overflow ``math.exp``; that is reported as
-    ``inf`` rather than raising.
+    def __new__(cls, value: float, *, nll_sum: float, tokens: int) -> "PerplexityResult":
+        result = super().__new__(cls, value)
+        result.nll_sum = float(nll_sum)
+        result.tokens = int(tokens)
+        return result
+
+
+def _exp_or_inf(value: float) -> float:
+    """``math.exp(value)``, reporting an astronomically bad model as ``inf``."""
+    try:
+        return math.exp(value)
+    except OverflowError:
+        return math.inf
+
+
+def run_perplexity_stats(
+    model: Any, tokenizer: Any, suite: Any, *, torch_mod: Any = None
+) -> tuple[float, int]:
+    """Return ``(total_nll, scored_token_count)`` for *suite* under *model*.
+
+    The un-reduced totals behind :func:`run_perplexity`: each record's mean
+    cross-entropy times its label count, summed, alongside the total label
+    count. Callers that combine several suites must aggregate *these* and
+    exponentiate once — see :func:`build_summary`.
     """
     if torch_mod is None:
-        import torch  # noqa: PLC0415 — intentional lazy import
+        try:
+            import torch  # noqa: PLC0415 — intentional lazy import
 
-        torch_mod = torch
+            torch_mod = torch
+        except ImportError as exc:
+            raise CliError(
+                code=EXIT_ENV_ERROR,
+                message=f"torch is not installed: {exc}",
+                remediation=_INSTALL_HINT,
+            ) from exc
 
     records = _suite_records(suite)
     device = _model_device(model)
@@ -1218,12 +1384,43 @@ def run_perplexity(model: Any, tokenizer: Any, suite: Any, *, torch_mod: Any = N
         labels = max(_sequence_length(inputs["input_ids"]) - 1, 1)
         total_nll += float(loss) * labels
         total_tokens += labels
-    if not total_tokens:
-        return 0.0
-    try:
-        return math.exp(total_nll / total_tokens)
-    except OverflowError:
-        return math.inf
+    return total_nll, total_tokens
+
+
+def run_perplexity(model: Any, tokenizer: Any, suite: Any, *, torch_mod: Any = None) -> float:
+    """Return ``exp(mean per-token NLL)`` of *suite* under *model*.
+
+    This is a **labelled forward pass**, never a ``generate`` call: each record is
+    rendered to ``prompt + expected_output``, tokenized, and run through
+    ``model(**inputs, labels=input_ids)``, whose ``loss`` is the mean
+    cross-entropy over that sequence's predicted tokens. The losses are combined
+    *token-weighted* (each row's loss times its label count, divided by the total
+    label count), so a long row counts for more than a short one — a plain mean
+    of per-row losses would silently reweight the suite by row count.
+
+    *suite* is either a JSONL path (validated and parsed here) or an
+    already-parsed list of records. *torch_mod* lets a caller that has already
+    imported torch (both eval seams have) hand it in; when omitted torch is
+    imported lazily inside the function, exactly like this module's other heavy
+    seams — so the documented ``run_perplexity(model, tokenizer, suite)`` call
+    works on its own.
+
+    An astronomically bad model can overflow ``math.exp``; that is reported as
+    ``inf`` rather than raising.
+
+    The returned value is a :class:`PerplexityResult` — a ``float`` that also
+    carries ``nll_sum``/``tokens``, so a caller combining several suites can
+    weight them correctly. Use :func:`run_perplexity_stats` to get the totals
+    directly.
+
+    Raises
+    ------
+    CliError(code=2)
+        When *torch_mod* is omitted and torch is not installed.
+    """
+    total_nll, total_tokens = run_perplexity_stats(model, tokenizer, suite, torch_mod=torch_mod)
+    value = 0.0 if not total_tokens else _exp_or_inf(total_nll / total_tokens)
+    return PerplexityResult(value, nll_sum=total_nll, tokens=total_tokens)
 
 
 # ---------------------------------------------------------------------------

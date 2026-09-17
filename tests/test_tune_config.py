@@ -645,3 +645,51 @@ def test_dataset_map_not_a_table_raises_cli_error(tmp_path: Path) -> None:
     with pytest.raises(CliError) as exc_info:
         load_config(toml_file)
     assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# [run.dataset_map] completeness — a partial map must never reach the trainer
+# (qodo PR #29 finding 1: a one-key task map inferred the task schema, then
+# _render_hf_row indexed all three columns and crashed mid-run)
+# ---------------------------------------------------------------------------
+
+
+def test_dataset_map_partial_task_mapping_raises_naming_the_missing_keys(tmp_path: Path) -> None:
+    toml_file = _write_toml(
+        tmp_path, _HF_RUN + '\n[run.dataset_map]\ntask = "instruction"\ninput = "context"\n'
+    )
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
+    assert "expected_output" in exc_info.value.message
+    assert exc_info.value.remediation
+
+
+def test_dataset_map_single_task_key_raises(tmp_path: Path) -> None:
+    toml_file = _write_toml(tmp_path, _HF_RUN + '\n[run.dataset_map]\ntask = "instruction"\n')
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
+    assert "input" in exc_info.value.message
+    assert "expected_output" in exc_info.value.message
+
+
+def test_dataset_map_mixing_chat_and_task_keys_raises(tmp_path: Path) -> None:
+    toml_file = _write_toml(
+        tmp_path,
+        _HF_RUN + '\n[run.dataset_map]\nmessages = "conversations"\ntask = "instruction"\n'
+        'input = "context"\nexpected_output = "response"\n',
+    )
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
+    assert "messages" in exc_info.value.message
+    assert exc_info.value.remediation
+
+
+def test_dataset_map_empty_table_raises(tmp_path: Path) -> None:
+    toml_file = _write_toml(tmp_path, _HF_RUN + "\n[run.dataset_map]\n")
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
+    assert exc_info.value.remediation

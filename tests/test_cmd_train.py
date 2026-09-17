@@ -1337,9 +1337,21 @@ class TestLoadExternalRecords:
         import sloth.tune._trainer as trainer_mod
 
         assert (
-            trainer_mod.infer_hf_dataset_schema({"task": "instruction", "input": "context"})
+            trainer_mod.infer_hf_dataset_schema(
+                {"task": "instruction", "input": "context", "expected_output": "response"}
+            )
             == "task"
         )
+
+    def test_infer_schema_refuses_a_partial_task_map(self) -> None:
+        """A one- or two-key task map used to infer "task", then crash on render."""
+        import sloth.tune._trainer as trainer_mod
+
+        with pytest.raises(CliError) as exc_info:
+            trainer_mod.infer_hf_dataset_schema({"task": "instruction", "input": "context"})
+        assert exc_info.value.code == 1
+        assert "expected_output" in exc_info.value.message
+        assert exc_info.value.remediation
 
     def test_infer_schema_missing_map_raises_cli_error(self) -> None:
         import sloth.tune._trainer as trainer_mod
@@ -1564,4 +1576,5 @@ class TestRunTrainingHfDataset:
             "hf_id": "my-org/my-dataset",
             "split": "train",
             "revision": "main",
+            "source": "hf",
         }

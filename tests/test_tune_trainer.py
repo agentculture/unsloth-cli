@@ -1816,3 +1816,274 @@ class TestTrainingTimeEval:
         assert "holdout" in captured.err.lower()
         data = json.loads(Path(result["metadata_path"]).read_text(encoding="utf-8"))
         assert "holdout" not in data
+
+
+# ---------------------------------------------------------------------------
+# qodo PR #29 findings 3, 5, 6, 7
+# ---------------------------------------------------------------------------
+
+
+class TestPerplexityWeighting:
+    """The combined perplexity is token-weighted, never a mean of per-file values.
+
+    ``exp(total_nll / total_tokens)`` over every scored token is the only
+    aggregate that stays correct when suites differ in length; averaging the
+    per-file perplexities silently reweights the run by file count.
+    """
+
+    def test_run_perplexity_stats_returns_total_nll_and_token_count(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        suite = _write_task_suite(
+            tmp_path / "s.jsonl", [("reverse", "abc", "cba"), ("reverse", "de", "ed")]
+        )
+        tokenizer = _FakeTokenizer(pad_token="<pad>")
+        model = _FakeEvalModel(tokenizer, {})
+        model.forbid_generate = True
+        model.losses = [2.0, 2.0]
+        monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(no_grad=_NullContext))
+
+        nll, tokens = _trainer.run_perplexity_stats(model, tokenizer, suite)
+
+        assert tokens > 0
+        assert nll == pytest.approx(2.0 * tokens)
+
+    def test_run_perplexity_still_returns_a_float(self, tmp_path: Path, monkeypatch) -> None:
+        import math
+
+        suite = _write_task_suite(tmp_path / "s.jsonl", [("reverse", "abc", "cba")])
+        tokenizer = _FakeTokenizer(pad_token="<pad>")
+        model = _FakeEvalModel(tokenizer, {})
+        model.forbid_generate = True
+        model.losses = [2.0]
+        monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(no_grad=_NullContext))
+
+        value = _trainer.run_perplexity(model, tokenizer, suite)
+        assert isinstance(value, float)
+        assert value == pytest.approx(math.exp(2.0))
+
+    def test_file_entry_carries_the_nll_and_token_count(self) -> None:
+        stats = _trainer.PerplexityResult(7.389, nll_sum=20.0, tokens=10)
+        entry = _trainer.build_file_entry("s.jsonl", [], perplexity=stats)
+        assert entry["perplexity_nll"] == pytest.approx(20.0)
+        assert entry["perplexity_tokens"] == 10
+
+    def test_file_entry_accepts_explicit_keyword_stats(self) -> None:
+        entry = _trainer.build_file_entry(
+            "s.jsonl", [], perplexity=2.0, perplexity_nll=4.0, perplexity_tokens=8
+        )
+        assert entry["perplexity_nll"] == pytest.approx(4.0)
+        assert entry["perplexity_tokens"] == 8
+
+    def test_summary_weights_by_token_count(self) -> None:
+        import math
+
+        files = [
+            {
+                "total": 1,
+                "exact_match": 0,
+                "f1": 0.0,
+                "results": [],
+                "perplexity": math.exp(1.0),
+                "perplexity_nll": 1.0,
+                "perplexity_tokens": 1,
+            },
+            {
+                "total": 1,
+                "exact_match": 0,
+                "f1": 0.0,
+                "results": [],
+                "perplexity": math.exp(3.0),
+                "perplexity_nll": 99.0,
+                "perplexity_tokens": 33,
+            },
+        ]
+        summary = _trainer.build_summary(files, batch_size=1, base_load_in_4bit=None)
+
+        # Token-weighted: exp((1 + 99) / (1 + 33)) — NOT the mean of the two.
+        assert summary["perplexity"] == pytest.approx(round(math.exp(100 / 34), 4))
+        assert summary["perplexity"] != pytest.approx(round((math.exp(1.0) + math.exp(3.0)) / 2, 4))
+        assert summary["perplexity_tokens"] == 34
+
+    def test_summary_falls_back_to_the_mean_without_token_counts(self) -> None:
+        files = [
+            {"total": 1, "exact_match": 0, "f1": 0.0, "results": [], "perplexity": 2.0},
+            {"total": 1, "exact_match": 0, "f1": 0.0, "results": [], "perplexity": 4.0},
+        ]
+        summary = _trainer.build_summary(files, batch_size=1, base_load_in_4bit=None)
+        assert summary["perplexity"] == pytest.approx(3.0)
+
+    def test_run_eval_reports_a_token_weighted_aggregate(self, tmp_path: Path, monkeypatch) -> None:
+        import math
+
+        adapter = _adapter_with_config(tmp_path)
+        short = _write_task_suite(tmp_path / "short.jsonl", [("reverse", "abc", "cba")])
+        long = _write_task_suite(
+            tmp_path / "long.jsonl",
+            [("reverse", f"in{i} x y z", f"out{i} x y z") for i in range(4)],
+        )
+        _tokenizer, model = _eval_fakes(monkeypatch, {"abc": "cba"})
+        model.losses = [1.0] + [3.0] * 4
+
+        result = run_eval(str(adapter), suite_paths=[short, long], perplexity=True)
+
+        files = result["files"]
+        total_nll = sum(f["perplexity_nll"] for f in files)
+        total_tokens = sum(f["perplexity_tokens"] for f in files)
+        assert result["perplexity"] == pytest.approx(round(math.exp(total_nll / total_tokens), 4))
+        assert files[0]["perplexity"] == pytest.approx(math.exp(1.0))
+
+
+class TestMissingToolImports:
+    """A missing tool is an environment error with a hint — never a raw ImportError."""
+
+    def test_load_external_records_without_datasets_is_exit_2(self, monkeypatch) -> None:
+        monkeypatch.setitem(sys.modules, "datasets", None)  # None -> ImportError
+        with pytest.raises(CliError) as exc_info:
+            _trainer.load_external_records("hf:org/name:train", {"messages": "conversations"})
+        assert exc_info.value.code == 2
+        assert exc_info.value.remediation
+
+    def test_run_perplexity_without_torch_is_exit_2(self, tmp_path: Path, monkeypatch) -> None:
+        suite = _write_task_suite(tmp_path / "s.jsonl", [("reverse", "abc", "cba")])
+        monkeypatch.setitem(sys.modules, "torch", None)  # None -> ImportError
+        with pytest.raises(CliError) as exc_info:
+            _trainer.run_perplexity(object(), _FakeTokenizer(), suite)
+        assert exc_info.value.code == 2
+        assert exc_info.value.remediation
+
+
+def _write_schema_dataset(path: Path, record: dict) -> Path:
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    return path
+
+
+_EVAL_ONLY_RECORDS = {
+    "instruction": {
+        "instruction": "write a haiku",
+        "constraints": [{"type": "max_words", "value": 17}],
+    },
+    "structured": {
+        "task": "extract",
+        "input": "x",
+        "json_schema": {"type": "object"},
+    },
+    "toolcall": {
+        "task": "call",
+        "input": "weather in Paris",
+        "expected_tool_call": {"name": "get_weather", "arguments": {}},
+    },
+}
+
+
+class TestTrainingRejectsEvalOnlySchemas:
+    """Training accepts ``chat`` and ``task`` only — the eval-only suites are refused.
+
+    They were previously detected, then crashed inside ``_format_records`` (or
+    produced a nonsense holdout), so the refusal happens before any model load.
+    """
+
+    @pytest.mark.parametrize("schema", sorted(_EVAL_ONLY_RECORDS))
+    def test_detect_dataset_schema_refuses_eval_only_schema(
+        self, tmp_path: Path, schema: str
+    ) -> None:
+        dataset = _write_schema_dataset(tmp_path / "d.jsonl", _EVAL_ONLY_RECORDS[schema])
+        with pytest.raises(CliError) as exc_info:
+            _trainer._detect_dataset_schema(dataset)
+        assert exc_info.value.code == 1
+        assert schema in exc_info.value.message
+        assert "eval-only" in exc_info.value.remediation
+
+    def test_format_records_refuses_an_eval_only_schema(self) -> None:
+        with pytest.raises(CliError) as exc_info:
+            _trainer._format_records([{"instruction": "x"}], "instruction", _FakeTokenizer())
+        assert exc_info.value.code == 1
+        assert "eval-only" in exc_info.value.remediation
+
+    def test_training_refuses_before_loading_the_model(self, tmp_path: Path, monkeypatch) -> None:
+        config = _config(tmp_path)
+        _write_schema_dataset(Path(config.dataset), _EVAL_ONLY_RECORDS["toolcall"])
+        backend, events = _make_fake_backend()
+        monkeypatch.setattr(_trainer, "_load_backend", lambda: backend)
+        fake_module, _, _ = _fake_datasets_module()
+        monkeypatch.setitem(sys.modules, "datasets", fake_module)
+
+        with pytest.raises(CliError) as exc_info:
+            run_training(config, dry_run=False)
+        assert exc_info.value.code == 1
+        assert not events["from_pretrained"], "the model must not be loaded for a refused dataset"
+
+
+class TestDatasetMapColumnValidation:
+    """Every mapped source column must exist in the loaded hub dataset."""
+
+    def _fake_datasets(self, monkeypatch, rows: list[dict]) -> None:
+        module = type(
+            "FakeDatasetsModule", (), {"load_dataset": staticmethod(lambda *a, **k: rows)}
+        )
+        monkeypatch.setitem(sys.modules, "datasets", module)
+
+    def test_missing_chat_column_names_the_column_and_the_key(self, monkeypatch) -> None:
+        self._fake_datasets(monkeypatch, [{"dialogue": [{"role": "user", "content": "hi"}]}])
+        with pytest.raises(CliError) as exc_info:
+            _trainer.load_external_records("hf:org/name:train", {"messages": "conversations"})
+        assert exc_info.value.code == 1
+        assert "conversations" in exc_info.value.message
+        assert "messages" in exc_info.value.message
+        assert "[run.dataset_map]" in exc_info.value.remediation
+
+    def test_missing_task_column_names_the_column(self, monkeypatch) -> None:
+        self._fake_datasets(monkeypatch, [{"instruction": "x", "context": "y"}])
+        with pytest.raises(CliError) as exc_info:
+            _trainer.load_external_records(
+                "hf:org/name:train",
+                {"task": "instruction", "input": "context", "expected_output": "response"},
+            )
+        assert exc_info.value.code == 1
+        assert "response" in exc_info.value.message
+
+    def test_column_names_attribute_is_used_when_present(self, monkeypatch) -> None:
+        class _FakeHubDataset(list):
+            column_names = ["conversations"]
+
+        self._fake_datasets(
+            monkeypatch,
+            _FakeHubDataset([{"conversations": [{"role": "user", "content": "hi"}]}]),
+        )
+        records = _trainer.load_external_records("hf:org/name:train", {"messages": "conversations"})
+        assert records == [{"messages": [{"role": "user", "content": "hi"}]}]
+
+    def test_render_hf_row_refuses_a_missing_column(self) -> None:
+        with pytest.raises(CliError) as exc_info:
+            _trainer._render_hf_row({"dialogue": []}, {"messages": "conversations"}, "chat")
+        assert exc_info.value.code == 1
+
+
+class TestPartialDatasetMapIsRefused:
+    """A partial/mixed ``[run.dataset_map]`` never reaches ``_render_hf_row``."""
+
+    def test_partial_task_map_is_a_user_error(self) -> None:
+        with pytest.raises(CliError) as exc_info:
+            _trainer.infer_hf_dataset_schema({"task": "instruction", "input": "context"})
+        assert exc_info.value.code == 1
+        assert "expected_output" in exc_info.value.message
+
+    def test_mixed_map_is_a_user_error(self) -> None:
+        with pytest.raises(CliError) as exc_info:
+            _trainer.infer_hf_dataset_schema(
+                {
+                    "messages": "conversations",
+                    "task": "instruction",
+                    "input": "context",
+                    "expected_output": "response",
+                }
+            )
+        assert exc_info.value.code == 1
+
+    def test_complete_task_map_infers_the_task_schema(self) -> None:
+        assert (
+            _trainer.infer_hf_dataset_schema(
+                {"task": "instruction", "input": "context", "expected_output": "response"}
+            )
+            == "task"
+        )

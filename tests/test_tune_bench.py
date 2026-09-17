@@ -431,3 +431,70 @@ def test_choice_scoring_composes_with_a_schema_scorer() -> None:
     scored = metrics.score_records(records, ["B"], extra_metrics=extra)
     assert scored[0]["choice_match"] is True
     assert scored[0]["constraints_passed"] is True
+
+
+# ---------------------------------------------------------------------------
+# QLoRA precision resolution (qodo PR #29 finding 4)
+# ---------------------------------------------------------------------------
+
+
+def _write_metadata(directory: Path, payload: dict[str, Any]) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "training_metadata.json").write_text(json.dumps(payload), encoding="utf-8")
+    return directory
+
+
+def test_qlora_method_benches_in_4bit_even_without_the_hyperparameter(tmp_path: Path) -> None:
+    """Training forces 4-bit for `method = "qlora"`; the bench must match it."""
+    adapter = _write_metadata(
+        tmp_path / "adapter",
+        {
+            "model": "unsloth/Qwen3-4B",
+            "method": "qlora",
+            "hyperparameters": {"load_in_4bit": False},
+        },
+    )
+    assert bench.resolve_adapter_target(adapter) == ("unsloth/Qwen3-4B", True)
+
+
+def test_lora_method_with_the_flag_on_still_benches_in_4bit(tmp_path: Path) -> None:
+    adapter = _write_metadata(
+        tmp_path / "adapter",
+        {"model": "unsloth/Qwen3-4B", "method": "lora", "hyperparameters": {"load_in_4bit": True}},
+    )
+    assert bench.resolve_adapter_target(adapter) == ("unsloth/Qwen3-4B", True)
+
+
+def test_lora_method_without_the_flag_benches_in_full_precision(tmp_path: Path) -> None:
+    adapter = _write_metadata(
+        tmp_path / "adapter",
+        {"model": "unsloth/Qwen3-4B", "method": "lora", "hyperparameters": {"load_in_4bit": False}},
+    )
+    assert bench.resolve_adapter_target(adapter) == ("unsloth/Qwen3-4B", False)
+
+
+def test_resolved_load_in_4bit_wins_over_the_raw_hyperparameter(tmp_path: Path) -> None:
+    """``resolved.load_in_4bit`` is what the run actually trained at — prefer it."""
+    adapter = _write_metadata(
+        tmp_path / "adapter",
+        {
+            "model": "unsloth/Qwen3-4B",
+            "method": "lora",
+            "hyperparameters": {"load_in_4bit": False},
+            "resolved": {"load_in_4bit": True},
+        },
+    )
+    assert bench.resolve_adapter_target(adapter) == ("unsloth/Qwen3-4B", True)
+
+
+def test_resolved_load_in_4bit_false_wins_over_a_qlora_method(tmp_path: Path) -> None:
+    adapter = _write_metadata(
+        tmp_path / "adapter",
+        {
+            "model": "unsloth/Qwen3-4B",
+            "method": "qlora",
+            "hyperparameters": {"load_in_4bit": True},
+            "resolved": {"load_in_4bit": False},
+        },
+    )
+    assert bench.resolve_adapter_target(adapter) == ("unsloth/Qwen3-4B", False)
