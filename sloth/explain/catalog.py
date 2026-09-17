@@ -168,7 +168,22 @@ keys as `[run.dataset_map]` in `run.toml`: `messages` for chat, or
 **offline, without launching a container** when the dataset is already
 cached locally. When it is not cached (or the `datasets` library is not
 installed), the check exits `2` with a `hint:` naming `sloth train` as the
-way to populate the shared Hugging Face cache.
+way to populate the shared Hugging Face cache. `--schema` is honoured here
+too: the mapped rows are validated against the **pinned** schema and the
+report names it (`schema_source: pinned`); without it the schema is inferred
+from the mapping (`schema_source: inferred`). A `--schema` that contradicts
+the mapping — `--schema task` with a `messages` mapping, or `--schema chat`
+with a `task`/`input`/`expected_output` mapping — exits `1` with a `hint:`
+rather than being silently ignored.
+
+`--config PATH` reads a `run.toml` with the *same*
+`sloth.tune.config.load_config` `sloth train` uses and takes `dataset` from
+its `[run]` section and the column mapping from `[run.dataset_map]` when
+`--dataset` / `--dataset-map` are not passed — explicit flags always win, and
+`--suite` is never overridden. This is the entry point for a caller that holds
+only a run config (e.g. a sibling agent running
+`sloth validate --config run.toml --json`) and so cannot spell out the
+mapping on the command line.
 
 This module is pure stdlib — no torch/unsloth import, so it stays usable on a
 machine with no GPU stack installed.
@@ -178,6 +193,7 @@ machine with no GPU stack installed.
     unsloth-cli validate --dataset data/train.jsonl
     unsloth-cli validate --dataset data/train.jsonl --schema task
     unsloth-cli validate --dataset data/train.jsonl --json
+    unsloth-cli validate --config run.toml --json
     unsloth-cli validate --suite data/eval.jsonl
     unsloth-cli validate --suite examples/eval/ --json
 
@@ -193,10 +209,13 @@ machine with no GPU stack installed.
   pins that schema for every file.
 - `--dataset-map FIELD=COLUMN` (repeatable) — column mapping for an
   `hf:<org>/<name>[:split]` `--dataset`; ignored for a local JSONL `--dataset`.
+- `--config PATH` — a `run.toml` supplying `--dataset` (from `[run] dataset`)
+  and `--dataset-map` (from `[run.dataset_map]`) when those flags are absent.
 - `--json` — emit the result as structured JSON: `{valid, schema, line_count}`
   for `--dataset`, or `{valid, schema, files, total_records}` for `--suite`
   (`files` is a list of `{path, line_count}`, one per resolved file). An
-  `hf:` `--dataset` adds a `source` field naming the spec.
+  `hf:` `--dataset` adds a `source` field naming the spec and a
+  `schema_source` field (`pinned` or `inferred`).
 
 ## Exit codes
 
@@ -206,12 +225,14 @@ machine with no GPU stack installed.
   naming the file and line for a `--suite` directory), an empty `--suite`
   directory, an explicit non-`task` `--schema` passed with `--suite`, both/
   neither of `--dataset`/`--suite` passed, a malformed `--dataset-map` entry,
+  a `--schema` that contradicts the `--dataset-map` for an `hf:` `--dataset`,
   or a missing/unresolvable `[run.dataset_map]`-equivalent mapping for an
   `hf:` `--dataset`.
 - `2` environment error — the dataset file exists but cannot be opened
-  (e.g. a permission error); or, for an `hf:` `--dataset`, the `datasets`
-  library is not installed, or the dataset is not present in the local
-  Hugging Face cache (the `hint:` names `sloth train` as the way to cache it).
+  (e.g. a permission error); a `--config` file that is missing or not valid
+  TOML; or, for an `hf:` `--dataset`, the `datasets` library is not
+  installed, or the dataset is not present in the local Hugging Face cache
+  (the `hint:` names `sloth train` as the way to cache it).
 """
 
 _CONFIG_INIT = """\
