@@ -358,8 +358,9 @@ def test_h1_anchor_bad_dataset_and_out_of_scope_never_invoke_container(
     # --- H1a: invalid dataset (empty messages list) ---
     bad = _write_dataset(tmp_path, body='{"messages": []}\n', name="bad_ds.jsonl")
     toml_bad = _write_toml(tmp_path, dataset=bad, name="bad_run.toml")
+    args_bad = _make_args(toml_bad, dry_run=False)
     with pytest.raises(CliError) as exc_info_a:
-        cmd_train(_make_args(toml_bad, dry_run=False))
+        cmd_train(args_bad)
     assert exc_info_a.value.code == 1, "h1a: expected CliError code=1 for invalid dataset"
     mock_launch.assert_not_called()
 
@@ -923,7 +924,8 @@ def test_train_help_states_scope_warning() -> None:
     help_text = train_parser.format_help().lower()
     assert "full fine-tuning" in help_text
     assert "out of scope" in help_text
-    assert "lora" in help_text and "qlora" in help_text
+    assert "lora" in help_text
+    assert "qlora" in help_text
 
 
 def test_in_container_flag_suppressed_from_help() -> None:
@@ -1446,8 +1448,9 @@ class TestTrainHfDatasetIntegration:
     ) -> None:
         cfg = _hf_config(tmp_path, dataset_map=None)
         monkeypatch.setattr(train_mod, "load_config", lambda _path: cfg)
+        args = _make_args(tmp_path / "ignored.toml", dry_run=True)
         with pytest.raises(CliError) as exc_info:
-            cmd_train(_make_args(tmp_path / "ignored.toml", dry_run=True))
+            cmd_train(args)
         assert exc_info.value.code == 1
 
     def test_host_real_run_extra_mounts_omit_hf_dataset(

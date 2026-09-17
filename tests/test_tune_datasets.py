@@ -778,4 +778,5 @@ class TestDetectSchemaFiveWay:
         (d / "c.jsonl").write_text("{}\n", encoding="utf-8")
         with pytest.raises(CliError) as exc_info:
             validate_suite(d, schema="auto")
-        assert "c.jsonl" in exc_info.value.message and "line 1" in exc_info.value.message
+        assert "c.jsonl" in exc_info.value.message
+        assert "line 1" in exc_info.value.message
