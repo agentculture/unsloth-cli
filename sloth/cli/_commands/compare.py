@@ -165,11 +165,12 @@ def _dataset_identity(dataset: dict[str, Any] | None) -> Any:
     two differing shapes still compare unequal rather than silently matching.
     """
     ds = dataset or {}
+    # Always a (kind, value) pair so every branch returns the same shape.
     if ds.get("hf_id") or ds.get("source") == "hf":
-        return ("hf", ds.get("hf_id"), ds.get("split"), ds.get("revision"))
+        return ("hf", (ds.get("hf_id"), ds.get("split"), ds.get("revision")))
     if ds.get("sha256") is not None:
         return ("sha256", ds.get("sha256"))
-    return ("raw", sorted((str(k), str(v)) for k, v in ds.items()))
+    return ("raw", tuple(sorted((str(k), str(v)) for k, v in ds.items())))
 
 
 def _config_deltas(meta_a: dict[str, Any] | None, meta_b: dict[str, Any] | None) -> dict[str, Any]:

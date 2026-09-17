@@ -1947,8 +1947,9 @@ class TestMissingToolImports:
     def test_run_perplexity_without_torch_is_exit_2(self, tmp_path: Path, monkeypatch) -> None:
         suite = _write_task_suite(tmp_path / "s.jsonl", [("reverse", "abc", "cba")])
         monkeypatch.setitem(sys.modules, "torch", None)  # None -> ImportError
+        model, tokenizer = object(), _FakeTokenizer()
         with pytest.raises(CliError) as exc_info:
-            _trainer.run_perplexity(object(), _FakeTokenizer(), suite)
+            _trainer.run_perplexity(model, tokenizer, suite)
         assert exc_info.value.code == 2
         assert exc_info.value.remediation
 
@@ -1995,8 +1996,9 @@ class TestTrainingRejectsEvalOnlySchemas:
         assert "eval-only" in exc_info.value.remediation
 
     def test_format_records_refuses_an_eval_only_schema(self) -> None:
+        records, tokenizer = [{"instruction": "x"}], _FakeTokenizer()
         with pytest.raises(CliError) as exc_info:
-            _trainer._format_records([{"instruction": "x"}], "instruction", _FakeTokenizer())
+            _trainer._format_records(records, "instruction", tokenizer)
         assert exc_info.value.code == 1
         assert "eval-only" in exc_info.value.remediation
 
