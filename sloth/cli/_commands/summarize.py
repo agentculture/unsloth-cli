@@ -45,9 +45,7 @@ def _summary_text_lines(summary: dict[str, Any]) -> list[str]:
     eval_summary = summary.get("eval")
     if eval_summary:
         lines.append("eval:")
-        lines.append(f"  exact_match_pct: {eval_summary.get('exact_match_pct')}")
-        lines.append(f"  f1:              {eval_summary.get('f1')}")
-        lines.append(f"  files:           {eval_summary.get('file_count')}")
+        lines.extend(_eval_suite_lines(eval_summary.get("suites") or {}))
     exports = summary.get("exports") or []
     if exports:
         lines.append("exports:")
@@ -58,10 +56,31 @@ def _summary_text_lines(summary: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _eval_suite_lines(suites: dict[str, Any]) -> list[str]:
+    """Render one text block per eval suite: every numeric metric key (see
+    :func:`sloth.tune.summary._eval_summary`), the suite's file count, and
+    ``batch_size``/``base_load_in_4bit`` ("base precision") when present."""
+    lines: list[str] = []
+    for suite_name in sorted(suites):
+        metrics = suites[suite_name]
+        lines.append(f"  suite: {suite_name}")
+        skip = {"file_count", "batch_size", "base_load_in_4bit"}
+        for key in sorted(metrics):
+            if key in skip:
+                continue
+            lines.append(f"    {key}: {metrics[key]}")
+        lines.append(f"    files: {metrics.get('file_count')}")
+        if "batch_size" in metrics:
+            lines.append(f"    batch_size: {metrics.get('batch_size')}")
+        if "base_load_in_4bit" in metrics:
+            lines.append(f"    base_load_in_4bit: {metrics.get('base_load_in_4bit')}")
+    return lines
+
+
 def _export_line(export: dict[str, Any]) -> str:
     """Render one export record as ``<format> quant=<a,b> files=<n> bytes=<n>``,
     appended with an ``eval(...)`` suffix when that export's own output dir
-    has an ``eval.json`` (see :func:`sloth.tune.summary.build_summary`)."""
+    has eval results (see :func:`sloth.tune.summary.build_summary`)."""
     raw_quant = export.get("quant")
     quant_items = [str(q) for q in raw_quant] if isinstance(raw_quant, list) else []
     quant = ",".join(quant_items) or "-"
@@ -71,10 +90,13 @@ def _export_line(export: dict[str, Any]) -> str:
     line = f"{export.get('format')} quant={quant} files={len(files)} bytes={int(total_bytes)}"
     export_eval = export.get("eval")
     if export_eval:
+        eval_files = sum(
+            suite.get("file_count", 0) for suite in (export_eval.get("suites") or {}).values()
+        )
         line += (
             f" eval(exact_match_pct={export_eval.get('exact_match_pct')}"
             f" f1={export_eval.get('f1')}"
-            f" files={export_eval.get('file_count')})"
+            f" files={eval_files})"
         )
     return line
 
