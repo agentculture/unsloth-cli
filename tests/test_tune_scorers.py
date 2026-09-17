@@ -12,6 +12,7 @@ from sloth.tune.scorers import (
     TOOL_CALL_PARSERS,
     bleu,
     check_json_subset,
+    extract_choice_letter,
     family_for_model,
     gleu,
     parse_tool_call,
@@ -406,3 +407,50 @@ class _FakeSacrebleu:
         ref = references[0]
         score = 100.0 if prediction.strip() == ref.strip() else 0.0
         return _FakeScoreResult(score)
+
+
+# ---------------------------------------------------------------------------
+# extract_choice_letter — multiple-choice letter extraction (t13)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "prediction, expected",
+    [
+        ("B", "B"),
+        ("B.", "B"),
+        ("(B)", "B"),
+        ("**B**", "B"),
+        (" C \n", "C"),
+        ("Answer: B", "B"),
+        ("answer is (c)", "C"),
+        ("The correct option \u2014 D", "D"),
+        ("d", "D"),
+        ("A) Saturn", "A"),
+    ],
+)
+def test_extract_choice_letter_reads_common_shapes(prediction: str, expected: str) -> None:
+    """Every shape a model answers a lettered question in resolves to its letter."""
+    assert extract_choice_letter(prediction) == expected
+
+
+def test_extract_choice_letter_ignores_letters_inside_words() -> None:
+    """The ``A`` in ``Answer`` is not a standalone choice; the stated letter wins."""
+    assert extract_choice_letter("Answer: C") == "C"
+    assert extract_choice_letter("Adenosine triphosphate") is None
+
+
+def test_extract_choice_letter_prefers_uppercase_over_the_article_a() -> None:
+    """A lower-case standalone ``a`` never beats an upper-case choice letter."""
+    assert extract_choice_letter("It is a straightforward one: C") == "C"
+
+
+def test_extract_choice_letter_falls_back_to_lowercase() -> None:
+    """With no upper-case candidate, a standalone lower-case letter is used."""
+    assert extract_choice_letter("i would say b here") == "B"
+
+
+@pytest.mark.parametrize("prediction", ["", "none of these", "42", "Z", None, 7])
+def test_extract_choice_letter_returns_none_without_a_letter(prediction: object) -> None:
+    """No standalone A-D (or a non-string) means no choice was made."""
+    assert extract_choice_letter(prediction) is None  # type: ignore[arg-type]

@@ -9,7 +9,7 @@ third-party import — ``sacrebleu`` — is deferred *inside* :func:`gleu` /
 :func:`bleu`, exactly like the rest of the container-only ML stack is
 lazy-imported elsewhere in :mod:`sloth.tune`.
 
-Four capabilities
+Five capabilities
 ------------------
 1. :func:`score_constraints` — evaluate a prediction against a list of
    instruction constraints (``max_words``, ``min_words``, ``must_contain``,
@@ -28,6 +28,10 @@ Four capabilities
    ``docs/dgx-spark.md``); calling either without it installed raises
    :class:`~sloth.cli._errors.CliError` with a remediation hint instead of an
    ``ImportError``.
+5. :func:`extract_choice_letter` — pull the answer letter (``A``–``D``) out of a
+   multiple-choice prediction, so a letter-choice suite (e.g.
+   ``examples/eval/mmlu-subset.jsonl``) is scored on the *choice* the model made
+   rather than on a whole-string exact match.
 """
 
 from __future__ import annotations
@@ -479,3 +483,67 @@ def bleu(prediction: str, expected: str) -> float:
     """
     sacrebleu = _require_sacrebleu()
     return sacrebleu.sentence_bleu(prediction, [expected]).score
+
+
+# ---------------------------------------------------------------------------
+# 5. Multiple-choice letter extraction (MMLU-style suites)
+# ---------------------------------------------------------------------------
+
+#: Matches an ``A``-``D`` (or ``a``-``d``) that stands alone — not glued to
+#: another letter or digit. ``"Answer: B"``, ``"(B)"``, ``"B."``, ``"**B**"`` and
+#: a bare ``"B"`` all match; the ``A`` inside ``"Answer"`` does not.
+_CHOICE_LETTER_RE = re.compile(r"(?<![A-Za-z0-9])([A-Da-d])(?![A-Za-z0-9])")
+
+#: Matches an explicit answer marker followed by the letter, e.g.
+#: ``"Answer: B"``, ``"answer is (c)"``, ``"The correct option — D"``. Checked
+#: before the bare-letter scan so a prose preamble containing a standalone
+#: ``"a"`` (the English article) cannot win over a stated answer.
+_CHOICE_MARKER_RE = re.compile(
+    r"\b(?:answer|option|choice)\b[^A-Za-z0-9]{0,8}([A-Da-d])(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def extract_choice_letter(prediction: str) -> str | None:
+    """Return the multiple-choice letter (``"A"``-``"D"``) *prediction* picks, or ``None``.
+
+    Letter-choice suites (an ``expected_output`` that is a single ``A``-``D``)
+    ask the model to "answer with the letter", but models answer in prose:
+    ``"B"``, ``"B."``, ``"(B)"``, ``"Answer: B"``, ``"The answer is b."`` all
+    mean the same choice. This is the tolerant reader that turns any of them
+    into ``"B"``, so :func:`sloth.tune._trainer._extra_metrics_for` can score a
+    ``choice_match`` per row without changing exact-match semantics.
+
+    Resolution order — the first rule that fires wins:
+
+    1. an explicit marker (``answer``/``option``/``choice``) followed within a
+       few punctuation/space characters by a standalone ``A``-``D``;
+    2. the first standalone **upper-case** ``A``-``D``;
+    3. the first standalone **lower-case** ``a``-``d``, upper-cased.
+
+    Upper-case is preferred over lower-case in the unmarked case because a
+    lower-case standalone ``"a"`` is far more often the English article than an
+    answer. This is a heuristic, not a parser: a prose answer that never states
+    a letter returns ``None`` (scored as a miss), and a sentence that opens with
+    a standalone capital ``"A"`` before naming its real choice will be read as
+    ``"A"``. Terse, letter-first answers — what the suite prompt asks for — are
+    read correctly.
+
+    Returns ``None`` for a non-string, an empty string, or text with no
+    standalone ``A``-``D`` in it.
+    """
+    if not isinstance(prediction, str) or not prediction:
+        return None
+
+    marked = _CHOICE_MARKER_RE.search(prediction)
+    if marked is not None:
+        return marked.group(1).upper()
+
+    lower_fallback: str | None = None
+    for match in _CHOICE_LETTER_RE.finditer(prediction):
+        letter = match.group(1)
+        if letter.isupper():
+            return letter
+        if lower_fallback is None:
+            lower_fallback = letter
+    return lower_fallback.upper() if lower_fallback else None

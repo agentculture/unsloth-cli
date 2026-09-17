@@ -273,6 +273,37 @@ uv run sloth export --adapter runs/qlora-smoke --output runs/qlora-smoke-export
 The first real run creates the in-container venv and installs the dep layer
 (a few minutes); the HF cache and the venv make subsequent runs faster.
 
+## Warm-cache check for `sloth bench`
+
+`sloth bench` downloads the benchmark's dataset and the model weights **once**,
+into the host Hugging Face cache that `build_command` bind-mounts at
+`/opt/hf-cache` (with `HF_HOME` pointed at it). A second run must not download
+anything. The check:
+
+```bash
+# 1st run — populates ~/.cache/huggingface (dataset + weights)
+uv run sloth bench --adapter runs/qlora-smoke --limit 20 2> bench-1.log
+
+# 2nd run — identical command, warm cache
+uv run sloth bench --adapter runs/qlora-smoke --limit 20 2> bench-2.log
+
+grep -ciE 'downloading|resolving data files|%\|' bench-1.log   # > 0 on the cold run
+grep -ciE 'downloading|resolving data files|%\|' bench-2.log   # 0 on the warm run
+```
+
+The second log carrying **no** download/progress lines is the pass condition.
+To make it an enforced property rather than an observation, add `--offline`:
+that sets `HF_HUB_OFFLINE=1` in the container, so any attempted fetch fails
+loudly instead of silently re-downloading.
+
+```bash
+uv run sloth bench --adapter runs/qlora-smoke --limit 20 --offline
+```
+
+If the cache is not being reused, check that `~/.cache/huggingface` exists and
+is readable — `build_command` adds the mount only when the directory is present
+(see "Model re-downloads every run" in Troubleshooting below).
+
 ## Troubleshooting
 
 | Symptom | Cause / fix |

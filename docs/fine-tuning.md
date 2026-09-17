@@ -92,6 +92,35 @@ Exit codes: `0` success; `1` user-input error (missing/incomplete adapter,
 unsupported `--format`, bad `--quant`, non-empty `--output` without `--force`);
 `2` environment error (container exits non-zero, insufficient disk space).
 
+### `sloth bench --adapter <dir> --benchmark mmlu`
+
+Where `sloth eval` scores your own local suite, `sloth bench` scores the
+**standard public benchmark**: it runs the lm-evaluation-harness (`lm_eval`,
+part of the container's benchmark dep layer) inside the NGC container and writes
+`<target>/eval/mmlu.json` in the *same* result shape a suite produces — flat
+`acc` / `acc_norm` / `exact_match_pct` / `total`, plus `per_subject` and a
+`harness` provenance block — so `sloth summarize` and `sloth compare` fold a
+benchmark in with no special-casing. `--adapter` benches a LoRA/QLoRA adapter
+against the base model recorded in its `training_metadata.json`
+(`pretrained=<base>,peft=<dir>`, with `load_in_4bit=True` for a QLoRA run);
+`--model` benches a merged/exported directory. If the harness cannot load the
+4-bit-base + PEFT-adapter combination, the run exits `2` with a `hint:` naming
+the fallback — export merged to 16-bit and bench that directory with `--model`.
+`--limit N` shrinks a run to a smoke test, and `--offline` forbids network
+access outright (see the warm-cache check in [`dgx-spark.md`](dgx-spark.md)).
+For a network-free, MMLU-*style* check there is also
+`examples/eval/mmlu-subset.jsonl` — 120 committed, original lettered questions
+across 12 subjects, scored through `sloth eval --suite`, which detects an
+all-letter answer key and reports `choice_acc_pct` on the letter the model
+picked.
+
+```bash
+sloth bench --adapter runs/qlora-smoke --benchmark mmlu            # full 5-shot MMLU
+sloth bench --adapter runs/qlora-smoke --limit 20 --json           # smoke run
+sloth bench --model runs/qlora-smoke-export --offline              # merged export, no network
+sloth eval  --adapter runs/qlora-smoke --suite examples/eval/mmlu-subset.jsonl
+```
+
 ## Dataset schemas
 
 Two JSONL schemas, validated **before** any GPU time; the schema is inferred from

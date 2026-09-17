@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import statistics
 import tempfile
 import time
@@ -846,15 +847,96 @@ def _resolve_tool_call_family(model_id: str | None, override: str | None) -> str
         ) from exc
 
 
+#: Per-row key set by the letter-choice scorer (see :func:`_choice_metrics`) and
+#: folded into ``choice_acc_pct`` by :func:`choice_acc_pct`.
+CHOICE_KEY = "choice_match"
+
+_CHOICE_EXPECTED_RE = re.compile(r"^[A-Da-d]$")
+
+
+def _is_choice_record(record: dict[str, Any]) -> bool:
+    """True when *record*'s ``expected_output`` is a single ``A``-``D`` letter."""
+    expected = record.get("expected_output")
+    return isinstance(expected, str) and bool(_CHOICE_EXPECTED_RE.match(expected.strip()))
+
+
+def is_choice_suite(records: Sequence[dict[str, Any]]) -> bool:
+    """True when *every* record in the suite answers with a single ``A``-``D`` letter.
+
+    This is what switches a suite into letter-choice scoring (MMLU-style, e.g.
+    ``examples/eval/mmlu-subset.jsonl``). It is deliberately all-or-nothing: one
+    prose row means the file is a normal task suite that happens to contain a
+    one-letter answer, and scoring it on extracted letters would be wrong.
+    An empty suite is not a choice suite.
+    """
+    return bool(records) and all(_is_choice_record(record) for record in records)
+
+
+def _choice_metrics(record: dict[str, Any], prediction: str) -> dict[str, Any]:
+    """Score one letter-choice row: did *prediction* pick the expected letter?"""
+    expected = str(record.get("expected_output") or "").strip().upper()
+    chosen = scorers.extract_choice_letter(prediction)
+    return {CHOICE_KEY: bool(expected) and chosen == expected}
+
+
+def choice_acc_pct(rows: Sequence[dict[str, Any]]) -> float | None:
+    """Return the percentage of *rows* whose extracted answer letter was correct.
+
+    ``None`` when no row carries :data:`CHOICE_KEY` (an ordinary task/chat suite
+    has no letter to extract), so the caller leaves the key off the payload
+    entirely rather than reporting a misleading ``0``. Mirrors
+    :func:`compliance_pct` exactly.
+    """
+    flags = [bool(row[CHOICE_KEY]) for row in rows if CHOICE_KEY in row]
+    if not flags:
+        return None
+    return round(sum(flags) / len(flags) * 100, 2)
+
+
+def _with_choice_metrics(base):
+    """Compose *base* (possibly ``None``) with the letter-choice scorer."""
+    if base is None:
+        return _choice_metrics
+
+    def scored(record: dict[str, Any], prediction: str) -> dict[str, Any]:
+        merged = dict(base(record, prediction))
+        merged.update(_choice_metrics(record, prediction))
+        return merged
+
+    return scored
+
+
 def _extra_metrics_for(
-    schema: str, *, model_id: str | None = None, tool_call_family: str | None = None
+    schema: str,
+    *,
+    model_id: str | None = None,
+    tool_call_family: str | None = None,
+    records: Sequence[dict[str, Any]] | None = None,
 ):
     """Return the per-row ``extra_metrics`` callable for *schema* (``None`` if any).
 
     ``chat``/``task`` suites are scored by exact match and token F1 alone. The
     three richer schemas each add one boolean key — see :data:`COMPLIANCE_KEYS`
     — which :func:`compliance_pct` folds into the suite-level percentage.
+
+    When *records* is supplied and every one of them answers with a single
+    ``A``-``D`` letter (:func:`is_choice_suite`), a :data:`CHOICE_KEY` boolean is
+    added on top of whatever the schema already scores: the prediction's answer
+    letter is extracted with
+    :func:`sloth.tune.scorers.extract_choice_letter` and compared to the
+    expected one. ``exact_match`` keeps its whole-string meaning — the letter
+    comparison lives in its own key, rolled up as ``choice_acc_pct``.
     """
+    base = _extra_metrics_for_schema(schema, model_id=model_id, tool_call_family=tool_call_family)
+    if records is not None and is_choice_suite(records):
+        return _with_choice_metrics(base)
+    return base
+
+
+def _extra_metrics_for_schema(
+    schema: str, *, model_id: str | None = None, tool_call_family: str | None = None
+):
+    """The schema-driven half of :func:`_extra_metrics_for` (no choice scoring)."""
     if schema == "instruction":
 
         def score_instruction(record: dict[str, Any], prediction: str) -> dict[str, Any]:
@@ -932,6 +1014,9 @@ def build_file_entry(
     pct = compliance_pct(scored)
     if pct is not None:
         entry["compliance_pct"] = pct
+    choice_pct = choice_acc_pct(scored)
+    if choice_pct is not None:
+        entry["choice_acc_pct"] = choice_pct
     if perplexity is not None:
         entry["perplexity"] = perplexity
     return entry
@@ -949,6 +1034,9 @@ def build_summary(
     pct = compliance_pct(summary["results"])
     if pct is not None:
         summary["compliance_pct"] = pct
+    choice_pct = choice_acc_pct(summary["results"])
+    if choice_pct is not None:
+        summary["choice_acc_pct"] = choice_pct
     perplexities = [f["perplexity"] for f in files if f.get("perplexity") is not None]
     if perplexities:
         summary["perplexity"] = round(sum(perplexities) / len(perplexities), 4)
@@ -1228,7 +1316,10 @@ def run_eval(
         records = validate_dataset(Path(suite_file), schema=schema)
         # Resolved BEFORE generation so an unknown tool-call family costs no GPU.
         extra_metrics = _extra_metrics_for(
-            schema, model_id=base_model_name, tool_call_family=tool_call_family
+            schema,
+            model_id=base_model_name,
+            tool_call_family=tool_call_family,
+            records=records,
         )
         generation = _generate_predictions(
             torch,

@@ -33,6 +33,8 @@ buildable/deployable package baseline. Clone it, rename the package, edit
 - `unsloth-cli eval` — score an adapter against a local task-schema eval suite
   (a file or a directory of them).
 - `unsloth-cli export` — export an adapter to a PEFT/safetensors layout.
+- `unsloth-cli bench` — score an adapter or model on a standard benchmark
+  (MMLU via `lm_eval`, in the NGC container).
 - `unsloth-cli runs list` / `runs show <run_id>` — enumerate/inspect past runs
   from the run registry (`<runs-root>/runs.jsonl`) — no directory walking.
 - `unsloth-cli summarize <run_id|dir>` — one JSON summary of a past run
@@ -404,6 +406,101 @@ for a plain bf16 merged directory or a GGUF).
 - `2` environment / setup error (ML stack not installed, llama.cpp missing, OOM)
 """
 
+_BENCH = """\
+# unsloth-cli bench
+
+Score a trained adapter — or a merged / exported model directory — on a
+**standard public benchmark**. Where `unsloth-cli eval` scores your own local
+suite, `bench` runs the lm-evaluation-harness (`lm_eval`) so the number is the
+one everyone else quotes. MMLU is the shipped benchmark (`--benchmark mmlu`,
+5-shot by default).
+
+The harness runs **inside the NGC container**, where the benchmark dependency
+layer (`lm_eval`, `sacrebleu`) is installed; the host process imports no
+torch/`lm_eval` at all. The in-container command is, verbatim:
+
+    lm_eval --model hf \\
+        --model_args pretrained=<base>[,peft=<adapter>][,load_in_4bit=True] \\
+        --tasks mmlu --num_fewshot 5 [--limit N] \\
+        --output_path <tmp> --log_samples
+
+## Two targets: `--adapter` or `--model`
+
+Exactly one is required — passing both, or neither, exits `1` with a `hint:`.
+
+- `--adapter DIR` benches a LoRA/QLoRA adapter against the base model recorded
+  in its `training_metadata.json` (`model`), adding `load_in_4bit=True` when
+  that run's `hyperparameters.load_in_4bit` was set. Falls back to
+  `adapter_config.json`'s `base_model_name_or_path`.
+- `--model DIR` benches a merged / exported directory directly
+  (`pretrained=<dir>`).
+
+**If the QLoRA path cannot be loaded** — whether `lm_eval`'s `hf` backend
+accepts a 4-bit base wrapped with a PEFT adapter depends on the installed
+`peft`/`bitsandbytes` pair — the run exits `2` with a `hint:` naming the
+fallback: export the adapter merged to 16-bit
+(`unsloth-cli export --format merged16`) and bench that directory with
+`--model`. Both outcomes are supported by design.
+
+## Result shape
+
+One run writes `<target>/eval/<benchmark>.json` in the **same shape** a suite
+result uses, so `unsloth-cli summarize` and `unsloth-cli compare` fold a
+benchmark in with no special-casing:
+
+- `acc` — overall accuracy, `0..1`.
+- `acc_norm` — length-normalised accuracy when the harness reports one; `null`
+  for MMLU, which reports plain `acc` only (the key is always present, never
+  invented).
+- `exact_match_pct` — `acc * 100`, the flat percentage every suite carries.
+- `total` — samples actually scored (`--limit` aware).
+- `per_subject` — `{subject: {acc, acc_norm, total}}` for each sub-task
+  (MMLU's 57 subjects, with the `mmlu_` prefix stripped).
+- `harness` — `{name, version, tasks, limit, num_fewshot}`: the provenance of
+  the number.
+
+## Usage
+
+    unsloth-cli bench --adapter adapters/qwen3-4b-qlora --benchmark mmlu
+    unsloth-cli bench --model exports/qwen3-4b-merged16 --limit 20 --json
+    unsloth-cli bench --adapter adapters/qwen3-4b-qlora --offline
+
+## Key flags
+
+- `--adapter DIR` / `--model DIR` — the target (exactly one).
+- `--benchmark NAME` — the benchmark to run; also names the result file
+  `eval/<NAME>.json` (default: `mmlu`).
+- `--tasks SPEC` — the `lm_eval` task spec (default: the `--benchmark` name).
+- `--num-fewshot N` — few-shot examples per task (default: `5`, MMLU's
+  standard); `0` is zero-shot, a negative value exits `1`.
+- `--limit N` — score only the first `N` documents per task, for smoke runs;
+  must be `>= 1` or the run exits `1` before any container launch.
+- `--offline` — set `HF_HUB_OFFLINE=1` in the container so the harness cannot
+  reach the network at all. Requires a warm Hugging Face cache; see the
+  warm-cache check in `docs/dgx-spark.md`.
+- `--json` — emit the payload as structured JSON.
+
+## MMLU without the network
+
+`examples/eval/mmlu-subset.jsonl` is a committed, MMLU-**style** letter-choice
+suite (original questions, not MMLU rows) scored through the ordinary suite
+path — `unsloth-cli eval --adapter <dir> --suite examples/eval/mmlu-subset.jsonl`.
+A suite whose every `expected_output` is a single `A`-`D` letter is scored on
+the *letter the model picked* (extracted from `"B"`, `"B."`, `"(B)"`,
+`"Answer: B"`, …) and reports `choice_acc_pct` alongside the usual
+`exact_match_pct`.
+
+## Exit codes
+
+- `0` success
+- `1` user-input error (both/neither target, a missing directory, a `--limit`
+  below `1`, a negative `--num-fewshot`, or an adapter whose base model cannot
+  be determined)
+- `2` environment / setup error (docker/GPU unavailable, `lm_eval` missing, the
+  harness exiting non-zero — including the 4-bit + PEFT load path failing, whose
+  `hint:` names the merged-16-bit fallback)
+"""
+
 _EXPORT = """\
 # unsloth-cli export
 
@@ -621,6 +718,7 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("train",): _TRAIN,
     ("eval",): _EVAL,
     ("export",): _EXPORT,
+    ("bench",): _BENCH,
     ("runs",): _RUNS,
     ("runs", "list"): _RUNS,
     ("runs", "show"): _RUNS,
