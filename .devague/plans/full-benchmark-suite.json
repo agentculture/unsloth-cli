@@ -1,0 +1,772 @@
+{
+  "slug": "full-benchmark-suite",
+  "title": "full benchmark suite",
+  "frame_slug": "full-benchmark-suite",
+  "schema_version": 5,
+  "status": "exported",
+  "created": "2026-09-17T04:09:32Z",
+  "updated": "2026-09-17T04:15:14Z",
+  "targets": [
+    {
+      "id": "c1",
+      "kind": "announcement",
+      "text": "unsloth-cli ships a full benchmark suite: sloth eval scores target-task accuracy, holdout generalization, a regression set against the base model, instruction following, structured-output/tool-call compliance, held-out perplexity/loss, per-item latency + tok/s, and standard benchmarks (MMLU), each suite recorded side by side and summarized/compared across runs",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h1",
+      "kind": "honesty",
+      "text": "every benchmark family in the announcement is measured by a real run on the DGX Spark and its numbers appear in docs/benchmarks.md; no family is announced on the strength of unit tests alone",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c2",
+      "kind": "requirement",
+      "text": "the eval scoring pipeline gains an open metrics dict: today sloth/tune/metrics.py:106-118 score_records hard-codes exact_match + f1, summary.py:131-141 _eval_summary reduces to exact_match_pct/f1/file_count, compare.py:57 _EVAL_KEYS=(exact_match_pct, f1) and eval.py:306-312 _render_text print only those, so every new metric kind (accuracy, perplexity, BLEU, compliance rate, latency) must pass through all four without per-key edits",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h2",
+      "kind": "honesty",
+      "text": "adding a metric key to score_records surfaces it in eval.json, summarize --json, compare --json and the text renderers with no edit to summary.py, compare.py or eval.py",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c3",
+      "kind": "requirement",
+      "text": "eval results become suite-keyed and retained side by side: metrics.py:38 EVAL_JSON_NAME='eval.json' is one flat file per target dir overwritten on every run (metrics.py:178-184 docstring), summary.py:107-128 read_eval reads only that name, and no suite name or batch_size field exists (only suite_paths/target/written_at) \u2014 a suite id, batch size and per-suite file (e.g. eval/<suite>.json) are required so target-task, holdout, regression, instruction-following and compliance suites coexist on one adapter (extends issue #28 item 2)",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h3",
+      "kind": "honesty",
+      "text": "two sloth eval runs with different --suite (or --batch-size) against the same adapter leave both result files on disk, each carrying suite name, batch_size, target and written_at, and summarize lists both",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c4",
+      "kind": "requirement",
+      "text": "held-out loss / perplexity: _trainer.py:291-310 builds only train_dataset and SFTConfig/SFTTrainer receive no eval_dataset, eval_strategy or eval_steps; trainer.train()'s TrainOutput is discarded and metadata.py:114-124 records no loss; the eval path (run_eval / run_eval_model) only generates text \u2014 a forward-pass loss/perplexity over a held-out JSONL and a loss history in training_metadata.json are required",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h4",
+      "kind": "honesty",
+      "text": "a training run with an [eval] holdout configured records eval loss at eval_steps in training_metadata.json, and sloth eval --perplexity <suite> returns exp(mean token NLL) computed by a forward pass with labels, never by generation",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c5",
+      "kind": "requirement",
+      "text": "holdout split + train/eval overlap check live in the pure-stdlib core: sloth/tune/datasets.py has validators (chat 103-143, task 146-184), detect_schema (192-201), validate_dataset/validate_suite, but no split function, no seed, and no cross-file dedup; a seeded holdout split and a hash-based exact-duplicate check between the training file and every eval suite run before the container launches (same GPU-free gate as schema validation)",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h5",
+      "kind": "honesty",
+      "text": "the holdout split is deterministic for a given seed (same rows every run) and sloth eval refuses (exit 1, error:/hint:) when any suite row exactly duplicates a training row, before any container launch",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c6",
+      "kind": "requirement",
+      "text": "instruction-following and structured-output/tool-call suites need new record schemas and stdlib scorers: datasets.py:34 TASK_KEYS={task,input,expected_output} is string-in/string-out only, with no field for format constraints, refusal expectation, JSON schema or expected tool call; eval.py:172 validates suites with schema='task' hard-coded and chat-schema suites are rejected \u2014 new suite kinds (e.g. constraints[], json_schema, expected_tool_call) with json.loads/regex/schema-shape scorers are required, still pure stdlib in metrics.py",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h6",
+      "kind": "honesty",
+      "text": "instruction-following suites carry machine-checkable constraints (max words, required/forbidden substrings, must-refuse, JSON-only) and structured-output suites carry a JSON schema or expected tool call; scoring is pure stdlib and reports a per-suite compliance rate",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c7",
+      "kind": "requirement",
+      "text": "regression set = one fixed capability suite scored against both the untouched base model and the adapter, with sloth compare gaining a base-vs-adapter mode and a pass/fail threshold: today compare.py:108-137 is run-vs-run only, a base model never evaluated has no eval.json so _eval_deltas returns {} silently (compare.py:75-76), and eval --model requires an exported directory (eval.py:97-147 _resolve_target) so evaluating the raw HF base needs a no-op export first",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h7",
+      "kind": "honesty",
+      "text": "sloth compare --base <hf-model-or-dir> <adapter> evaluates the untouched base on every suite the adapter has, emits per-suite deltas, and exits non-zero when a regression suite drops below the configured threshold",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c8",
+      "kind": "requirement",
+      "text": "latency + tok/s: the offline eval path records per-item wall clock and generated-token counts in _trainer.py:447-488 _generate_predictions (greedy, max_new_tokens=100 at :351, batch 8 at :354; outputs[row] and max_new_tokens already in scope, no perf_counter anywhere) and writes them into the suite result; the serving-side tok/s + TTFT figure is obtained by calling lobes-cli's run_benchmark (lobes/assess.py:569-598, output {model,endpoint,decode_rates[],prefill{}}) against the exported model, not reimplemented",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h8",
+      "kind": "honesty",
+      "text": "every eval result row carries generated_tokens and latency_ms measured around model.generate, the suite summary carries median latency and aggregate tok/s, and the serving figure comes from lobes benchmark (documented hand-off), not from code in this repo",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h26",
+      "kind": "honesty",
+      "text": "latency_ms is defined per batch-wall-time / rows and every result row carries the batch_size it was measured under; the benchmarks doc reports serial (batch 1) latency as the per-item figure and batch-8 throughput as tok/s, never mixing the two",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c9",
+      "kind": "requirement",
+      "text": "standard benchmarks (MMLU) run inside the NGC container via a harness added to container.py's DEP_LAYER tuples (97-107 / 119-123) with a live-measured exact pin per docs/dgx-spark.md:88-131; the container has default bridge networking (no --network flag in container.py:410-460) and mounts the host HF cache at /opt/hf-cache (container.py:148-151), so the MMLU dataset is fetched once and reused; zero references to lm_eval/MMLU/IFEval/sacrebleu exist in unsloth-cli or lobes-cli today",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h9",
+      "kind": "honesty",
+      "text": "MMLU runs inside the NGC container with the harness pinned to a version measured live on nvcr.io/nvidia/pytorch:25.11-py3, recorded in docs/tested.md, and a second run with a warm HF cache completes without re-downloading the dataset",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c10",
+      "kind": "requirement",
+      "text": "BLEU/GLEU (or any third-party scorer) is lazy-imported inside a function in a separate module, never in sloth/tune/metrics.py: tests/test_lazy_import.py:174-198 test_metrics_module_imports_only_stdlib AST-checks that every top-level import in metrics.py is stdlib, and test_packaging_import_light.py:78-92 repeats it at package level; the sanctioned pattern is _trainer._load_backend / _exporter._load_eval_backend",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h10",
+      "kind": "honesty",
+      "text": "no non-stdlib import appears at module top level in sloth/tune/metrics.py or any sloth/tune core module; BLEU-family scorers import their library inside the function and raise CliError(code=2) with an install hint when it is absent",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c11",
+      "kind": "requirement",
+      "text": "the /finetune loop and the explain catalog follow the new suites: .claude/skills/finetune/scripts/finetune.sh:217 issues one hard-coded 'eval --adapter --suite --json' call with a single string --suite (120-126) and forwards no --batch-size/--model; sloth/explain/catalog.py:273+ _EVAL and the _ROOT verb list (21-45) are hand-written, so every new verb (e.g. bench) or eval flag needs catalog text and a register() line in sloth/cli/__init__.py:93-113",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h11",
+      "kind": "honesty",
+      "text": "finetune.sh run accepts repeated --suite and forwards --batch-size; explain eval (and any new verb) documents every new flag; teken cli doctor . --strict stays green",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c12",
+      "kind": "requirement",
+      "text": "docs/benchmarks.md gains one measured section per benchmark family; today it reports train samples/s + steps/s (43, 56, not token-normalised), per-format exact/F1 (106-156) and lists MMLU/BLEU/perplexity nowhere; its 'What is not yet benchmarked' section (193-201) already admits the per-format table is 0/46 on a 10-step smoke adapter",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h12",
+      "kind": "honesty",
+      "text": "docs/benchmarks.md has one measured table per family (target-task, holdout, regression, instruction-following, structured-output, perplexity, latency/tok-s, MMLU), each row stating model, adapter steps, batch size and date",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c13",
+      "kind": "requirement",
+      "text": "tests reuse the existing GPU-free fakes: tests/test_tune_trainer.py:706-784 _FakeTokenizer/_FakeEvalModel/_install_fake_ml for the adapter path, tests/test_cmd_eval.py:928-1002 _fake_backend/_EvalBackend for the --model path, and tests/test_gpu_smoke.py:36-65,144 @pytest.mark.gpu + subprocess CUDA probe for any real-GPU benchmark test",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h13",
+      "kind": "honesty",
+      "text": "all new metric code is covered without a GPU via _install_fake_ml / _fake_backend, and the only GPU-gated tests are the live smoke rows",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c14",
+      "kind": "boundary",
+      "text": "[project].dependencies stays empty (pyproject.toml:16; CLAUDE.md 'GPU stack: NGC container, not a pip dep'): every benchmark library (lm-eval harness, sacrebleu, evaluate) lives only in container.py's in-container dep tuples, never as a host dependency",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h14",
+      "kind": "honesty",
+      "text": "pyproject.toml [project].dependencies remains [] and uv tool install unsloth-cli on aarch64 without a GPU still succeeds",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c15",
+      "kind": "boundary",
+      "text": "the pinned window transformers==4.57.1 / peft==0.18.0 / trl==0.24.0 / datasets==4.8.5 is not floated (docs/dgx-spark.md:66-86 peft>=0.19 \u2192 torchao>0.16 \u2192 torch>=2.11 deadlock on NGC 25.11 torch 2.10); any harness whose resolver conflicts with it is installed --no-deps like unsloth/bitsandbytes, and its pin is measured live in the container, not guessed from PyPI",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h15",
+      "kind": "honesty",
+      "text": "uv pip list inside the container after the dep layer still shows transformers 4.57.1, peft 0.18.0, trl 0.24.0, datasets 4.8.5 and the container torch 2.10",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c18",
+      "kind": "boundary",
+      "text": "runs.jsonl (registry.py:99-139) stays a training-run index (run_id, config_hash, dataset digest, timing, status) \u2014 benchmark results live in the run's output directory beside training_metadata.json, discovered by summarize/compare, not copied into the registry line",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h16",
+      "kind": "honesty",
+      "text": "runs.jsonl records gain no eval fields; sloth runs show still reads only the registry and exports index",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c19",
+      "kind": "audience",
+      "text": "agents and operators driving the /finetune loop (Claude/colleague backends) who need a machine-readable verdict on whether an adapter improved its target behaviour without degrading the base model, plus the lobes/colleague siblings that decide whether to serve it",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h17",
+      "kind": "honesty",
+      "text": "the /finetune skill and colleague can consume the verdict from sloth compare --json alone (no text parsing), and docs/fine-tuning.md shows the agent path first",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c20",
+      "kind": "after_state",
+      "text": "sloth eval scores one adapter across several named suites in one invocation, each retained under its own name with batch size and metrics, sloth summarize renders all of them, and sloth compare reports per-suite deltas between the base model and the adapter with a pass/fail verdict",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h18",
+      "kind": "honesty",
+      "text": "one sloth eval invocation with several --suite values writes one result file per suite under the adapter dir, and sloth summarize --json lists every suite with its batch_size and metrics",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c21",
+      "kind": "before_state",
+      "text": "sloth eval scores exactly one metric family (exact match + token F1) on task-schema suites, overwrites a single eval.json per directory, computes no loss/perplexity/latency, cannot score instruction-following or structured output, and has no base-vs-adapter regression check (sloth/tune/metrics.py:106-118, summary.py:131-141, compare.py:57, _trainer.py:291-310)",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h19",
+      "kind": "honesty",
+      "text": "the before-state is reproducible from main at a072b88: eval.json holds only exact_match/f1 keys and a second eval overwrites the first",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c22",
+      "kind": "why_it_matters",
+      "text": "a fine-tune that raises target-task accuracy while silently degrading base capabilities, breaking JSON output or halving tok/s is worse than no fine-tune; today the repo cannot detect any of those, and its only accuracy table is 0/46 on a smoke adapter (docs/benchmarks.md:193-201)",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h20",
+      "kind": "honesty",
+      "text": "the delivery doc shows at least one case where the new suites catch a degradation (regression, compliance or latency) that exact match + F1 alone would have missed",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c23",
+      "kind": "success_signal",
+      "text": "on a multi-hundred-step adapter, sloth compare base adapter --json reports target-task exact match > 0 with a positive delta, regression-suite delta >= -2 percentage points, structured-output compliance >= 95%, per-item median latency within 10% of base, and held-out perplexity lower than the base model's; all numbers stated with batch size and reproduced in docs/benchmarks.md",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h21",
+      "kind": "honesty",
+      "text": "every threshold in the success signal is checked by a real run on the #28 adapter and the measured values, with batch size, are recorded in docs/benchmarks.md; a missed threshold is reported as failing, not softened",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c28",
+      "kind": "requirement",
+      "text": "the holdout split must produce scorable rows: every shipped training set is chat-schema (examples/lora-smoke.toml, qlora-smoke.toml, lfm2-lora.toml all set dataset = examples/chat-smoke.jsonl) while eval scores task rows only, so a split of a chat corpus yields rows sloth eval cannot score today \u2014 either chat-schema eval (render all but the last assistant turn, score against it) ships with c5, or the split emits task rows from the final assistant turn; the overlap check in c5 must likewise normalise across schemas (chat final-assistant content vs expected_output)",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h22",
+      "kind": "honesty",
+      "text": "sloth eval on a holdout split from a chat-schema training file scores every row (no schema rejection), and the overlap check catches a chat row whose final assistant content equals a task row's expected_output",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c30",
+      "kind": "requirement",
+      "text": "base-vs-adapter compare never holds both models resident: on the Spark's unified memory a 1.2B LoRA train already OOMs at backend init while lobes vLLM holds ~90 of 121 GB (eidetic record unsloth-cli-followups-22-livetest-gotchas), so sloth compare --base runs the base eval and the adapter eval as two sequential container invocations and an OOM in either maps to CliError(code=2) with the memory hint that _trainer.py already emits",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h24",
+      "kind": "honesty",
+      "text": "sloth compare --base issues two separate container runs (visible in the fake launcher call list) and a simulated CUDA OOM in the second exits 2 with the memory hint, leaving the first run's result file intact",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c31",
+      "kind": "requirement",
+      "text": "regression and perplexity deltas compare like with like: for a QLoRA adapter (load_in_4bit, config.py) the base run uses the same 4-bit quantised base, and for a LoRA adapter the bf16 base, and every result file records the base precision \u2014 otherwise dequantisation noise is counted as adapter regression",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h25",
+      "kind": "honesty",
+      "text": "sloth compare exits 1 with a hint when the base and adapter result files disagree on base precision, and docs/benchmarks.md states the precision on every delta row",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c32",
+      "kind": "boundary",
+      "text": "the stdlib structured-output checker implements a documented JSON Schema subset (type, required, properties, enum, items, additionalProperties) \u2014 not full Draft 2020-12; rows using unsupported keywords are rejected at validate time with a hint, never silently passed",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h27",
+      "kind": "honesty",
+      "text": "sloth validate rejects a structured-output row whose schema uses a keyword outside the documented subset, and the subset is listed in explain eval",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c33",
+      "kind": "requirement",
+      "text": "results carry schema_version and summarize/compare keep reading the legacy flat eval.json written by runs before this change, so older adapters on disk stay summarisable and comparable; a run directory holding both a legacy eval.json and eval/<suite>.json files reports the legacy file as suite 'legacy'",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h28",
+      "kind": "honesty",
+      "text": "sloth summarize and sloth compare on a run directory produced at a072b88 (flat eval.json only) exit 0 and report its metrics unchanged",
+      "deferred": false,
+      "deferred_reason": ""
+    }
+  ],
+  "tasks": [
+    {
+      "id": "t1",
+      "summary": "metrics core: open metrics dict, schema_version, suite-keyed result files",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "sloth/tune/metrics.py: score_records returns an open metrics dict per row and summarize/aggregate fold any numeric metric key without naming it; a fake metric registered in a test appears in the aggregate",
+        "write_eval_json(directory, suite, payload, batch_size=...) writes eval/<suite>.json carrying schema_version=2, suite, batch_size, target, written_at, base_load_in_4bit; a second call with another suite leaves the first file intact",
+        "metrics.py passes test_metrics_module_imports_only_stdlib unchanged"
+      ],
+      "deps": [],
+      "covers": [
+        "c2",
+        "h2",
+        "c3",
+        "h3",
+        "c33",
+        "h28"
+      ],
+      "instruction": "Keep the legacy EVAL_JSON_NAME constant exported for readers (t5 handles legacy reads). Suite name = the suite file/dir stem, sanitised to [a-z0-9-]. Aggregate keys: exact_match_pct, f1 stay; add any numeric metric generically as mean. Tests go in tests/test_tune_metrics.py (new file)."
+    },
+    {
+      "id": "t2",
+      "summary": "datasets core: seeded holdout split, cross-schema overlap check, new suite schemas + JSON-Schema-subset validation",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "sloth/tune/datasets.py: split_holdout(path, fraction, seed) returns identical partitions on repeated calls with the same seed and writes <stem>.train.jsonl/<stem>.holdout.jsonl; chat rows split into task rows (prompt = all but final assistant turn rendered as text, expected_output = final assistant content) so the holdout is scorable",
+        "overlap_check(train_path, suite_paths) normalises chat and task rows to (prompt, expected_output) and returns file:line of every duplicate; sloth-level callers raise CliError(code=1) with a hint naming them",
+        "validate_suite accepts three new schemas: instruction (task keys + constraints[] of {max_words|min_words|must_contain|must_not_contain|must_refuse|json_only}), structured ({task,input,json_schema} with the documented subset type/required/properties/enum/items/additionalProperties; any other keyword -> validation error naming it) and toolcall ({task,input,expected_tool_call:{name,arguments}})",
+        "tests/test_tune_datasets.py covers all three criteria; module stays stdlib-only"
+      ],
+      "deps": [],
+      "covers": [
+        "c5",
+        "h5",
+        "c28",
+        "h22",
+        "c6",
+        "c32",
+        "h27"
+      ],
+      "instruction": "Do not touch metrics.py or _trainer.py. Keep detect_schema backwards compatible: existing chat/task files still detect as before. Document each new schema in the module docstring; t14 copies that text into the catalog."
+    },
+    {
+      "id": "t3",
+      "summary": "config: [eval] section (holdout_fraction, seed, eval_steps, perplexity) and [eval.thresholds] baseline",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "sloth/tune/config.py: load_config reads [eval] with defaults holdout_fraction=0.0, eval_steps=0 (off), perplexity=false, and [eval.thresholds] with defaults regression_drop_pp=2.0, compliance_min_pct=95.0, latency_max_ratio=1.10, min_suite_rows=100; unknown keys raise the existing config error with a hint",
+        "RunConfig exposes eval and thresholds as frozen dataclasses; tests/test_tune_config.py covers defaults, overrides and rejection; sloth config init template documents the keys"
+      ],
+      "deps": [],
+      "covers": [
+        "c23"
+      ],
+      "instruction": "Follow the existing [hyperparameters] parsing style. The thresholds baseline values come from frame decision c36 and are the single source the docs cite. Keep tomllib-only."
+    },
+    {
+      "id": "t4",
+      "summary": "scorers module: instruction constraints, JSON-schema-subset checker, per-family tool-call parser registry, lazy GLEU/BLEU",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "sloth/tune/scorers.py (new, stdlib at top level): score_constraints(prediction, constraints) -> {passed: bool, failed: [names]}; check_json_subset(prediction, schema) -> {valid: bool, errors: [...]} for the documented subset; parse_tool_call(prediction, family) via a registry with at least qwen3 and lfm2 parsers, unknown family raises ValueError listing supported families",
+        "gleu(prediction, expected) and bleu(...) import sacrebleu inside the function and raise CliError(code=2, 'install sacrebleu in the container dep layer') when absent; tests monkeypatch sys.modules to prove both paths",
+        "tests/test_tune_scorers.py (new) has one fixture per parser family; tests/test_lazy_import.py stays green"
+      ],
+      "deps": [],
+      "covers": [
+        "c6",
+        "h6",
+        "c10",
+        "h10",
+        "c32"
+      ],
+      "instruction": "Parsers: qwen3 = <tool_call>{json}</tool_call> blocks; lfm2 = the LFM2.5 tool-call token wrapper (read the tokenizer chat template in the HF cache for the exact tokens; cite it in the docstring). Family detection helper: family_for_model(model_id) by substring, overridable via [eval] tool_call_family."
+    },
+    {
+      "id": "t5",
+      "summary": "summary + summarize: read every eval/<suite>.json plus legacy eval.json, open metric pass-through, per-suite text render",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "sloth/tune/summary.py: read_eval returns {suite_name: payload} from eval/*.json and maps a flat legacy eval.json to suite 'legacy'; build_summary['eval'] = {'suites': {...}, plus top-level exact_match_pct/f1 taken from the 'target' suite when present else the first suite} so existing readers of summary['eval']['f1'] keep working",
+        "a fixture run dir copied from a run at a072b88 (flat eval.json only) summarises with unchanged exact_match_pct/f1 (covers h19); a mixed dir reports both",
+        "sloth summarize text output prints one block per suite with every numeric metric key, batch_size and base precision; tests/test_tune_summary.py + tests/test_cmd_summarize.py updated; runs.jsonl RunRecord fields unchanged (tests/test_runs_registry.py)"
+      ],
+      "deps": [
+        "t1"
+      ],
+      "covers": [
+        "c3",
+        "h3",
+        "c2",
+        "h2",
+        "c33",
+        "h28",
+        "c18",
+        "h16",
+        "c21",
+        "h19",
+        "c20",
+        "h18"
+      ],
+      "instruction": "This is the compatibility seam for frame park v1: additive nesting, never drop the flat keys. Do not edit compare.py here (t10 owns it)."
+    },
+    {
+      "id": "t6",
+      "summary": "eval loop: latency + token counts, chat-schema rendering, perplexity forward pass, base precision recorded (adapter and --model paths)",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "sloth/tune/_trainer.py _generate_predictions returns per-row generated_tokens and latency_ms = batch wall time / rows measured with time.perf_counter around model.generate; run_eval and _exporter.run_eval_model both write them, plus suite-level median_latency_ms and tokens_per_s, plus batch_size and base_load_in_4bit into the result",
+        "run_eval scores instruction/structured/toolcall/chat suites by delegating to sloth.tune.scorers and eval_prompt renders chat rows via the tokenizer chat template with add_generation_prompt",
+        "run_perplexity(model, tokenizer, suite) returns exp(mean token NLL) from a labelled forward pass, never from generate; fake-backend tests in tests/test_tune_trainer.py and tests/test_cmd_eval.py cover every criterion"
+      ],
+      "deps": [
+        "t1",
+        "t4"
+      ],
+      "covers": [
+        "c8",
+        "h8",
+        "h26",
+        "c4",
+        "c28",
+        "h22",
+        "c31"
+      ],
+      "instruction": "Keep the shared-plumbing contract between _trainer.py and _exporter.py (comment at _trainer.py:344-348). No change to _run_real here (t7 owns training-time eval). Perplexity on the --model path is only for transformers-loadable exports; GGUF returns a CliError(code=1) with a hint."
+    },
+    {
+      "id": "t7",
+      "summary": "training-time eval: eval_dataset + eval_steps into SFTTrainer, loss history into training_metadata.json",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "sloth/tune/_trainer.py _run_real: when config.eval.holdout_fraction > 0 the dataset is split via datasets.split_holdout and SFTTrainer receives eval_dataset with eval_strategy='steps' and eval_steps=config.eval.eval_steps; fake-backend test asserts the kwargs",
+        "sloth/tune/metadata.py records loss_history (step, train_loss, eval_loss) from trainer.state.log_history and final_train_loss; holdout split path + seed recorded so the run is reproducible"
+      ],
+      "deps": [
+        "t6",
+        "t2",
+        "t3"
+      ],
+      "covers": [
+        "c4",
+        "h4"
+      ],
+      "instruction": "Serialised after t6 because both touch _trainer.py. Read log_history from trainer.state, not TrainOutput, so eval losses are included."
+    },
+    {
+      "id": "t8",
+      "summary": "eval CLI: repeated --suite by name, --perplexity, --batch-size in results, overlap refusal before container launch, tool-call family flag",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "sloth eval --adapter X --suite A --suite B writes eval/A.json and eval/B.json in one invocation; --json output lists suites with their metrics; text output prints one block per suite",
+        "sloth eval --train-dataset <path> (or the dataset recorded in training_metadata.json when present) runs datasets.overlap_check and exits 1 with a file:line hint before any docker invocation (fake launcher asserts zero calls)",
+        "--perplexity and --tool-call-family flags are forwarded in-container; --batch-size is recorded in every result; tests/test_cmd_eval.py covers all criteria"
+      ],
+      "deps": [
+        "t1",
+        "t2",
+        "t4"
+      ],
+      "covers": [
+        "c3",
+        "c5",
+        "h5",
+        "c6",
+        "c20",
+        "h18"
+      ],
+      "instruction": "Suite name derives from the path stem; collisions (two suites with one stem) exit 1 with a hint. Keep --in-container recursion guard untouched."
+    },
+    {
+      "id": "t9",
+      "summary": "compare --base: sequential base and adapter container runs, per-suite deltas, thresholds from config, precision guard, exit codes",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "sloth compare --base <hf-id-or-dir> <adapter-dir> [--config run.toml] evaluates the base on every suite the adapter has via two separate container invocations (fake launcher records two calls), then emits deltas per suite and per metric",
+        "exit 1 with hint when a regression-tagged suite drops more than thresholds.regression_drop_pp, when compliance < compliance_min_pct, when median latency ratio > latency_max_ratio, or when a suite has fewer rows than min_suite_rows; the applied thresholds are echoed in --json",
+        "exit 1 with hint when base_load_in_4bit differs between the two result sets; simulated OOM on the second run exits 2 with the memory hint and leaves the first result on disk; tests/test_cmd_compare.py covers all criteria"
+      ],
+      "deps": [
+        "t5",
+        "t8"
+      ],
+      "covers": [
+        "c7",
+        "h7",
+        "c30",
+        "h24",
+        "c31",
+        "h25",
+        "c23",
+        "h21"
+      ],
+      "instruction": "Base eval of a raw HF id needs no export: run the --model path with a no-adapter load inside the container; write its results under <adapter>/eval-base/<suite>.json. Thresholds default to the c36 baseline when no --config is given."
+    },
+    {
+      "id": "t10",
+      "summary": "suites + demo corpus: regression, instruction-following, structured-output, tool-call suites and the demo training corpus",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "examples/eval/regression.jsonl (>= 100 general-capability task rows), instruction-following.jsonl (>= 50 constraint rows incl. must_refuse), structured-output.jsonl (>= 50 json_schema rows), tool-call.jsonl (>= 30 rows) all pass sloth validate",
+        "examples/demo-corpus.jsonl (chat schema, >= 500 rows) whose rows teach the answers in examples/eval/agentculture-terms.jsonl, cli-contract.jsonl and task-format.jsonl without duplicating any eval row (overlap_check returns none); provenance and licence stated in examples/README.md"
+      ],
+      "deps": [
+        "t2"
+      ],
+      "covers": [],
+      "instruction": "Derive the demo corpus from this repo's own docs (CLAUDE.md, docs/fine-tuning.md, explain catalog) and the AgentCulture terminology the suites test; paraphrase, never copy eval rows. Regression rows should be generic (arithmetic, short QA, formatting) so a base model scores well."
+    },
+    {
+      "id": "t11",
+      "summary": "external dataset option: train/eval accept a Hugging Face Hub dataset id or a path outside the repo",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "run-config dataset = 'hf:<org>/<name>[:split]' resolves inside the container through the mounted HF cache via datasets.load_dataset and is rendered to the chat or task schema by a documented column mapping in [run.dataset_map]; a local path outside the repo is mounted read-only",
+        "sloth validate on an hf: dataset validates the mapped first N rows without a container launch when the dataset is already cached, else exits 2 with a hint; tests/test_cmd_validate.py + tests/test_cmd_train.py cover it with the fake launcher"
+      ],
+      "deps": [
+        "t3"
+      ],
+      "covers": [],
+      "instruction": "Keep sloth/tune/datasets.py stdlib: the HF load happens in _trainer.py behind the lazy backend; datasets.py only validates rendered rows. training_metadata.json records the hf id + revision instead of a sha256 for hub datasets."
+    },
+    {
+      "id": "t12",
+      "summary": "container dep layer: add lm_eval + sacrebleu pins, live-validate against NGC 25.11, record in docs/tested.md + docs/dgx-spark.md",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "sloth/tune/container.py: a new DEP_LAYER_BENCH_PACKAGES tuple (lm_eval==<measured>, sacrebleu==<measured>) is installed in _inner_script after DEP_LAYER_PACKAGES; tests/test_tune_container.py asserts the install line contains it",
+        "docs/tested.md gains a dated row with the uv pip list output showing transformers 4.57.1, peft 0.18.0, trl 0.24.0, datasets 4.8.5, nv torch 2.10 still present after the bench layer; docs/dgx-spark.md pin-bump section names the new tuple",
+        "pyproject.toml [project].dependencies is still []; tests/test_packaging_import_light.py green"
+      ],
+      "deps": [],
+      "covers": [
+        "c9",
+        "h9",
+        "c14",
+        "h14",
+        "c15",
+        "h15"
+      ],
+      "instruction": "Run the real install inside docker run --rm --gpus all nvcr.io/nvidia/pytorch:25.11-py3 on this Spark before pinning (frame lapse l1: the host-side resolve is not evidence; frame assumption c29 is what you are verifying). If lm_eval drags a conflicting transformers/torch, install it --no-deps and list its runtime deps explicitly like unsloth."
+    },
+    {
+      "id": "t13",
+      "summary": "bench verb: MMLU via lm_eval in the container plus the vendored MMLU-subset suite",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "sloth bench --adapter|--model <dir> --benchmark mmlu [--limit N] runs lm_eval inside the container and writes eval/mmlu.json in the same result shape (metrics dict incl. acc, acc_norm, per-subject) so summarize/compare pick it up; fake launcher test asserts the in-container command",
+        "examples/eval/mmlu-subset.jsonl (>= 100 rows, licence noted in examples/README.md) scores through sloth eval --suite with letter-choice extraction; sloth explain bench exists and teken cli doctor . --strict stays green",
+        "a second bench run with a warm HF cache makes no network download (documented check in docs/dgx-spark.md)"
+      ],
+      "deps": [
+        "t12",
+        "t8"
+      ],
+      "covers": [
+        "c9",
+        "h9",
+        "c11"
+      ],
+      "instruction": "Register in sloth/cli/__init__.py at the marked spot; catalog entry in sloth/explain/catalog.py plus the _ROOT verb list. Resolve frame park v4 here: try lm_eval's hf backend with peft= + load_in_4bit on the QLoRA fixture; if it fails, bench the merged-16bit export and state that in the docs."
+    },
+    {
+      "id": "t14",
+      "summary": "finetune skill loop, catalog, rubric gate and CPU-only test pass",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        ".claude/skills/finetune/scripts/finetune.sh run accepts repeated --suite and forwards --batch-size, --perplexity and --base (compare step added as step 5); tests/test_finetune_skill_script.py covers repeated --suite and the compare step",
+        "sloth explain eval / compare / bench / config document every new flag, schema and threshold key; uv run teken cli doctor . --strict passes",
+        "uv run pytest -n auto on a CPU-only box passes with the gpu tests skipped and coverage >= 60; only tests under tests/test_gpu_smoke.py are gpu-marked"
+      ],
+      "deps": [
+        "t8",
+        "t9",
+        "t13"
+      ],
+      "covers": [
+        "c11",
+        "h11",
+        "c13",
+        "h13"
+      ],
+      "instruction": "SKILL.md step table gains the compare step and the suite list; keep the loop stop-on-first-nonzero behaviour."
+    },
+    {
+      "id": "t15",
+      "summary": "docs: fine-tuning.md agent-first eval path, README fine-tune vs retrieval boundary, serving hand-off to lobes",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "docs/fine-tuning.md shows the agent path first: sloth eval --json -> sloth compare --base --json verdict, with the JSON shape and exit codes, before any human-oriented text",
+        "docs/benchmarks.md gains a 'Serving latency + tok/s' section that cites the exact lobes benchmark command and its output shape and states the hand-off is a manual operator step; README explains which suite catches which regression"
+      ],
+      "deps": [
+        "t14"
+      ],
+      "covers": [
+        "c19",
+        "h17"
+      ],
+      "instruction": "Cite lobes/assess.py run_benchmark output keys verbatim (model, endpoint, decode_rates, prefill). Do not invent numbers: the live-run task fills the measured tables."
+    },
+    {
+      "id": "t16",
+      "summary": "live run on the Spark: train the fixture adapter, score every suite and MMLU, base-vs-adapter compare, fill docs/benchmarks.md, delivery doc, close #28 items 1-2",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "a >= 300-step LoRA on examples/demo-corpus.jsonl (LFM2.5-1.2B via examples/lfm2-lora.toml or Qwen3-1.7B) exists under a documented run dir with training_metadata.json incl. loss_history; sloth compare --base reports target-task exact match > 0 with a positive delta",
+        "docs/benchmarks.md has one measured table per family (target-task, holdout, regression, instruction-following, structured-output, tool-call, perplexity, latency/tok-s at batch 1 and 8, MMLU) each row stating model, steps, batch size, base precision, date and the command; the per-format quantization-loss table is re-scored with at least one non-zero exact-match row; the batched-vs-serial outcome is stated",
+        "the delivery doc under docs/deliveries/ shows at least one degradation the new suites caught that exact/F1 missed (h20), reports every missed c23 threshold as failing, and issue #28 items 1-2 are referenced as closed by it"
+      ],
+      "deps": [
+        "t7",
+        "t10",
+        "t11",
+        "t15"
+      ],
+      "covers": [
+        "c1",
+        "h1",
+        "c12",
+        "h12",
+        "c22",
+        "h20",
+        "c23",
+        "h21"
+      ],
+      "instruction": "Free UMA first (lobes vLLM resident: see eidetic record unsloth-cli-followups-22-livetest-gotchas item 3). Run serially: train, eval all suites at batch 8 and batch 1, bench mmlu, compare --base. If a threshold fails, record it failing; do not tune thresholds to pass."
+    }
+  ],
+  "risks": [
+    {
+      "id": "r1",
+      "text": "demo corpus quality: if the >= 300-step adapter still scores 0 on target-task rows the success signal fails and the corpus (not the metrics) must be reworked; no second corpus is planned",
+      "kind": "unknown_nonblocking",
+      "task_id": "t10",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r2",
+      "text": "summary['eval'] additive nesting (t5) is the chosen resolution of frame park v1; any agent that iterates summary['eval'] keys generically will see the new 'suites' key",
+      "kind": "unknown_nonblocking",
+      "task_id": "t5",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r3",
+      "text": "t6 and t7 both edit _trainer.py and are serialised by dependency; t8 and t10 both edit CLI tests fixtures \u2014 verify disjoint files at fan-out",
+      "kind": "unknown_nonblocking",
+      "task_id": null,
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r4",
+      "text": "lm_eval 0.4.13's hf backend may not load a bitsandbytes 4-bit base + peft adapter; fallback is benching the merged-16bit export (frame park v4)",
+      "kind": "unknown_nonblocking",
+      "task_id": "t13",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r5",
+      "text": "UMA headroom for the live run: lobes vLLM resident (~90 of 121 GB) OOMs a 1.2B train; the live run needs the box freed or the page-cache trick, and its numbers depend on what else is resident",
+      "kind": "unknown_nonblocking",
+      "task_id": "t16",
+      "resolved": false,
+      "resolution": ""
+    }
+  ],
+  "obligations": []
+}
