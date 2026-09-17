@@ -90,6 +90,7 @@ _TASK_SPEC_RE = re.compile(r"^[A-Za-z0-9_,.-]+$")
 
 #: A Hugging Face repo id, ``org/name``. Deliberately narrower than the hub's own
 #: rules: no commas, no ``=``, no shell metacharacters.
+_LOCAL_PATH_RE = re.compile(r"^[A-Za-z0-9._~/-]+$")
 _HF_REPO_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 #: Characters that would break out of one ``--model_args`` fragment into another
@@ -145,14 +146,18 @@ def _validate_model_reference(value: str, label: str) -> str:
                 "Hugging Face repo id of the form org/name."
             ),
         )
-    if Path(text).exists() or _HF_REPO_ID_RE.match(text):
+    # No filesystem probe here (a missing directory surfaces as lm_eval's own
+    # load error): a reference is either an HF repo id or a plain path made of
+    # safe characters that cannot start a new argv flag.
+    if _HF_REPO_ID_RE.match(text) or (_LOCAL_PATH_RE.match(text) and not text.startswith("-")):
         return text
     raise CliError(
         code=EXIT_USER_ERROR,
         message=f"invalid {label} reference: {text!r}",
         remediation=(
-            "Pass an existing local directory, or a Hugging Face repo id of the form "
-            "org/name (letters, digits, '.', '_' and '-' only)."
+            "Pass a local directory path (letters, digits, '/', '.', '_', '~' and '-' "
+            "only, not starting with '-'), or a Hugging Face repo id of the form "
+            "org/name."
         ),
     )
 

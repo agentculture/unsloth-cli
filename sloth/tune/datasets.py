@@ -951,7 +951,7 @@ def split_holdout(
     indices = list(range(len(records)))
     # Deterministic dataset shuffling, not a security/cryptographic use of
     # randomness — reproducibility (same seed -> same split) is the goal.
-    random.Random(seed).shuffle(indices)  # NOSONAR: seeded split, not security  # nosec B311
+    random.Random(seed).shuffle(indices)  # nosec B311  # NOSONAR
     holdout_count = round(len(records) * fraction)
     holdout_count = max(0, min(holdout_count, len(records)))
     holdout_index_set = set(indices[:holdout_count])

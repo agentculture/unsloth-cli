@@ -285,7 +285,7 @@ def _parse_qwen3_tool_call(prediction: str) -> dict[str, Any]:
     template also accepts (and re-emits verbatim) a JSON-encoded *string*, so
     this parser decodes it a second time when needed.
     """
-    # NOSONAR: the reluctant `.*?` is required here -- `arguments` is itself a JSON
+    # The reluctant `.*?` is required here (NOSONAR below) -- `arguments` is itself a JSON
     # object, so a negated class like `[^}]*` would stop at the first inner `}` and
     # fail to match any nested tool call. The `\}\s*</tool_call>` tail bounds it.
     match = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", prediction, re.DOTALL)  # NOSONAR

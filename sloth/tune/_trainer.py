@@ -850,7 +850,7 @@ def _scorable_row(record: dict[str, Any], schema: str) -> dict[str, Any]:
     row = dict(record)
     if schema == "chat":
         messages = list(record.get("messages") or [])
-        last = messages[-1] if messages else None
+        last = next(reversed(messages), None)
         if last is not None and last.get("role") == "assistant":
             expected = last["content"]
             prompt_messages = messages[:-1]
