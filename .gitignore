@@ -237,3 +237,7 @@ runs/
 unsloth_compiled_cache/
 
 .devague/questions/
+
+# holdout splits written by `sloth train` when [eval] holdout_fraction > 0 (deterministic from seed)
+examples/*.train.jsonl
+examples/*.holdout.jsonl

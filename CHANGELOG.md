@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-09-17
+
+### Added
+
+- Full benchmark suite (plan `full-benchmark-suite`, spec
+  `docs/specs/2026-09-16-full-benchmark-suite.md`): `sloth eval` scores several
+  **named** suites per invocation and keeps each result under
+  `eval/<suite>.json` (schema_version 2, `batch_size`, base precision, per-row
+  `generated_tokens` / `latency_ms`, suite-level `median_latency_ms` /
+  `tokens_per_s`); an open metrics dict so new metric keys flow through
+  `summarize` / `compare` / `--json` untouched; three new suite schemas —
+  `instruction` (constraints incl. `must_refuse`), `structured` (a documented
+  JSON-Schema subset) and `toolcall` (per-model-family parsers, `qwen3` and
+  `lfm2`) — scored by the new stdlib `sloth.tune.scorers` with a
+  `compliance_pct`; chat-schema suites; `--perplexity` (labelled forward pass);
+  lazy-imported GLEU/BLEU; a seeded holdout split (`[eval] holdout_fraction`)
+  with training-time `eval_loss` and a `loss_history` in
+  `training_metadata.json`; a train/eval overlap refusal before any container
+  launch; `sloth compare --base <ref> <adapter>` (two sequential container
+  runs, per-suite deltas, `[eval.thresholds]` baseline, precision guard, exit
+  1 on a failed gate); `sloth bench --benchmark mmlu` through
+  lm-evaluation-harness in the container (`lm_eval==0.4.13`,
+  `sacrebleu==2.6.0` added to the dep layer, live-validated on NGC 25.11);
+  external `hf:<org>/<name>` datasets with `[run.dataset_map]`; four new
+  suites plus a demo corpus and an MMLU-style subset under `examples/`
+  (`examples/generate_suites.py`, `examples/generate_mmlu_subset.py`); the
+  `/finetune` loop forwards repeated `--suite`, `--batch-size`, `--perplexity`
+  and a `--base` compare step.
+
+### Changed
+
+- `sloth validate --suite` detects each file's schema (deviation d1) instead of
+  forcing the task schema, so a directory may mix suite kinds.
+- `sloth eval --json` now emits `{"suites": {<name>: <payload>}}`; `summarize`
+  keeps the flat `exact_match_pct` / `f1` keys and adds `eval.suites`.
+
 ## [0.8.2] - 2026-09-15
 
 ### Added
