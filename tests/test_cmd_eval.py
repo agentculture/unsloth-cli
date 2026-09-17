@@ -1606,6 +1606,8 @@ def test_run_eval_model_signature_keeps_backward_compatible_keywords() -> None:
     params = inspect.signature(exporter_mod.run_eval_model).parameters
     for name in ("perplexity", "tool_call_family", "base_load_in_4bit"):
         assert params[name].default is None or params[name].default is False
+
+
 # t8 — repeated --suite by name, per-suite eval/<name>.json, --perplexity,
 # --tool-call-family, and the train/eval overlap refusal.
 # ---------------------------------------------------------------------------
@@ -2223,3 +2225,68 @@ class TestBatchSizeRecordedInResult:
         for name in ("suite", "b"):
             record = json.loads((tmp_adapter / "eval" / f"{name}.json").read_text())
             assert record["batch_size"] == 4
+
+
+# ---------------------------------------------------------------------------
+# Integration of t6 (per-file seam results) with t8 (named suites): the CLI must
+# split the seam's ``files`` entries by suite instead of duplicating the aggregate
+# under every name (which would clobber the trainer's own eval/<stem>.json).
+# ---------------------------------------------------------------------------
+
+
+class TestNamedResultsSplitPerSuite:
+    @staticmethod
+    def _seam_payload(paths: list[Path]) -> dict[str, Any]:
+        from sloth.tune import metrics
+
+        files = []
+        for i, p in enumerate(paths):
+            rows = [
+                {
+                    "index": i,
+                    "task": "t",
+                    "input": "i",
+                    "expected_output": "a",
+                    "prediction": "a" if i == 0 else "b",
+                    "exact_match": i == 0,
+                    "f1": 1.0 if i == 0 else 0.0,
+                    "file": str(p),
+                }
+            ]
+            files.append(metrics.file_entry(p, rows))
+        payload = metrics.aggregate(files)
+        payload["batch_size"] = 4
+        payload["base_load_in_4bit"] = True
+        return payload
+
+    def test_single_file_suites_get_their_own_file_entry(self, tmp_path: Path) -> None:
+        from sloth.cli._commands.eval import _normalize_named_results
+
+        a, b = tmp_path / "alpha.jsonl", tmp_path / "beta.jsonl"
+        raw = self._seam_payload([a, b])
+        named = _normalize_named_results(raw, ["alpha", "beta"], {"alpha": [a], "beta": [b]})
+        assert named["alpha"]["exact_match"] == 1 and named["beta"]["exact_match"] == 0
+        assert named["alpha"]["total"] == 1 and named["beta"]["total"] == 1
+        # run-level fields are carried onto every suite payload
+        assert named["alpha"]["batch_size"] == 4 and named["beta"]["base_load_in_4bit"] is True
+        # and the aggregate is NOT duplicated under both names
+        assert named["alpha"] is not named["beta"]
+
+    def test_directory_suite_aggregates_its_files(self, tmp_path: Path) -> None:
+        from sloth.cli._commands.eval import _normalize_named_results
+
+        d = tmp_path / "suite-dir"
+        d.mkdir()
+        a, b = d / "one.jsonl", d / "two.jsonl"
+        raw = self._seam_payload([a, b])
+        named = _normalize_named_results(raw, ["suite-dir"], {"suite-dir": [a, b]})
+        assert named["suite-dir"]["total"] == 2
+        assert named["suite-dir"]["exact_match"] == 1
+        assert [f["path"] for f in named["suite-dir"]["files"]] == [str(a), str(b)]
+
+    def test_flat_payload_without_files_is_duplicated(self) -> None:
+        from sloth.cli._commands.eval import _normalize_named_results
+
+        raw = {"total": 1, "exact_match": 1, "exact_match_pct": 100.0, "f1": 1.0}
+        named = _normalize_named_results(raw, ["x", "y"], {"x": [], "y": []})
+        assert named == {"x": raw, "y": raw}

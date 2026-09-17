@@ -577,20 +577,66 @@ def _call_eval_seam(
 
 
 def _normalize_named_results(
-    raw_result: dict[str, Any], suite_names: list[str]
+    raw_result: dict[str, Any],
+    suite_names: list[str],
+    named_suites: dict[str, list[Path]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Normalize a seam/launch return value into ``{suite_name: payload}``.
 
-    If *raw_result* is already suite-keyed (``{"suites": {...}}`` — the shape a
-    richer seam, or this module's own in-container JSON emission, produces),
-    that inner mapping is returned as-is. Otherwise *raw_result* is the older,
-    single-payload shape and is duplicated under every name in *suite_names* —
-    a faithful (if not per-suite-precise) fallback until every seam reports
-    per-suite results natively.
+    Three input shapes are accepted, in order of preference:
+
+    * already suite-keyed (``{"suites": {...}}`` — this module's own in-container
+      JSON emission): the inner mapping is returned as-is;
+    * the seams' aggregate shape carrying per-file entries (``{"files": [{"path",
+      ...}, ...], ...}`` — what :func:`sloth.tune._trainer.run_eval` and
+      :func:`sloth.tune._exporter.run_eval_model` return): each named suite gets
+      **its own** files' scores — the single file entry when the suite named one
+      file, or :func:`metrics.aggregate` over its files when it named a
+      directory — so a multi-suite run never reports one suite's numbers under
+      another suite's name. Run-level fields the file entries lack
+      (``batch_size``, ``base_load_in_4bit``, ``model_dir``, ``quant_*``) are
+      copied onto every suite payload;
+    * a flat payload with no ``files`` (a legacy/test double): duplicated under
+      every name in *suite_names* — a faithful, if not per-suite-precise, fallback.
     """
     if isinstance(raw_result, dict) and "suites" in raw_result:
         return dict(raw_result["suites"])
-    return {name: raw_result for name in suite_names}
+    files = raw_result.get("files") if isinstance(raw_result, dict) else None
+    if not (isinstance(files, list) and files and named_suites):
+        return {name: raw_result for name in suite_names}
+
+    by_path: dict[str, dict[str, Any]] = {}
+    for entry in files:
+        path = entry.get("path") if isinstance(entry, dict) else None
+        if isinstance(path, str):
+            by_path[str(Path(path).resolve())] = entry
+    run_level = {
+        key: value
+        for key, value in raw_result.items()
+        if key in _RUN_LEVEL_KEYS and key not in ("results", "files")
+    }
+    named: dict[str, dict[str, Any]] = {}
+    for name in suite_names:
+        entries = [
+            by_path[str(p.resolve())]
+            for p in named_suites.get(name, [])
+            if str(p.resolve()) in by_path
+        ]
+        if not entries:
+            named[name] = raw_result
+            continue
+        payload = dict(entries[0]) if len(entries) == 1 else metrics.aggregate(entries)
+        for key, value in run_level.items():
+            payload.setdefault(key, value)
+        named[name] = payload
+    return named
+
+
+#: Run-level keys the seams set once per invocation (not per file) that every
+#: per-suite payload should still carry.
+_RUN_LEVEL_KEYS = frozenset(
+    {"batch_size", "base_load_in_4bit", "model_dir", "quant_method", "quant_format", "target"}
+)
 
 
 def _write_named_eval_json(
@@ -598,6 +644,7 @@ def _write_named_eval_json(
     named_results: dict[str, dict[str, Any]],
     *,
     batch_size: int,
+    base_load_in_4bit: bool | None = None,
 ) -> None:
     """Write ``<target_dir>/eval/<name>.json`` for every suite in *named_results*.
 
@@ -607,7 +654,13 @@ def _write_named_eval_json(
     """
     for name, payload in named_results.items():
         try:
-            metrics.write_eval_json(target_dir, name, payload, batch_size=batch_size)
+            metrics.write_eval_json(
+                target_dir,
+                name,
+                payload,
+                batch_size=batch_size,
+                base_load_in_4bit=base_load_in_4bit,
+            )
         except OSError as exc:
             emit_diagnostic(f"note: could not write eval/{name}.json: {exc}")
 
@@ -698,7 +751,7 @@ def cmd_eval(args: argparse.Namespace) -> int | None:
             perplexity=perplexity,
             tool_call_family=tool_call_family,
         )
-        named_results = _normalize_named_results(raw_result, suite_names)
+        named_results = _normalize_named_results(raw_result, suite_names, named_suites)
         if json_mode:
             emit_result({"suites": named_results}, json_mode=True)
         else:
@@ -731,8 +784,15 @@ def cmd_eval(args: argparse.Namespace) -> int | None:
             tool_call_family=tool_call_family,
         )
 
-    named_results = _normalize_named_results(raw_result, suite_names)
-    _write_named_eval_json(target.directory, named_results, batch_size=batch_size)
+    named_results = _normalize_named_results(raw_result, suite_names, named_suites)
+    _write_named_eval_json(
+        target.directory,
+        named_results,
+        batch_size=batch_size,
+        base_load_in_4bit=(
+            raw_result.get("base_load_in_4bit") if isinstance(raw_result, dict) else None
+        ),
+    )
 
     # --- emit results (always suite-keyed) ------------------------------------
     if json_mode:
