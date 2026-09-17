@@ -1439,6 +1439,17 @@ class TestChatSuiteEval:
         assert result["results"][0]["expected_output"] == "pong"
         assert result["exact_match"] == 1
 
+    def test_scorable_row_tolerates_an_empty_message_list(self) -> None:
+        """An empty ``messages`` list must not IndexError -- it scores as no expectation."""
+        row = _trainer._scorable_row({"messages": []}, "chat")
+        assert row["task"] == "chat"
+        assert row["expected_output"] == ""
+        assert row["input"] == _trainer.render_chat_prompt([])
+
+    def test_scorable_row_tolerates_a_missing_message_list(self) -> None:
+        row = _trainer._scorable_row({}, "chat")
+        assert row["expected_output"] == ""
+
     def test_eval_prompt_falls_back_without_a_tokenizer(self) -> None:
         record = {
             "messages": [

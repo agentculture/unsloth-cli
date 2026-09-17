@@ -53,6 +53,7 @@ import os
 import random
 from collections import defaultdict
 from pathlib import Path
+from typing import Callable
 
 from sloth.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 
@@ -341,13 +342,8 @@ def _validate_instruction_record(record: object, line_no: int) -> None:
             _validate_constraint(constraint, idx, line_no)
 
 
-def _validate_json_schema_subset(schema: object, line_no: int, path: str) -> None:
-    """Raise CliError if *schema* uses a keyword outside the documented subset.
-
-    Recognised keywords: ``type``, ``required``, ``properties``, ``enum``,
-    ``items``, ``additionalProperties``. ``properties`` values and ``items``
-    are validated recursively as nested schemas.
-    """
+def _as_schema_dict(schema: object, line_no: int, path: str) -> dict:
+    """Return *schema* as a dict, rejecting a non-object or an unsupported keyword."""
     if not isinstance(schema, dict):
         raise CliError(
             code=EXIT_USER_ERROR,
@@ -365,7 +361,11 @@ def _validate_json_schema_subset(schema: object, line_no: int, path: str) -> Non
                 f"{sorted(JSON_SCHEMA_SUBSET_KEYWORDS)}."
             ),
         )
+    return schema
 
+
+def _check_schema_type(schema: dict, line_no: int, path: str) -> None:
+    """``"type"`` must name a JSON-Schema type, i.e. be a string."""
     if "type" in schema and not isinstance(schema["type"], str):
         raise CliError(
             code=EXIT_USER_ERROR,
@@ -373,15 +373,22 @@ def _validate_json_schema_subset(schema: object, line_no: int, path: str) -> Non
             remediation='"type" must be a JSON-Schema type name, e.g. "object" or "string".',
         )
 
-    if "required" in schema:
-        required = schema["required"]
-        if not isinstance(required, list) or not all(isinstance(r, str) for r in required):
-            raise CliError(
-                code=EXIT_USER_ERROR,
-                message=f'line {line_no}: {path}["required"] must be a list of strings',
-                remediation='"required" must be a JSON array of property-name strings.',
-            )
 
+def _check_schema_required(schema: dict, line_no: int, path: str) -> None:
+    """``"required"`` must be a list of property-name strings."""
+    if "required" not in schema:
+        return
+    required = schema["required"]
+    if not isinstance(required, list) or not all(isinstance(r, str) for r in required):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f'line {line_no}: {path}["required"] must be a list of strings',
+            remediation='"required" must be a JSON array of property-name strings.',
+        )
+
+
+def _check_schema_additional_properties(schema: dict, line_no: int, path: str) -> None:
+    """``"additionalProperties"`` must be a boolean in this subset."""
     if "additionalProperties" in schema and not isinstance(schema["additionalProperties"], bool):
         raise CliError(
             code=EXIT_USER_ERROR,
@@ -389,6 +396,9 @@ def _validate_json_schema_subset(schema: object, line_no: int, path: str) -> Non
             remediation='"additionalProperties" must be true or false.',
         )
 
+
+def _check_schema_enum(schema: dict, line_no: int, path: str) -> None:
+    """``"enum"`` must be a list of allowed values."""
     if "enum" in schema and not isinstance(schema["enum"], list):
         raise CliError(
             code=EXIT_USER_ERROR,
@@ -396,21 +406,46 @@ def _validate_json_schema_subset(schema: object, line_no: int, path: str) -> Non
             remediation='"enum" must be a JSON array of allowed values.',
         )
 
-    if "properties" in schema:
-        properties = schema["properties"]
-        if not isinstance(properties, dict):
-            raise CliError(
-                code=EXIT_USER_ERROR,
-                message=f'line {line_no}: {path}["properties"] must be a JSON object',
-                remediation='"properties" must map property names to nested schemas.',
-            )
-        for prop_name, prop_schema in properties.items():
-            _validate_json_schema_subset(
-                prop_schema, line_no, f'{path}["properties"]["{prop_name}"]'
-            )
 
-    if "items" in schema:
-        _validate_json_schema_subset(schema["items"], line_no, f'{path}["items"]')
+def _check_schema_properties(schema: dict, line_no: int, path: str) -> None:
+    """``"properties"`` must map names to schemas; each nested schema recurses."""
+    if "properties" not in schema:
+        return
+    properties = schema["properties"]
+    if not isinstance(properties, dict):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f'line {line_no}: {path}["properties"] must be a JSON object',
+            remediation='"properties" must map property names to nested schemas.',
+        )
+    for prop_name, prop_schema in properties.items():
+        _validate_json_schema_subset(prop_schema, line_no, f'{path}["properties"]["{prop_name}"]')
+
+
+#: Per-keyword checkers run by :func:`_validate_json_schema_subset`, in report order.
+_SCHEMA_KEYWORD_CHECKS: tuple[Callable[[dict, int, str], None], ...] = (
+    _check_schema_type,
+    _check_schema_required,
+    _check_schema_additional_properties,
+    _check_schema_enum,
+    _check_schema_properties,
+)
+
+
+def _validate_json_schema_subset(schema: object, line_no: int, path: str) -> None:
+    """Raise CliError if *schema* uses a keyword outside the documented subset.
+
+    Recognised keywords: ``type``, ``required``, ``properties``, ``enum``,
+    ``items``, ``additionalProperties``. ``properties`` values and ``items``
+    are validated recursively as nested schemas.
+    """
+    schema_dict = _as_schema_dict(schema, line_no, path)
+
+    for check in _SCHEMA_KEYWORD_CHECKS:
+        check(schema_dict, line_no, path)
+
+    if "items" in schema_dict:
+        _validate_json_schema_subset(schema_dict["items"], line_no, f'{path}["items"]')
 
 
 def _validate_structured_record(record: object, line_no: int) -> None:
@@ -916,7 +951,7 @@ def split_holdout(
     indices = list(range(len(records)))
     # Deterministic dataset shuffling, not a security/cryptographic use of
     # randomness — reproducibility (same seed -> same split) is the goal.
-    random.Random(seed).shuffle(indices)  # nosec B311
+    random.Random(seed).shuffle(indices)  # NOSONAR: seeded split, not security  # nosec B311
     holdout_count = round(len(records) * fraction)
     holdout_count = max(0, min(holdout_count, len(records)))
     holdout_index_set = set(indices[:holdout_count])
@@ -976,6 +1011,38 @@ def _normalize_row_for_overlap(record: object) -> tuple[str, str] | None:
     return None
 
 
+def _collect_overlap_locations(
+    scan_path: Path, locations: dict[tuple[str, str], list[str]]
+) -> None:
+    """Record every normalisable row of *scan_path* under its ``(prompt, expected)`` key.
+
+    An unreadable file, a blank line, a line that is not JSON, and a row that
+    :func:`_normalize_row_for_overlap` does not recognise are all skipped
+    silently — overlap reporting never raises.
+    """
+    try:
+        fh = scan_path.open(encoding="utf-8")
+    except OSError:
+        return
+    with fh:
+        for line_no, raw_line in enumerate(fh, start=1):
+            record = _decode_overlap_line(raw_line)
+            key = None if record is None else _normalize_row_for_overlap(record)
+            if key is not None:
+                locations[key].append(f"{scan_path}:{line_no}")
+
+
+def _decode_overlap_line(raw_line: str) -> object | None:
+    """Return the JSON value on *raw_line*, or ``None`` when blank or malformed."""
+    line = raw_line.strip()
+    if not line:
+        return None
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return None
+
+
 def overlap_check(
     train_path: str | os.PathLike,
     suite_paths: list[str | os.PathLike],
@@ -1012,27 +1079,9 @@ def overlap_check(
     """
     locations: dict[tuple[str, str], list[str]] = defaultdict(list)
 
-    def _scan(scan_path: Path) -> None:
-        try:
-            fh = scan_path.open(encoding="utf-8")
-        except OSError:
-            return
-        with fh:
-            for line_no, raw_line in enumerate(fh, start=1):
-                line = raw_line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                key = _normalize_row_for_overlap(record)
-                if key is not None:
-                    locations[key].append(f"{scan_path}:{line_no}")
-
-    _scan(Path(train_path))
+    _collect_overlap_locations(Path(train_path), locations)
     for suite_path in suite_paths:
-        _scan(Path(suite_path))
+        _collect_overlap_locations(Path(suite_path), locations)
 
     duplicates: list[str] = []
     for locs in locations.values():
