@@ -820,25 +820,12 @@ COMPLIANCE_KEYS: dict[str, str] = {
 def detect_suite_schema(record: dict[str, Any]) -> str:
     """Return the eval-suite schema of a single *record*.
 
-    :func:`sloth.tune.datasets.detect_schema` is the authority for the two
-    original schemas (``chat``/``task``); the three newer suite schemas are
-    distinguished here by their one discriminating key (``constraints``,
-    ``json_schema``, ``expected_tool_call``), because a shared ``detect_schema``
-    that knows them is not part of this task's editable surface. A record that
-    matches nothing falls back to ``"task"``, so ``validate_dataset`` — not this
-    sniff — produces the error message.
+    Delegates to :func:`sloth.tune.datasets.detect_schema`, the single five-way
+    detector (deviation d1); a record that matches nothing falls back to
+    ``"task"``, so ``validate_dataset`` — not this sniff — produces the error
+    message.
     """
-    schema = detect_schema(record)
-    if schema is not None:
-        return schema
-    keys = set(record) if isinstance(record, dict) else set()
-    if "constraints" in keys:
-        return "instruction"
-    if "json_schema" in keys:
-        return "structured"
-    if "expected_tool_call" in keys:
-        return "toolcall"
-    return "task"
+    return detect_schema(record) or "task"
 
 
 def _detect_suite_schema(path: Path) -> str:

@@ -244,32 +244,12 @@ def _peek_first_record(path: Path) -> Any:
 def _detect_file_schema(path: Path) -> str | None:
     """Guess *path*'s schema from its first record.
 
-    Reuses :func:`sloth.tune.datasets.detect_schema` for the chat case, and
-    extends it — from the same module's exported key-set constants — to the
-    other four schemas (task / instruction / structured / toolcall), without
-    needing any change to ``sloth/tune/datasets.py`` itself. An instruction
-    record without a ``"constraints"`` key is indistinguishable from a plain
-    task record by key set alone, and is reported as ``"task"`` (both
-    validators accept it identically in that case). Returns ``None`` when no
-    known schema matches.
+    Delegates to :func:`sloth.tune.datasets.detect_file_schema`, the single
+    five-way detector shared with ``sloth validate --suite`` and the trainer
+    (deviation d1), so every host-side and in-container path classifies a
+    suite file the same way. Returns ``None`` when no known schema matches.
     """
-    record = _peek_first_record(path)
-    if record is None:
-        return None
-    if datasets.detect_schema(record) == "chat":
-        return "chat"
-    if not isinstance(record, dict):
-        return None
-    keys = set(record.keys())
-    if keys == datasets.TASK_KEYS:
-        return "task"
-    if keys == datasets.INSTRUCTION_KEYS:
-        return "instruction"
-    if keys == datasets.STRUCTURED_KEYS:
-        return "structured"
-    if keys == datasets.TOOLCALL_KEYS:
-        return "toolcall"
-    return None
+    return datasets.detect_file_schema(path)
 
 
 def _validate_suite_file(path: Path) -> None:
