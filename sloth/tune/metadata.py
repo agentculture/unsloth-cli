@@ -66,14 +66,39 @@ def dataset_digest(path: Path) -> tuple[str, int]:
     return h.hexdigest(), line_count
 
 
+#: Prefix marking a dataset value as a Hugging Face Hub dataset id rather than a
+#: local JSONL path — mirrors ``sloth.tune._trainer.HF_DATASET_PREFIX`` (kept as
+#: a separate literal so this module stays free of any import from ``_trainer``).
+_HF_DATASET_PREFIX = "hf:"
+
+#: Split recorded when a ``hf:<org>/<name>`` spec omits an explicit ``:<split>``.
+_DEFAULT_HF_SPLIT = "train"
+
+#: Revision recorded for a hub dataset when the caller does not pin one — the
+#: implicit ref ``datasets.load_dataset`` resolves to when no revision is given.
+_DEFAULT_HF_REVISION = "main"
+
+
+def _hf_dataset_record(dataset_spec: str, *, hf_revision: str | None) -> dict[str, Any]:
+    """Return the ``{"hf_id", "split", "revision"}`` record for a ``hf:`` spec."""
+    body = dataset_spec[len(_HF_DATASET_PREFIX) :]
+    hf_id, _, split = body.partition(":")
+    return {
+        "hf_id": hf_id,
+        "split": split or _DEFAULT_HF_SPLIT,
+        "revision": hf_revision or _DEFAULT_HF_REVISION,
+    }
+
+
 def write_metadata(
     adapter_dir: Path,
     *,
     model: str,
     method: str,
-    dataset_path: Path,
+    dataset_path: "Path | str",
     hyperparameters: dict[str, Any],
     timestamp: str | None = None,
+    hf_revision: str | None = None,
 ) -> Path:
     """Write ``adapter_dir/training_metadata.json`` and return the path.
 
@@ -87,14 +112,20 @@ def write_metadata(
     method:
         Adapter method: ``"lora"`` or ``"qlora"``.
     dataset_path:
-        Path to the JSONL training dataset.  Its sha256 and line count are
-        computed and embedded in the metadata.
+        Either a path to the local JSONL training dataset (its sha256 and line
+        count are computed and embedded in the metadata), or a
+        ``"hf:<org>/<name>[:split]"`` string naming a Hugging Face Hub dataset
+        — recorded instead as ``{"hf_id", "split", "revision"}`` (no sha256:
+        the dataset is not a fixed local file).
     hyperparameters:
         Mapping of training hyperparameters (rank, lora_alpha, epochs, …).
     timestamp:
         ISO-8601 string to stamp the record.  When ``None`` (the default) the
         current UTC time is used.  Pass an explicit value in tests for a
         deterministic round-trip.
+    hf_revision:
+        Revision/ref to record for a ``hf:`` *dataset_path*. Ignored for a
+        local dataset path. Defaults to ``"main"`` when not given.
 
     Returns
     -------
@@ -104,9 +135,18 @@ def write_metadata(
     Raises
     ------
     CliError
-        code=2 when *dataset_path* cannot be read.
+        code=2 when a local *dataset_path* cannot be read.
     """
-    sha256, line_count = dataset_digest(dataset_path)
+    dataset_str = str(dataset_path)
+    if dataset_str.startswith(_HF_DATASET_PREFIX):
+        dataset_record: dict[str, Any] = _hf_dataset_record(dataset_str, hf_revision=hf_revision)
+    else:
+        sha256, line_count = dataset_digest(Path(dataset_path))
+        dataset_record = {
+            "path": dataset_str,
+            "sha256": sha256,
+            "line_count": line_count,
+        }
 
     if timestamp is None:
         timestamp = datetime.now(timezone.utc).isoformat()
@@ -114,11 +154,7 @@ def write_metadata(
     record: dict[str, Any] = {
         "model": model,
         "method": method,
-        "dataset": {
-            "path": str(dataset_path),
-            "sha256": sha256,
-            "line_count": line_count,
-        },
+        "dataset": dataset_record,
         "hyperparameters": hyperparameters,
         "timestamp": timestamp,
     }

@@ -153,6 +153,16 @@ the same pattern `sloth eval`'s `--adapter`/`--model` uses):
   together with `--suite` exits `1` with a `hint:` — it would otherwise
   report a suite as valid against a schema `sloth eval` will not accept.
 
+`--dataset` also accepts an external `hf:<org>/<name>[:split]` Hugging Face
+Hub dataset id in place of a local path. Its rows are rendered to the chat or
+task schema via a `--dataset-map FIELD=COLUMN` mapping (repeatable; the same
+keys as `[run.dataset_map]` in `run.toml`: `messages` for chat, or
+`task`/`input`/`expected_output` for task) and the first 50 rows are checked
+**offline, without launching a container** when the dataset is already
+cached locally. When it is not cached (or the `datasets` library is not
+installed), the check exits `2` with a `hint:` naming `sloth train` as the
+way to populate the shared Hugging Face cache.
+
 This module is pure stdlib — no torch/unsloth import, so it stays usable on a
 machine with no GPU stack installed.
 
@@ -175,9 +185,12 @@ machine with no GPU stack installed.
   default auto-detect from the first record. With `--suite`: always `task`
   (eval suites are task-schema only); passing `--schema chat` (or any value
   other than `task`) together with `--suite` exits `1` with a `hint:`.
+- `--dataset-map FIELD=COLUMN` (repeatable) — column mapping for an
+  `hf:<org>/<name>[:split]` `--dataset`; ignored for a local JSONL `--dataset`.
 - `--json` — emit the result as structured JSON: `{valid, schema, line_count}`
   for `--dataset`, or `{valid, schema, files, total_records}` for `--suite`
-  (`files` is a list of `{path, line_count}`, one per resolved file).
+  (`files` is a list of `{path, line_count}`, one per resolved file). An
+  `hf:` `--dataset` adds a `source` field naming the spec.
 
 ## Exit codes
 
@@ -185,10 +198,14 @@ machine with no GPU stack installed.
 - `1` user-input error — missing file, invalid JSON, a record that fails
   schema validation (the validator's own `CliError` propagates verbatim,
   naming the file and line for a `--suite` directory), an empty `--suite`
-  directory, an explicit non-`task` `--schema` passed with `--suite`, or
-  both/neither of `--dataset`/`--suite` passed.
+  directory, an explicit non-`task` `--schema` passed with `--suite`, both/
+  neither of `--dataset`/`--suite` passed, a malformed `--dataset-map` entry,
+  or a missing/unresolvable `[run.dataset_map]`-equivalent mapping for an
+  `hf:` `--dataset`.
 - `2` environment error — the dataset file exists but cannot be opened
-  (e.g. a permission error).
+  (e.g. a permission error); or, for an `hf:` `--dataset`, the `datasets`
+  library is not installed, or the dataset is not present in the local
+  Hugging Face cache (the `hint:` names `sloth train` as the way to cache it).
 """
 
 _CONFIG_INIT = """\
@@ -222,6 +239,12 @@ Refuses to overwrite an existing file unless `--force` is passed.
 The generated file omits `target_modules` (optional; a list of module names, a
 single regex string, or a known preset such as `"preset:lfm2"`). Add it under
 `[hyperparameters]` to extend which modules the adapter touches.
+
+The generated `[run]` section also documents (as commented-out TOML) that
+`dataset` may instead name an external Hugging Face Hub dataset —
+`"hf:<org>/<name>[:split]"` — with a `[run.dataset_map]` table mapping its
+hub columns onto the chat (`messages`) or task (`task`/`input`/
+`expected_output`) schema. See `unsloth-cli explain train`.
 
 ## Exit codes
 
@@ -262,6 +285,16 @@ regex string, or a known preset such as `"preset:lfm2"` (unknown presets fail at
 load time, before any GPU spend). `preset:lfm2` adapts all 92 LoRA-able modules
 of LFM2.5-1.2B (24 attention, 20 short-conv, 48 feed-forward); Unsloth's default
 adapts only q/k/v on the 6 attention layers.
+
+`dataset` may also name an external Hugging Face Hub dataset instead of a
+local JSONL file: `"hf:<org>/<name>[:split]"` (split defaults to `"train"`).
+A `[run.dataset_map]` table then maps its hub columns onto the chat
+(`messages`) or task (`task`/`input`/`expected_output`) schema; it is
+required to resolve an `hf:` dataset's schema. The actual
+`datasets.load_dataset` call happens lazily, inside the NGC container, through
+the same mounted Hugging Face cache used for models — check an `hf:` dataset
+offline first with `sloth validate --dataset hf:<org>/<name> --dataset-map
+...`.
 
 ## Exit codes
 
