@@ -23,6 +23,15 @@ Metrics
 * **token F1** — SQuAD-style bag-of-tokens F1 over lowercased ``\\w+`` tokens,
   counted as a *multiset* intersection so repeated tokens are not over-credited.
   ``token_f1("a b c", "a b d") == 2/3`` (``0.667`` to three decimals).
+
+The per-row dict returned by :func:`score_records` is deliberately **open**:
+callers may pass ``extra_metrics`` (a callable or a ``{name: callable}`` map) to
+add more numeric metric keys per row without this module knowing their names in
+advance. :func:`summarize` / :func:`aggregate` fold *any* numeric metric key
+found on the rows into the summary as its mean — ``exact_match_pct`` and ``f1``
+are kept as named fields for backward compatibility, but a brand-new metric
+name registered only in a test or a future scorer shows up in the aggregate
+automatically.
 """
 
 from __future__ import annotations
@@ -32,15 +41,36 @@ import re
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Mapping, Sequence, Union
 
-#: Filename written into the evaluated directory by :func:`write_eval_json`.
+#: Filename written into the evaluated directory by the *legacy* call shape of
+#: :func:`write_eval_json`. Kept exported verbatim for readers of the old
+#: single-file layout (see ``t5`` for the legacy-read side of this contract).
 EVAL_JSON_NAME = "eval.json"
+
+#: Directory (relative to the evaluated target) holding the newer, suite-keyed
+#: result files written by the new call shape of :func:`write_eval_json`.
+EVAL_JSON_DIR = "eval"
+
+#: Schema version stamped onto every suite-keyed result file.
+SCHEMA_VERSION = 2
 
 #: Decimal places for the reported F1 figures (percentages keep the legacy 2).
 _F1_PLACES = 4
 
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+#: Row keys that are never treated as foldable numeric metrics.
+_NON_METRIC_KEYS = frozenset(
+    {"index", "task", "input", "expected_output", "prediction", "exact_match", "file"}
+)
+
+#: Either a single ``(record, prediction) -> {name: value}`` callable, or a
+#: ``{name: (record, prediction) -> value}`` mapping of per-metric callables.
+ExtraMetrics = Union[
+    Callable[[dict[str, Any], str], Mapping[str, Any]],
+    Mapping[str, Callable[[dict[str, Any], str], Any]],
+]
 
 
 # ---------------------------------------------------------------------------
@@ -84,14 +114,25 @@ def token_f1(prediction: str, reference: str) -> float:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_extra_metrics(
+    extra_metrics: ExtraMetrics, record: dict[str, Any], prediction: str
+) -> dict[str, Any]:
+    """Normalize *extra_metrics* (a callable or a ``{name: callable}`` map) to a dict."""
+    if callable(extra_metrics):
+        computed = extra_metrics(record, prediction)
+        return dict(computed) if computed else {}
+    return {name: fn(record, prediction) for name, fn in extra_metrics.items()}
+
+
 def score_records(
     records: Sequence[dict[str, Any]],
     predictions: Sequence[str],
     *,
     start_index: int = 0,
     source: str | None = None,
+    extra_metrics: ExtraMetrics | None = None,
 ) -> list[dict[str, Any]]:
-    """Score *predictions* against *records* and return one result dict per item.
+    """Score *predictions* against *records* and return one **open** result dict per item.
 
     Each entry keeps the historical keys (``index``, ``task``, ``input``,
     ``expected_output``, ``prediction``, ``exact_match``) and adds ``f1`` plus,
@@ -99,6 +140,13 @@ def score_records(
     makes indices unique across a multi-file suite: the aggregate ``results``
     list is the concatenation of the per-file lists, so indices run ``0..n-1``
     over the *whole* suite while each per-file slice keeps its own entries.
+
+    *extra_metrics*, when given, is either a single
+    ``(record, prediction) -> {name: value}`` callable or a
+    ``{name: (record, prediction) -> value}`` mapping of per-metric callables.
+    Whatever keys it returns are merged onto the row dict, so a scorer can add
+    a brand-new numeric metric without this module ever naming it — see
+    :func:`summarize` for how those extra keys are folded into the aggregate.
     """
     results: list[dict[str, Any]] = []
     for offset, (record, prediction) in enumerate(zip(records, predictions)):
@@ -114,35 +162,63 @@ def score_records(
         }
         if source is not None:
             entry["file"] = source
+        if extra_metrics is not None:
+            entry.update(_resolve_extra_metrics(extra_metrics, record, prediction))
         results.append(entry)
     return results
 
 
 def summarize(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    """Return ``{total, exact_match, exact_match_pct, f1}`` over scored *results*.
+    """Return ``{total, exact_match, exact_match_pct, f1, ...}`` over scored *results*.
 
     ``exact_match_pct`` keeps the legacy 2-decimal rounding; ``f1`` is the mean
     per-record F1 rounded to four places. An empty list scores ``0`` / ``0.0``
     rather than raising, so an empty suite file still reports a well-formed
     entry.
+
+    Any **other** numeric key present on the row dicts (added by a scorer's
+    ``extra_metrics``, see :func:`score_records`) is folded in generically as
+    its mean across rows that reported it, rounded to the same four places —
+    without this function needing to know the metric's name in advance.
     """
     total = len(results)
     exact = sum(1 for r in results if r["exact_match"])
     mean_f1 = sum(float(r.get("f1", 0.0)) for r in results) / total if total else 0.0
-    return {
+    payload: dict[str, Any] = {
         "total": total,
         "exact_match": exact,
         "exact_match_pct": round(exact / total * 100, 2) if total else 0.0,
         "f1": round(mean_f1, _F1_PLACES),
     }
 
+    numeric_keys: set[str] = set()
+    for row in results:
+        for key, value in row.items():
+            if key in _NON_METRIC_KEYS or key == "f1":
+                continue
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                numeric_keys.add(key)
+
+    for key in sorted(numeric_keys):
+        values = [
+            float(row[key])
+            for row in results
+            if isinstance(row.get(key), (int, float)) and not isinstance(row.get(key), bool)
+        ]
+        payload[key] = round(sum(values) / len(values), _F1_PLACES) if values else 0.0
+
+    return payload
+
 
 def aggregate(files: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """Build the full eval payload from per-file entries produced by :func:`file_entry`.
 
     The returned dict is the aggregate (``total``, ``exact_match``,
-    ``exact_match_pct``, ``f1``) over every record of every file, plus the
-    concatenated ``results`` and the ``files`` list itself. Callers add their own
+    ``exact_match_pct``, ``f1``, plus any other numeric metric folded in by
+    :func:`summarize`) over every record of every file, plus the concatenated
+    ``results`` and the ``files`` list itself. Callers add their own
     target-specific fields (``model_dir``/``quant_method``/``quant_format``).
     """
     all_results: list[dict[str, Any]] = []
@@ -166,27 +242,91 @@ def file_entry(path: Any, results: Sequence[dict[str, Any]]) -> dict[str, Any]:
 # eval.json
 # ---------------------------------------------------------------------------
 
+_SUITE_NAME_RE = re.compile(r"[^a-z0-9-]+")
+
+
+def sanitize_suite_name(suite: str | Path) -> str:
+    """Return the suite file/dir stem, sanitised to ``[a-z0-9-]``.
+
+    The suite's basename (its final path component, extension stripped) is
+    lowercased and every run of characters outside ``[a-z0-9-]`` is collapsed
+    to a single ``-``; leading/trailing ``-`` are stripped. An empty result
+    (e.g. a suite name made entirely of punctuation) falls back to ``"suite"``
+    so callers always get a non-empty, filesystem-safe name.
+    """
+    stem = Path(suite).stem or Path(suite).name
+    lowered = stem.lower()
+    sanitized = _SUITE_NAME_RE.sub("-", lowered).strip("-")
+    return sanitized or "suite"
+
 
 def write_eval_json(
     directory: Path,
-    payload: dict[str, Any],
+    suite_or_payload: str | Path | dict[str, Any],
+    payload: dict[str, Any] | None = None,
     *,
-    suite_paths: Sequence[Any],
-    target: str,
+    suite_paths: Sequence[Any] = (),
+    target: str | None = None,
+    batch_size: int | None = None,
+    base_load_in_4bit: bool | None = None,
     timestamp: datetime | None = None,
 ) -> Path:
-    """Write ``<directory>/eval.json`` and return its path (overwriting any prior run).
+    """Write an eval result file and return its path.
 
-    The file's schema is the stdout result dict plus three provenance fields:
-    ``suite_paths`` (every scored file, in order), ``target`` (``"adapter"`` or
-    ``"model"``) and ``written_at`` (ISO-8601 UTC). Re-running an eval overwrites
-    it, so the file always describes the most recent run of that directory.
+    This function supports **two call shapes**:
+
+    Legacy (unchanged behaviour, kept so ``sloth.tune._trainer``/``_exporter``
+    never had to change)::
+
+        write_eval_json(directory, payload, *, suite_paths=[...], target="adapter")
+
+    writes ``<directory>/eval.json`` (see :data:`EVAL_JSON_NAME`), overwriting
+    any prior run — the historical single-file layout.
+
+    New, suite-keyed shape::
+
+        write_eval_json(directory, suite, payload, batch_size=8)
+
+    writes ``<directory>/eval/<sanitised-suite-name>.json`` (see
+    :func:`sanitize_suite_name`), carrying ``schema_version`` (:data:`SCHEMA_VERSION`),
+    ``suite``, ``batch_size``, ``target``, ``written_at`` and
+    ``base_load_in_4bit`` alongside *payload*'s own keys. A second call with a
+    *different* suite name writes a sibling file and leaves the first one
+    untouched — each suite owns its own result file.
+
+    The two shapes are told apart by whether *payload* was supplied: passing
+    only two positional arguments is the legacy shape (the second argument is
+    the result payload itself); passing three is the new shape (the second
+    argument is the suite name/path, the third is the payload).
     """
     when = timestamp or datetime.now(timezone.utc)
+    directory = Path(directory)
+
+    if payload is None:
+        legacy_payload = suite_or_payload
+        if not isinstance(legacy_payload, dict):
+            raise TypeError(
+                "write_eval_json(directory, payload, *, suite_paths=..., target=...) "
+                "requires payload to be a dict when called with two positional arguments"
+            )
+        record = dict(legacy_payload)
+        record["suite_paths"] = [str(p) for p in suite_paths]
+        record["target"] = target
+        record["written_at"] = when.isoformat()
+        destination = directory / EVAL_JSON_NAME
+        destination.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+        return destination
+
+    suite_name = sanitize_suite_name(suite_or_payload)
     record = dict(payload)
-    record["suite_paths"] = [str(p) for p in suite_paths]
+    record["schema_version"] = SCHEMA_VERSION
+    record["suite"] = suite_name
+    record["batch_size"] = batch_size
     record["target"] = target
     record["written_at"] = when.isoformat()
-    destination = directory / EVAL_JSON_NAME
+    record["base_load_in_4bit"] = base_load_in_4bit
+    eval_dir = directory / EVAL_JSON_DIR
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    destination = eval_dir / f"{suite_name}.json"
     destination.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     return destination
