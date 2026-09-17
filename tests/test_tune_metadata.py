@@ -317,3 +317,80 @@ class TestWriteMetadataHfDataset:
             "split": "train",
             "revision": "v2",
         }
+
+
+# ---------------------------------------------------------------------------
+# Training-time eval: loss_history + holdout provenance (t7)
+# ---------------------------------------------------------------------------
+
+
+class TestWriteMetadataLossHistory:
+    """``log_history`` from ``trainer.state`` is folded into the metadata record."""
+
+    def _write(self, tmp_path: Path, **extra) -> dict:
+        dataset = _make_dataset(tmp_path, ['{"task": "t", "input": "i", "expected_output": "o"}'])
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        write_metadata(
+            adapter_dir,
+            model="unsloth/Qwen3-4B",
+            method="lora",
+            dataset_path=dataset,
+            hyperparameters={"lora_r": 8},
+            timestamp="2026-01-01T00:00:00+00:00",
+            **extra,
+        )
+        return read_metadata(adapter_dir)
+
+    def test_absent_when_no_log_history_given(self, tmp_path: Path) -> None:
+        data = self._write(tmp_path)
+        assert "loss_history" not in data
+        assert "holdout" not in data
+
+    def test_merges_train_and_eval_entries_by_step(self, tmp_path: Path) -> None:
+        log_history = [
+            {"loss": 2.0, "step": 1},
+            {"loss": 1.5, "step": 2},
+            {"eval_loss": 1.9, "step": 2},
+            {"loss": 1.0, "step": 3},
+            {"eval_loss": 1.2, "step": 4},
+            {"train_runtime": 0.4, "step": 4},
+        ]
+        data = self._write(tmp_path, log_history=log_history)
+
+        assert data["loss_history"] == [
+            {"step": 1, "train_loss": 2.0, "eval_loss": None},
+            {"step": 2, "train_loss": 1.5, "eval_loss": 1.9},
+            {"step": 3, "train_loss": 1.0, "eval_loss": None},
+            {"step": 4, "train_loss": None, "eval_loss": 1.2},
+        ]
+        assert data["final_train_loss"] == 1.0
+        assert data["final_eval_loss"] == 1.2
+
+    def test_final_train_loss_key_is_honoured(self, tmp_path: Path) -> None:
+        """HF appends a summary entry keyed ``train_loss`` — it counts as a train loss."""
+        data = self._write(
+            tmp_path,
+            log_history=[{"loss": 3.0, "step": 1}, {"train_loss": 2.5, "step": 2}],
+        )
+        assert data["final_train_loss"] == 2.5
+        assert data["final_eval_loss"] is None
+
+    def test_empty_log_history_records_empty_list_and_null_finals(self, tmp_path: Path) -> None:
+        data = self._write(tmp_path, log_history=[])
+        assert data["loss_history"] == []
+        assert data["final_train_loss"] is None
+        assert data["final_eval_loss"] is None
+
+    def test_holdout_block_is_recorded_verbatim(self, tmp_path: Path) -> None:
+        holdout = {
+            "fraction": 0.2,
+            "seed": 7,
+            "train_path": str(tmp_path / "d.train.jsonl"),
+            "holdout_path": str(tmp_path / "d.holdout.jsonl"),
+            "train_count": 8,
+            "holdout_count": 2,
+            "eval_steps": 15,
+        }
+        data = self._write(tmp_path, holdout=holdout)
+        assert data["holdout"] == holdout

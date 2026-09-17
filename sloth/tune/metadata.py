@@ -90,6 +90,61 @@ def _hf_dataset_record(dataset_spec: str, *, hf_revision: str | None) -> dict[st
     }
 
 
+#: Keys a ``log_history`` entry may use for the *training* loss. ``"loss"`` is
+#: what transformers logs per ``logging_steps``; ``"train_loss"`` is the single
+#: summary entry appended when training finishes.
+_TRAIN_LOSS_KEYS: tuple[str, ...] = ("loss", "train_loss")
+
+
+def fold_log_history(log_history: list[dict[str, Any]]) -> dict[str, Any]:
+    """Fold a ``trainer.state.log_history`` list into the metadata loss record.
+
+    transformers logs training and evaluation separately — ``{"loss", "step"}``
+    entries every ``logging_steps`` and ``{"eval_loss", "step"}`` entries every
+    ``eval_steps`` — so the same step can appear twice. They are merged here by
+    ``step`` (first-seen order preserved) into
+    ``[{"step", "train_loss", "eval_loss"}]``, with a missing side recorded as
+    ``None``. Entries carrying no ``step`` or neither loss (e.g. the
+    ``train_runtime`` summary) are ignored.
+
+    Returns
+    -------
+    dict
+        ``{"loss_history": [...], "final_train_loss": float|None,
+        "final_eval_loss": float|None}`` — the finals being the last non-``None``
+        value of each series.
+    """
+    merged: dict[Any, dict[str, Any]] = {}
+    for entry in log_history:
+        if not isinstance(entry, dict) or "step" not in entry:
+            continue
+        train_loss = next((entry[k] for k in _TRAIN_LOSS_KEYS if k in entry), None)
+        eval_loss = entry.get("eval_loss")
+        if train_loss is None and eval_loss is None:
+            continue
+        step = entry["step"]
+        row = merged.setdefault(step, {"step": step, "train_loss": None, "eval_loss": None})
+        if train_loss is not None:
+            row["train_loss"] = train_loss
+        if eval_loss is not None:
+            row["eval_loss"] = eval_loss
+
+    loss_history = list(merged.values())
+    final_train_loss = next(
+        (row["train_loss"] for row in reversed(loss_history) if row["train_loss"] is not None),
+        None,
+    )
+    final_eval_loss = next(
+        (row["eval_loss"] for row in reversed(loss_history) if row["eval_loss"] is not None),
+        None,
+    )
+    return {
+        "loss_history": loss_history,
+        "final_train_loss": final_train_loss,
+        "final_eval_loss": final_eval_loss,
+    }
+
+
 def write_metadata(
     adapter_dir: Path,
     *,
@@ -99,6 +154,8 @@ def write_metadata(
     hyperparameters: dict[str, Any],
     timestamp: str | None = None,
     hf_revision: str | None = None,
+    log_history: list[dict[str, Any]] | None = None,
+    holdout: dict[str, Any] | None = None,
 ) -> Path:
     """Write ``adapter_dir/training_metadata.json`` and return the path.
 
@@ -126,6 +183,16 @@ def write_metadata(
     hf_revision:
         Revision/ref to record for a ``hf:`` *dataset_path*. Ignored for a
         local dataset path. Defaults to ``"main"`` when not given.
+    log_history:
+        ``trainer.state.log_history`` from the finished run. When given it is
+        folded by :func:`fold_log_history` into the ``loss_history``,
+        ``final_train_loss`` and ``final_eval_loss`` keys. ``None`` (the
+        default) omits all three.
+    holdout:
+        Provenance of the training-time eval split — ``{"fraction", "seed",
+        "train_path", "holdout_path", "train_count", "holdout_count",
+        "eval_steps"}`` — recorded verbatim so the split is reproducible.
+        ``None`` (the default) omits the key entirely.
 
     Returns
     -------
@@ -158,6 +225,10 @@ def write_metadata(
         "hyperparameters": hyperparameters,
         "timestamp": timestamp,
     }
+    if log_history is not None:
+        record.update(fold_log_history(log_history))
+    if holdout is not None:
+        record["holdout"] = holdout
 
     out_path = adapter_dir / _METADATA_FILENAME
     out_path.write_text(json.dumps(record, indent=2), encoding="utf-8")

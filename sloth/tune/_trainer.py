@@ -46,7 +46,12 @@ from sloth.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 from sloth.cli._output import emit_diagnostic
 from sloth.tune import metrics, scorers
 from sloth.tune.config import RunConfig
-from sloth.tune.datasets import detect_schema, render_chat_prompt, validate_dataset
+from sloth.tune.datasets import (
+    detect_schema,
+    render_chat_prompt,
+    split_holdout,
+    validate_dataset,
+)
 from sloth.tune.metadata import write_metadata
 from sloth.tune.presets import resolve_target_modules
 from sloth.tune.scope import check_scope
@@ -399,6 +404,20 @@ def _format_records(records: list[dict], schema: str, tokenizer: Any) -> list[di
     ]
 
 
+def _resolve_eval_steps(config: RunConfig, configured: int) -> int:
+    """Return the effective ``eval_steps`` for a training-time eval.
+
+    ``0`` means "unset" in the ``[eval]`` section, so fall back to a quarter of
+    the run's ``max_steps`` (at least 1) — roughly four eval points across the
+    run, which is informative without dominating the step budget. The resolved
+    value is what both ``SFTConfig`` and ``training_metadata.json`` record, so
+    the default is never left implicit.
+    """
+    if configured > 0:
+        return configured
+    return max(1, config.max_steps // 4)
+
+
 # ---------------------------------------------------------------------------
 # Real training path (uses the lazily-loaded backend; not GPU-tested in CI)
 # ---------------------------------------------------------------------------
@@ -413,13 +432,50 @@ def _run_real(config: RunConfig, plan: dict[str, Any], backend: _Backend) -> dic
     # time ("validate before spending GPU"). An `hf:` dataset is loaded via the
     # mounted HF cache and rendered through [run.dataset_map] instead of being
     # read as a local JSONL path.
+    eval_config = config.eval
+    wants_holdout = eval_config is not None and eval_config.holdout_fraction > 0
+    eval_records: list[dict] | None = None
+    holdout_record: dict[str, Any] | None = None
+
     if is_hf_dataset_spec(config.dataset):
         schema = infer_hf_dataset_schema(config.dataset_map)
         train_records = load_external_records(config.dataset, config.dataset_map)
+        if wants_holdout:
+            # An ``hf:`` dataset is materialised in memory, not as a local JSONL
+            # file, and ``split_holdout`` splits a *file*. Rather than round-trip
+            # the rendered rows through a temp file, skip the split and say so —
+            # the run still trains, it just has no training-time eval curve.
+            emit_diagnostic(
+                "note: skipping the [eval] holdout split — an hf: dataset has no local "
+                "file to split; training proceeds without a training-time eval set."
+            )
+            wants_holdout = False
     else:
         dataset_path = Path(config.dataset)
-        schema = _detect_dataset_schema(dataset_path)
-        train_records = validate_dataset(dataset_path, schema=schema)
+        if wants_holdout:
+            # Split BEFORE the model load so a split failure costs no GPU time.
+            # split_holdout writes task-schema rows on both sides (chat rows are
+            # rendered down), so the split outputs always read back as "task".
+            split = split_holdout(
+                dataset_path,
+                eval_config.holdout_fraction,
+                eval_config.seed,
+            )
+            schema = "task"
+            train_records = validate_dataset(Path(split["train_path"]), schema=schema)
+            eval_records = validate_dataset(Path(split["holdout_path"]), schema=schema)
+            holdout_record = {
+                "fraction": eval_config.holdout_fraction,
+                "seed": eval_config.seed,
+                "train_path": str(split["train_path"]),
+                "holdout_path": str(split["holdout_path"]),
+                "train_count": split["train_count"],
+                "holdout_count": split["holdout_count"],
+                "eval_steps": _resolve_eval_steps(config, eval_config.eval_steps),
+            }
+        else:
+            schema = _detect_dataset_schema(dataset_path)
+            train_records = validate_dataset(dataset_path, schema=schema)
 
     # Lazy-imported here (not at module top) so the module stays importable without
     # ``datasets`` installed and tests can inject a fake via sys.modules.
@@ -451,15 +507,23 @@ def _run_real(config: RunConfig, plan: dict[str, Any], backend: _Backend) -> dic
         # on it).
         train_dataset = Dataset.from_list(_format_records(train_records, schema, tokenizer))
 
-        sft_config = backend.sft_config(
-            output_dir=config.output,
-            per_device_train_batch_size=config.batch_size,
-            gradient_accumulation_steps=config.grad_accum,
-            learning_rate=config.learning_rate,
-            max_steps=config.max_steps,
-            seed=config.seed,
-            dataset_text_field="text",
-        )
+        sft_kwargs: dict[str, Any] = {
+            "output_dir": config.output,
+            "per_device_train_batch_size": config.batch_size,
+            "gradient_accumulation_steps": config.grad_accum,
+            "learning_rate": config.learning_rate,
+            "max_steps": config.max_steps,
+            "seed": config.seed,
+            "dataset_text_field": "text",
+        }
+        trainer_kwargs: dict[str, Any] = {}
+        if holdout_record is not None and eval_records is not None:
+            sft_kwargs["eval_strategy"] = "steps"
+            sft_kwargs["eval_steps"] = holdout_record["eval_steps"]
+            trainer_kwargs["eval_dataset"] = Dataset.from_list(
+                _format_records(eval_records, schema, tokenizer)
+            )
+        sft_config = backend.sft_config(**sft_kwargs)
         # trl >= 0.12 renamed the ``tokenizer`` kwarg to ``processing_class``;
         # trl 0.24 (the pinned in-container version) removed ``tokenizer`` entirely.
         trainer = backend.sft_trainer(
@@ -467,8 +531,13 @@ def _run_real(config: RunConfig, plan: dict[str, Any], backend: _Backend) -> dic
             processing_class=tokenizer,
             train_dataset=train_dataset,
             args=sft_config,
+            **trainer_kwargs,
         )
         trainer.train()
+        # Read the loss curve from trainer.state, NOT from train()'s TrainOutput:
+        # TrainOutput carries only the final training loss, while state.log_history
+        # holds every logged train AND eval entry.
+        log_history = list(getattr(getattr(trainer, "state", None), "log_history", []) or [])
     except NotImplementedError as exc:
         # Unsloth raises NotImplementedError (message: "cannot find any torch
         # accelerator") when no GPU is available. Map it to a user-actionable
@@ -491,6 +560,8 @@ def _run_real(config: RunConfig, plan: dict[str, Any], backend: _Backend) -> dic
         method=config.method,
         dataset_path=config.dataset,
         hyperparameters=plan["hyperparameters"],
+        log_history=log_history,
+        holdout=holdout_record,
     )
 
     result = dict(plan)
