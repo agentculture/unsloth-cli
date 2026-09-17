@@ -125,6 +125,33 @@ def test_generated_hyperparameters_match_tune_config_defaults(tmp_path: Path) ->
     assert cfg.load_in_4bit == DEFAULT_LOAD_IN_4BIT
 
 
+def test_template_documents_eval_and_thresholds_keys(tmp_path: Path) -> None:
+    """The generated run.toml documents [eval] / [eval.thresholds] as
+    commented-out TOML (so a fresh config still loads with eval/thresholds
+    unset), naming every key from the c36 baseline."""
+    output = tmp_path / "out"
+    cmd_config_init(_make_args(output=str(output)))
+    text = (output / "run.toml").read_text(encoding="utf-8")
+
+    for key in (
+        "holdout_fraction",
+        "eval_steps",
+        "perplexity",
+        "tool_call_family",
+        "regression_drop_pp",
+        "compliance_min_pct",
+        "latency_max_ratio",
+        "min_suite_rows",
+    ):
+        assert key in text, f"template does not mention {key!r}"
+
+    # The generated file must still load with eval/thresholds unset, proving
+    # the documentation is commented out rather than a live section.
+    cfg = load_config(output / "run.toml")
+    assert cfg.eval is None
+    assert cfg.thresholds is None
+
+
 def test_default_path_is_output_slash_run_toml(tmp_path: Path) -> None:
     """With no --path, the file lands at <output>/run.toml."""
     output = tmp_path / "myrun"

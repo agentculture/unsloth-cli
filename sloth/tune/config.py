@@ -84,6 +84,40 @@ DEFAULT_LOAD_IN_4BIT: bool = True
 
 
 # ---------------------------------------------------------------------------
+# [eval] / [eval.thresholds] defaults — frame decision c36 is the single
+# source of truth for the threshold baseline values; docs/benchmarks.md and
+# docs/specs cite these constants rather than restating the numbers.
+# ---------------------------------------------------------------------------
+
+DEFAULT_EVAL_HOLDOUT_FRACTION: float = 0.0
+"""Fraction of the training set carved into a held-out eval split. 0.0 = off."""
+
+DEFAULT_EVAL_SEED: int = DEFAULT_SEED
+"""Random seed for the eval holdout split. Shares the training default."""
+
+DEFAULT_EVAL_STEPS: int = 0
+"""Run an in-training eval every N steps. 0 = disabled."""
+
+DEFAULT_EVAL_PERPLEXITY: bool = False
+"""Whether to compute held-out perplexity/loss during eval."""
+
+DEFAULT_EVAL_TOOL_CALL_FAMILY: str = ""
+"""Tool-call parser family override (e.g. "qwen3", "lfm2"). "" = auto-detect."""
+
+DEFAULT_REGRESSION_DROP_PP: float = 2.0
+"""c36 baseline: max allowed regression-suite drop, in percentage points."""
+
+DEFAULT_COMPLIANCE_MIN_PCT: float = 95.0
+"""c36 baseline: minimum structured-output/tool-call compliance percentage."""
+
+DEFAULT_LATENCY_MAX_RATIO: float = 1.10
+"""c36 baseline: max per-item median latency, as a ratio of the base model's."""
+
+DEFAULT_MIN_SUITE_ROWS: int = 100
+"""c36 baseline: minimum suite size before a delta counts as pass/fail."""
+
+
+# ---------------------------------------------------------------------------
 # Config dataclass
 # ---------------------------------------------------------------------------
 
@@ -122,6 +156,70 @@ class RunConfig:
     # resolving "preset:<name>" to its regex happens at the call site via
     # sloth.tune.presets.resolve_target_modules(), not here.
     target_modules: list[str] | str | None = None
+
+    # [eval] / [eval.thresholds] — both None when the config omits [eval]
+    # entirely, so a pre-existing config's compute_config_hash() is untouched
+    # (the hash formula drops None-valued top-level fields; see
+    # sloth.tune.registry.compute_config_hash).
+    eval: "EvalConfig | None" = None
+    thresholds: "ThresholdsConfig | None" = None
+
+
+@dataclass(frozen=True)
+class EvalConfig:
+    """Typed, frozen representation of a ``[eval]`` TOML section.
+
+    Only constructed when the config file has an ``[eval]`` section (even an
+    empty one) — its absence leaves :attr:`RunConfig.eval` as ``None``.
+    """
+
+    holdout_fraction: float = DEFAULT_EVAL_HOLDOUT_FRACTION
+    seed: int = DEFAULT_EVAL_SEED
+    eval_steps: int = DEFAULT_EVAL_STEPS
+    perplexity: bool = DEFAULT_EVAL_PERPLEXITY
+    tool_call_family: str = DEFAULT_EVAL_TOOL_CALL_FAMILY
+
+
+@dataclass(frozen=True)
+class ThresholdsConfig:
+    """Typed, frozen representation of the ``[eval.thresholds]`` TOML section.
+
+    Defaults are the c36 frame-decision baseline (regression drop 2 pp,
+    compliance >= 95%, latency within 10% of base, minimum suite size 100
+    rows) — the single source these numbers are cited from elsewhere.
+    """
+
+    regression_drop_pp: float = DEFAULT_REGRESSION_DROP_PP
+    compliance_min_pct: float = DEFAULT_COMPLIANCE_MIN_PCT
+    latency_max_ratio: float = DEFAULT_LATENCY_MAX_RATIO
+    min_suite_rows: int = DEFAULT_MIN_SUITE_ROWS
+
+
+# ---------------------------------------------------------------------------
+# [eval] / [eval.thresholds] known keys — unknown keys are rejected the same
+# way an unrecognised [hyperparameters] value would be (CliError + hint).
+# ---------------------------------------------------------------------------
+
+_EVAL_KNOWN_KEYS: frozenset[str] = frozenset(
+    {"holdout_fraction", "seed", "eval_steps", "perplexity", "tool_call_family", "thresholds"}
+)
+_THRESHOLDS_KNOWN_KEYS: frozenset[str] = frozenset(
+    {"regression_drop_pp", "compliance_min_pct", "latency_max_ratio", "min_suite_rows"}
+)
+
+
+def _reject_unknown_keys(section: dict, known: frozenset[str], section_name: str) -> None:
+    """Raise ``CliError(code=1)`` naming any key in *section* not in *known*."""
+    unknown = sorted(set(section) - known)
+    if unknown:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"unknown key(s) {unknown} in [{section_name}] section",
+            remediation=(
+                f"Remove the unrecognised key(s) from [{section_name}], or fix the typo. "
+                f"Accepted keys: {sorted(known)}."
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +289,18 @@ def _require_bool(hp: dict, key: str, default: bool) -> bool:
             code=EXIT_USER_ERROR,
             message=f"hyperparameter '{key}' must be a boolean, got {type(value).__name__}",
             remediation=f"Set `{key} = true` or `{key} = false` in [hyperparameters].",
+        )
+    return value
+
+
+def _require_str(hp: dict, key: str, default: str) -> str:
+    """Return ``hp[key]`` as a ``str``, else *default*; raise on any other type."""
+    value = hp.get(key, default)
+    if not isinstance(value, str):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"'{key}' must be a string, got {type(value).__name__}",
+            remediation=f'Set `{key} = "<value>"`.',
         )
     return value
 
@@ -267,6 +377,84 @@ def _require_target_modules(hp: dict) -> list[str] | str | None:
 
 
 # ---------------------------------------------------------------------------
+# [eval] / [eval.thresholds] parsing
+# ---------------------------------------------------------------------------
+
+
+def _parse_thresholds(eval_section: dict) -> ThresholdsConfig:
+    """Return a :class:`ThresholdsConfig` built from ``eval_section["thresholds"]``.
+
+    Missing keys (or a wholly absent ``thresholds`` sub-table) fall back to
+    the c36 baseline defaults. Raises ``CliError(code=1)`` if ``thresholds``
+    is present but not a table, or on any unknown/malformed key.
+    """
+    thresholds_section = eval_section.get("thresholds", {})
+    if not isinstance(thresholds_section, dict):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=(
+                "'thresholds' must be a table ([eval.thresholds]), got "
+                f"{type(thresholds_section).__name__}"
+            ),
+            remediation="Define thresholds under an [eval.thresholds] section, not as a scalar.",
+        )
+    _reject_unknown_keys(thresholds_section, _THRESHOLDS_KNOWN_KEYS, "eval.thresholds")
+
+    return ThresholdsConfig(
+        regression_drop_pp=_require_float(
+            thresholds_section, "regression_drop_pp", DEFAULT_REGRESSION_DROP_PP, minimum=0.0
+        ),
+        compliance_min_pct=_require_float(
+            thresholds_section,
+            "compliance_min_pct",
+            DEFAULT_COMPLIANCE_MIN_PCT,
+            minimum=0.0,
+            maximum=100.0,
+        ),
+        latency_max_ratio=_require_float(
+            thresholds_section, "latency_max_ratio", DEFAULT_LATENCY_MAX_RATIO, minimum=0.0
+        ),
+        min_suite_rows=_require_int(
+            thresholds_section, "min_suite_rows", DEFAULT_MIN_SUITE_ROWS, minimum=0
+        ),
+    )
+
+
+def _parse_eval(raw: dict) -> tuple["EvalConfig | None", "ThresholdsConfig | None"]:
+    """Return ``(eval, thresholds)`` parsed from ``raw["eval"]``.
+
+    Both are ``None`` when *raw* has no ``[eval]`` section at all — this
+    keeps :func:`sloth.tune.registry.compute_config_hash` stable for every
+    pre-existing config, since it drops ``None``-valued top-level fields.
+    Raises ``CliError(code=1)`` on any unknown or malformed key in either
+    ``[eval]`` or ``[eval.thresholds]``.
+    """
+    if "eval" not in raw:
+        return None, None
+
+    eval_section = raw["eval"] or {}
+    _reject_unknown_keys(eval_section, _EVAL_KNOWN_KEYS, "eval")
+
+    thresholds = _parse_thresholds(eval_section)
+    eval_config = EvalConfig(
+        holdout_fraction=_require_float(
+            eval_section,
+            "holdout_fraction",
+            DEFAULT_EVAL_HOLDOUT_FRACTION,
+            minimum=0.0,
+            maximum=1.0,
+        ),
+        seed=_require_int(eval_section, "seed", DEFAULT_EVAL_SEED, minimum=0),
+        eval_steps=_require_int(eval_section, "eval_steps", DEFAULT_EVAL_STEPS, minimum=0),
+        perplexity=_require_bool(eval_section, "perplexity", DEFAULT_EVAL_PERPLEXITY),
+        tool_call_family=_require_str(
+            eval_section, "tool_call_family", DEFAULT_EVAL_TOOL_CALL_FAMILY
+        ),
+    )
+    return eval_config, thresholds
+
+
+# ---------------------------------------------------------------------------
 # Loader
 # ---------------------------------------------------------------------------
 
@@ -336,6 +524,9 @@ def load_config(path: str | Path) -> RunConfig:
     # --- hyperparameters (all optional, but type/range-checked) -------------
     hp: dict = raw.get("hyperparameters", {})
 
+    # --- eval / thresholds (both optional; absent [eval] -> both None) -----
+    eval_config, thresholds_config = _parse_eval(raw)
+
     return RunConfig(
         model=run_section["model"],
         dataset=run_section["dataset"],
@@ -354,4 +545,6 @@ def load_config(path: str | Path) -> RunConfig:
         seed=_require_int(hp, "seed", DEFAULT_SEED, minimum=0),
         load_in_4bit=_require_bool(hp, "load_in_4bit", DEFAULT_LOAD_IN_4BIT),
         target_modules=_require_target_modules(hp),
+        eval=eval_config,
+        thresholds=thresholds_config,
     )

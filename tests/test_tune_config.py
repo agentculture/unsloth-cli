@@ -9,7 +9,14 @@ import pytest
 from sloth.cli._errors import CliError
 from sloth.tune.config import (
     DEFAULT_BATCH_SIZE,
+    DEFAULT_COMPLIANCE_MIN_PCT,
+    DEFAULT_EVAL_HOLDOUT_FRACTION,
+    DEFAULT_EVAL_PERPLEXITY,
+    DEFAULT_EVAL_SEED,
+    DEFAULT_EVAL_STEPS,
+    DEFAULT_EVAL_TOOL_CALL_FAMILY,
     DEFAULT_GRAD_ACCUM,
+    DEFAULT_LATENCY_MAX_RATIO,
     DEFAULT_LEARNING_RATE,
     DEFAULT_LOAD_IN_4BIT,
     DEFAULT_LORA_ALPHA,
@@ -18,8 +25,12 @@ from sloth.tune.config import (
     DEFAULT_MAX_SEQ_LEN,
     DEFAULT_MAX_STEPS,
     DEFAULT_METHOD,
+    DEFAULT_MIN_SUITE_ROWS,
+    DEFAULT_REGRESSION_DROP_PP,
     DEFAULT_SEED,
+    EvalConfig,
     RunConfig,
+    ThresholdsConfig,
     load_config,
 )
 from sloth.tune.presets import PRESETS
@@ -379,3 +390,190 @@ def test_target_modules_unknown_preset_raises_cli_error(tmp_path: Path) -> None:
         load_config(toml_file)
     assert exc_info.value.code == 1
     assert "preset:nope" in exc_info.value.message or "nope" in exc_info.value.message
+
+
+# ---------------------------------------------------------------------------
+# Criterion 2 — [eval] section + [eval.thresholds] baseline (c23, c36)
+# ---------------------------------------------------------------------------
+
+
+def test_no_eval_section_leaves_eval_and_thresholds_none(tmp_path: Path) -> None:
+    toml_file = _write_toml(tmp_path, _BASE_RUN)
+    cfg = load_config(toml_file)
+    assert cfg.eval is None
+    assert cfg.thresholds is None
+
+
+def test_empty_eval_section_applies_all_defaults(tmp_path: Path) -> None:
+    toml_file = _write_toml(tmp_path, _BASE_RUN + "\n[eval]\n")
+    cfg = load_config(toml_file)
+    assert cfg.eval == EvalConfig(
+        holdout_fraction=DEFAULT_EVAL_HOLDOUT_FRACTION,
+        seed=DEFAULT_EVAL_SEED,
+        eval_steps=DEFAULT_EVAL_STEPS,
+        perplexity=DEFAULT_EVAL_PERPLEXITY,
+        tool_call_family=DEFAULT_EVAL_TOOL_CALL_FAMILY,
+    )
+    assert cfg.thresholds == ThresholdsConfig(
+        regression_drop_pp=DEFAULT_REGRESSION_DROP_PP,
+        compliance_min_pct=DEFAULT_COMPLIANCE_MIN_PCT,
+        latency_max_ratio=DEFAULT_LATENCY_MAX_RATIO,
+        min_suite_rows=DEFAULT_MIN_SUITE_ROWS,
+    )
+
+
+def test_eval_defaults_match_c36_baseline_literals() -> None:
+    # The c36 frame decision is the single source of truth for these numbers;
+    # this test pins them so a docs/code drift is caught here first.
+    assert DEFAULT_EVAL_HOLDOUT_FRACTION == 0.0
+    assert DEFAULT_EVAL_STEPS == 0
+    assert DEFAULT_EVAL_PERPLEXITY is False
+    assert DEFAULT_EVAL_TOOL_CALL_FAMILY == ""
+    assert DEFAULT_REGRESSION_DROP_PP == 2.0
+    assert DEFAULT_COMPLIANCE_MIN_PCT == 95.0
+    assert DEFAULT_LATENCY_MAX_RATIO == 1.10
+    assert DEFAULT_MIN_SUITE_ROWS == 100
+
+
+def test_eval_section_overrides_are_applied(tmp_path: Path) -> None:
+    toml_file = _write_toml(
+        tmp_path,
+        _BASE_RUN + """
+[eval]
+holdout_fraction = 0.1
+seed = 42
+eval_steps = 20
+perplexity = true
+tool_call_family = "qwen3"
+
+[eval.thresholds]
+regression_drop_pp = 3.5
+compliance_min_pct = 90.0
+latency_max_ratio = 1.25
+min_suite_rows = 40
+""",
+    )
+    cfg = load_config(toml_file)
+    assert cfg.eval == EvalConfig(
+        holdout_fraction=0.1,
+        seed=42,
+        eval_steps=20,
+        perplexity=True,
+        tool_call_family="qwen3",
+    )
+    assert cfg.thresholds == ThresholdsConfig(
+        regression_drop_pp=3.5,
+        compliance_min_pct=90.0,
+        latency_max_ratio=1.25,
+        min_suite_rows=40,
+    )
+
+
+def test_eval_thresholds_partial_override_keeps_other_defaults(tmp_path: Path) -> None:
+    toml_file = _write_toml(
+        tmp_path,
+        _BASE_RUN + "\n[eval]\n[eval.thresholds]\nmin_suite_rows = 250\n",
+    )
+    cfg = load_config(toml_file)
+    assert cfg.thresholds.min_suite_rows == 250
+    assert cfg.thresholds.regression_drop_pp == DEFAULT_REGRESSION_DROP_PP
+    assert cfg.thresholds.compliance_min_pct == DEFAULT_COMPLIANCE_MIN_PCT
+    assert cfg.thresholds.latency_max_ratio == DEFAULT_LATENCY_MAX_RATIO
+
+
+def test_eval_config_and_thresholds_config_are_frozen_dataclasses() -> None:
+    import dataclasses
+
+    assert dataclasses.is_dataclass(EvalConfig)
+    assert dataclasses.fields(EvalConfig)[0].name  # has fields
+    assert EvalConfig.__dataclass_params__.frozen is True
+    assert dataclasses.is_dataclass(ThresholdsConfig)
+    assert ThresholdsConfig.__dataclass_params__.frozen is True
+
+    cfg = EvalConfig()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        cfg.holdout_fraction = 0.5  # type: ignore[misc]
+
+
+def test_eval_unknown_key_raises_cli_error_with_hint(tmp_path: Path) -> None:
+    toml_file = _write_toml(tmp_path, _BASE_RUN + "\n[eval]\nbogus_key = 1\n")
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
+    assert "bogus_key" in exc_info.value.message
+    assert exc_info.value.remediation
+
+
+def test_eval_thresholds_unknown_key_raises_cli_error_with_hint(tmp_path: Path) -> None:
+    toml_file = _write_toml(
+        tmp_path, _BASE_RUN + "\n[eval]\n[eval.thresholds]\nbogus_threshold = 1\n"
+    )
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
+    assert "bogus_threshold" in exc_info.value.message
+    assert exc_info.value.remediation
+
+
+def test_eval_holdout_fraction_out_of_range_raises_cli_error(tmp_path: Path) -> None:
+    toml_file = _write_toml(tmp_path, _BASE_RUN + "\n[eval]\nholdout_fraction = 1.5\n")
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
+
+
+def test_eval_perplexity_non_bool_raises_cli_error(tmp_path: Path) -> None:
+    toml_file = _write_toml(tmp_path, _BASE_RUN + '\n[eval]\nperplexity = "yes"\n')
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
+
+
+def test_eval_tool_call_family_non_string_raises_cli_error(tmp_path: Path) -> None:
+    toml_file = _write_toml(tmp_path, _BASE_RUN + "\n[eval]\ntool_call_family = 5\n")
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
+
+
+def test_eval_thresholds_compliance_min_pct_out_of_range_raises_cli_error(
+    tmp_path: Path,
+) -> None:
+    toml_file = _write_toml(
+        tmp_path,
+        _BASE_RUN + "\n[eval]\n[eval.thresholds]\ncompliance_min_pct = 150.0\n",
+    )
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
+
+
+def test_eval_thresholds_not_a_table_raises_cli_error(tmp_path: Path) -> None:
+    toml_file = _write_toml(tmp_path, _BASE_RUN + "\n[eval]\nthresholds = 5\n")
+    with pytest.raises(CliError) as exc_info:
+        load_config(toml_file)
+    assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# Criterion 3 — existing config hash is unchanged when no [eval] section
+# ---------------------------------------------------------------------------
+
+
+def test_config_hash_unchanged_for_config_without_eval_section() -> None:
+    # Recorded from compute_config_hash(load_config("examples/lora-smoke.toml"))
+    # BEFORE this task added the eval/thresholds fields to RunConfig. If this
+    # literal ever needs to change, every pre-existing run's run_id (which
+    # embeds config_hash[:12]) silently changes underneath it — so this test
+    # is the single source of truth that adding eval/thresholds as
+    # None-by-default fields does not perturb the hash of a config that omits
+    # [eval] entirely.
+    from sloth.tune.registry import compute_config_hash
+
+    cfg = load_config("examples/lora-smoke.toml")
+    assert cfg.eval is None
+    assert cfg.thresholds is None
+    assert (
+        compute_config_hash(cfg)
+        == "752c600641c508e00a4720ee7ce503530706e29be51915ee52ba71efd82f39a2"[:64]
+    )
