@@ -155,6 +155,61 @@ batch-1 result, not batch 8. **The batch size itself is not recorded inside
 produced the run; do not infer it from the file. `sloth summarize` and `sloth
 compare` render whichever file is present.
 
+## Serving latency + tok/s
+
+Once an adapter is exported (`sloth export`), **serving it is a manual
+operator step — unsloth-cli does not start or call lobes.** The hand-off is:
+export the adapter to a servable layout here, then a human operator points
+[lobes-cli](https://github.com/agentculture/lobes-cli) at it (`lobes deploy`
+et al. — see that repo's own docs) and runs its benchmark verb against the
+now-serving endpoint.
+
+The exact command, read from `lobes/cli/_commands/benchmark.py`'s
+`register()`/`cmd_benchmark()`:
+
+```bash
+lobes benchmark --model <served-model-name> --json
+```
+
+(`--purpose`, `--input-len`/`--output-len`, and `--runs` override the
+workload shape and repetition count; they default to the deployment's
+configured `VLLM_PURPOSE` and 2 runs respectively. `--all-lobes` and
+`--profile` are separate, unrelated modes of the same verb — not part of this
+hand-off.)
+
+`cmd_benchmark`'s single-model path calls `lobes.assess.run_benchmark`, whose
+return shape is, verbatim (`lobes/assess.py`, `run_benchmark`, lines ~569-598):
+
+```text
+{model, endpoint, max_model_len, purpose, input_len, output_len,
+ decode_rates, prefill}
+```
+
+`--json` mode merges in one extra top-level key, `host` (`{image,
+gpu_memory}`), read from the deployment's compose config rather than from
+`run_benchmark` itself. `decode_rates` is the list of per-run decode
+throughput samples (tokens/sec); `prefill` is the prefill-latency measurement
+dict for the configured `input_len`.
+
+Measured numbers for this repo's exported adapters — batch 1 and batch 8,
+per export format — are **not yet collected**; that is the live-run task's
+job, not this doc's:
+
+| Export format | `--purpose` / batch | decode tok/s | prefill latency |
+|----------------|---------------------|--------------|------------------|
+| `merged-16bit` | batch 1 | (to be measured by the live run) | (to be measured by the live run) |
+| `merged-16bit` | batch 8 | (to be measured by the live run) | (to be measured by the live run) |
+| `gguf` (`q4_k_m`) | batch 1 | (to be measured by the live run) | (to be measured by the live run) |
+| `gguf` (`q4_k_m`) | batch 8 | (to be measured by the live run) | (to be measured by the live run) |
+| `awq` | batch 1 | (to be measured by the live run) | (to be measured by the live run) |
+| `awq` | batch 8 | (to be measured by the live run) | (to be measured by the live run) |
+| `nvfp4` | batch 1 | (to be measured by the live run) | (to be measured by the live run) |
+| `nvfp4` | batch 8 | (to be measured by the live run) | (to be measured by the live run) |
+
+This table is serving cost, not model quality — it belongs beside the
+per-format `sloth eval` scores above, not in place of them: a fast, cheap
+format that regresses accuracy is still a regression.
+
 ## Run metadata (written next to the adapter)
 
 `sloth train` writes `training_metadata.json` alongside the adapter, e.g. for the
