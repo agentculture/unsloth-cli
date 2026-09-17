@@ -270,6 +270,32 @@ A 5-per-subject smoke is a **noisy** estimate (285 documents); it is a
 sanity number for the fixture adapter, not a claim comparable to published
 LFM2.5-1.2B MMLU figures, which use the full 14 042-document test set.
 
+### `sloth export` + `sloth eval --model` — quantization loss on a trained adapter (batch 1)
+
+The measurement issue #28 (item 1) asked for: the per-format table re-scored on
+an adapter that actually learned something. Three target suites
+(`agentculture-terms` / `cli-contract` / `task-format`, 46 rows), batch 1,
+greedy, `max_new_tokens = 100`, 2026-09-17, one export + one eval per row; the
+adapter row is the same nine-suite batch-1 run as above.
+
+| Target | Weights | Export wall | Eval wall | Exact match (per suite) | Token-F1 (per suite) | Median latency ms (per suite) | Commands |
+|---|---|---|---|---|---|---|---|
+| adapter (bf16 base + LoRA) | 34 MB adapter | — | part of the 27 min nine-suite run | **14/46** (0/16 / 5/14 / 9/16) | 0.264 / 0.636 / 0.628 | 2377 / 2151 / 1464 | `sloth eval --adapter runs/demo-lora … --batch-size 1` |
+| merged-16bit | 2.34 GB | 42 s | 192 s | **14/46** (0/16 / 5/14 / 9/16) | 0.274 / 0.622 / 0.628 | 1815 / 1770 / 1429 | `sloth export --adapter runs/demo-lora --format merged-16bit … ; sloth eval --model <dir> … --batch-size 1` |
+| gguf Q4_K_M | 0.73 GB | 55 s | 71 s | **0/46** (0/16 / 0/14 / 0/16) | 0.238 / 0.484 / 0.363 | 1513 / 1466 / 1420 | `sloth export --adapter runs/demo-lora --format gguf --quant q4_k_m … ; sloth eval --model <dir> … --batch-size 1` |
+| awq (W4A16, compressed-tensors) | 1.08 GB | 81 s | 188 s | **12/46** (1/16 / 1/14 / 10/16) | 0.375 / 0.374 / 0.723 | 1704 / 1443 / 1432 | `sloth export --adapter runs/demo-lora --format awq --calib examples/chat-smoke.jsonl … ; sloth eval --model <dir> … --batch-size 1` |
+| nvfp4 (compressed-tensors) | 1.12 GB | 64 s | 217 s | **9/46** (0/16 / 2/14 / 7/16) | 0.249 / 0.368 / 0.564 | 2463 / 2279 / 1596 | `sloth export --adapter runs/demo-lora --format nvfp4 --calib examples/chat-smoke.jsonl … ; sloth eval --model <dir> … --batch-size 1` |
+
+**Reading it.** merged-16bit reproduces the adapter (14/46, F1 within 0.02) —
+the merge is lossless as far as these suites can tell. AWQ W4A16 keeps 12/46 and
+even gains on `task-format` (10/16, F1 0.72); NVFP4 keeps 9/46. **GGUF Q4_K_M
+drops to 0/46** with F1 0.24 / 0.48 / 0.36 — a far larger loss than the other
+4-bit formats, which points at the llama.cpp scoring path (prompt rendering,
+stop conditions, the whitespace token approximation) as much as at Q4_K_M
+itself (plan risk r14, follow-up). The two `0/46 on every format` caveats from
+the #22 run are closed by this table; the GGUF row is the one that now needs a
+diagnosis rather than a caveat.
+
 ## Serving latency + tok/s
 
 Once an adapter is exported (`sloth export`), **serving it is a manual
@@ -362,11 +388,15 @@ Qwen3 9B), raise `max_steps`, and run on a box with free unified memory.
 
 ## What is *not* yet benchmarked
 
-- Production-scale models (Qwen3 4B / 9B) on a free box — needs headroom this run
-  didn't have. The orchestration and trainer code are identical; only the model
-  size and step count change.
-- Throughput at larger `max_seq_len` / `batch_size`.
-- Multi-hundred-step convergence and eval accuracy on a real corpus — the
-  per-format table above is measured on a 10-step smoke adapter and scores 0/46
-  exact-match everywhere; it becomes a quantization-loss number only with a
-  trained adapter.
+- Production-scale models (Qwen3 4B / 9B) on a free box — needs headroom the
+  fixture runs above did not have (lobes' vLLM resident). The orchestration and
+  trainer code are identical; only the model size and step count change.
+- Throughput at larger `max_seq_len` / `batch_size` — and, for LFM2, *any*
+  batched generation until the eval loop gains a per-family padding guard (r13).
+- A QLoRA (`load_in_4bit = true`) adapter through `sloth bench` — the lm_eval
+  `peft=` load was proven on a bf16 LoRA only.
+- Tool-call compliance on an *Instruct* base (the fixture is a Base checkpoint,
+  which never emits LFM2's tool-call wrapper — the 0 % row is expected, not a
+  measurement of the adapter).
+- The GGUF Q4_K_M scoring path (r14) and the serving tok/s table (lobes, manual
+  hand-off — see above).
