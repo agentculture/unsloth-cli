@@ -1,12 +1,22 @@
 """``sloth eval`` — score an adapter or a merged/quantized model on an eval suite.
 
-Evaluates against one or more JSONL files whose records conform to the **task**
-schema (``{"task": …, "input": …, "expected_output": …}``).  ``--suite`` accepts a
-single file or a directory — a directory is expanded to its sorted ``*.jsonl``
-children — and is repeatable (``--suite a.jsonl --suite dir/``).  Every resolved
-file is validated against the task schema *before any container is launched*
-(see :func:`_resolve_and_validate_suite`), so a malformed suite costs no
-docker/GPU spend.  All inference is local and offline.
+Evaluates against one or more **named** eval suites — each ``--suite`` flag names
+one suite, whose name is derived from the given path's stem (sanitised via
+:func:`~sloth.tune.metrics.sanitize_suite_name`). ``--suite`` accepts a single
+file or a directory — a directory is expanded to its sorted ``*.jsonl``
+children — and is repeatable (``--suite a.jsonl --suite dir/``). Two ``--suite``
+entries whose stems sanitise to the same name is a collision and exits ``1``
+with a ``hint:`` before anything else runs.
+
+Every resolved file is schema-detected (chat / task / instruction / structured /
+toolcall — see :func:`~sloth.tune.datasets.detect_schema`) and validated
+*before any container is launched* (see :func:`_resolve_named_suites`), so a
+malformed suite costs no docker/GPU spend. When a training dataset can be
+found (``--train-dataset``, or ``dataset.path`` from the adapter/model's
+``training_metadata.json``), a train/eval overlap check
+(:func:`~sloth.tune.datasets.overlap_check`) also runs on the host, before any
+container launch — an overlap exits ``1`` naming every duplicated
+``file:line``. All inference is local and offline.
 
 **Two mutually-exclusive targets.** ``--adapter DIR`` scores a LoRA/QLoRA adapter
 against its base model (via :func:`~sloth.tune._trainer.run_eval`, which wraps the
@@ -24,8 +34,9 @@ delegates to :func:`~sloth.tune._trainer.run_training`.
 **Host vs in-container routing**
 
 On the host (no ``--in-container`` flag) :func:`cmd_eval` resolves the target and
-validates the suite file, then hands off GPU/ML work to the NGC container via
-:func:`sloth.tune.container.launch`, forwarding all original args plus
+every named suite, runs the overlap check, then hands off GPU/ML work to the NGC
+container via :func:`sloth.tune.container.launch`, forwarding all original args
+(including ``--perplexity`` / ``--tool-call-family`` when given) plus
 ``--in-container`` to prevent docker recursion.  Identity bind-mounts are added
 for the parent directories of the target and suite so their host-absolute paths
 resolve unchanged inside the container; a ``--model`` run additionally takes
@@ -33,25 +44,33 @@ resolve unchanged inside the container; a ``--model`` run additionally takes
 ``HOME``/``UNSLOTH_LLAMA_TAG``), because a GGUF directory is scored with
 ``llama-completion`` out of that cache.
 
+**Output shape.** Results are always reported keyed by suite name:
+``{"suites": {<name>: <payload>, ...}}`` in ``--json`` mode, and one text block
+per suite otherwise. A single ``sloth eval --adapter X --suite A --suite B``
+invocation writes ``eval/A.json`` and ``eval/B.json`` under the target
+directory (see :func:`_write_named_eval_json`).
+
 Usage::
 
     sloth eval --adapter adapters/qwen3-4b-qlora --suite data/eval.jsonl
     sloth eval --model exports/qwen3-4b-awq --suite data/eval.jsonl --json
+    sloth eval --adapter adapters/qwen3-4b-qlora --suite a.jsonl --suite b.jsonl
 """
 
 from __future__ import annotations
 
 import argparse
+import inspect
+import json as _json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from sloth.cli._errors import EXIT_USER_ERROR, CliError
-from sloth.cli._output import emit_result
-from sloth.tune import container
+from sloth.cli._output import emit_diagnostic, emit_result
+from sloth.tune import container, datasets, metadata, metrics
 from sloth.tune._exporter import run_eval_model
 from sloth.tune._trainer import run_eval
-from sloth.tune.datasets import validate_suite
 
 #: Default generation batch size for the eval loop (forwarded to the in-container seam).
 DEFAULT_BATCH_SIZE = 8
@@ -92,6 +111,11 @@ class _EvalTarget:
     def kind(self) -> str:
         """``"adapter"`` or ``"model"`` — the flag without its dashes."""
         return self.flag.lstrip("-")
+
+    @property
+    def directory(self) -> Path:
+        """The directory results are written under (the parent, for a bare .gguf file)."""
+        return self.path if self.path.is_dir() else self.path.parent
 
 
 def _resolve_target(args: argparse.Namespace) -> _EvalTarget:
@@ -153,25 +177,135 @@ def _resolve_target(args: argparse.Namespace) -> _EvalTarget:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_and_validate_suite(raw_entries: list[str]) -> list[Path]:
-    """Expand and task-schema-validate every ``--suite`` entry, in order given.
+def _peek_first_record(path: Path) -> Any:
+    """Return the first non-blank line of *path*, parsed as JSON, or ``None``.
 
-    Each entry may be a single ``.jsonl`` file or a directory (expanded to its
-    sorted ``*.jsonl`` children by :func:`~sloth.tune.datasets.validate_suite`).
-    Validation happens here — before any container launch or ML seam call — so
-    a malformed suite (anywhere in a directory) costs no docker/GPU spend and
-    names the offending file *and* line.
+    ``None`` covers an empty/blank-only file, an unparsable first line, or a
+    first record that isn't a JSON object — all of which make the schema
+    undetectable from this file alone.
+    """
+    try:
+        with path.open(encoding="utf-8") as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    record = _json.loads(line)
+                except _json.JSONDecodeError:
+                    return None
+                return record if isinstance(record, dict) else None
+    except OSError:
+        return None
+    return None
+
+
+def _detect_file_schema(path: Path) -> str | None:
+    """Guess *path*'s schema from its first record.
+
+    Reuses :func:`sloth.tune.datasets.detect_schema` for the chat case, and
+    extends it — from the same module's exported key-set constants — to the
+    other four schemas (task / instruction / structured / toolcall), without
+    needing any change to ``sloth/tune/datasets.py`` itself. An instruction
+    record without a ``"constraints"`` key is indistinguishable from a plain
+    task record by key set alone, and is reported as ``"task"`` (both
+    validators accept it identically in that case). Returns ``None`` when no
+    known schema matches.
+    """
+    record = _peek_first_record(path)
+    if record is None:
+        return None
+    if datasets.detect_schema(record) == "chat":
+        return "chat"
+    if not isinstance(record, dict):
+        return None
+    keys = set(record.keys())
+    if keys == datasets.TASK_KEYS:
+        return "task"
+    if keys == datasets.INSTRUCTION_KEYS:
+        return "instruction"
+    if keys == datasets.STRUCTURED_KEYS:
+        return "structured"
+    if keys == datasets.TOOLCALL_KEYS:
+        return "toolcall"
+    return None
+
+
+def _validate_suite_file(path: Path) -> None:
+    """Detect *path*'s schema and validate every record against it.
 
     Raises
     ------
     CliError(code=1)
-        On the first invalid file/line, or when an entry resolves to no files.
+        When the schema cannot be detected, or a record fails validation
+        (the message is prefixed with ``<path>:`` so a multi-file suite names
+        both the offending file and the line within it).
     """
-    resolved: list[Path] = []
+    schema = _detect_file_schema(path)
+    if schema is None:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"{path}: could not detect a known eval schema from the first record",
+            remediation=(
+                "Each suite file must be chat, task, instruction, structured, or "
+                "toolcall schema — see `sloth explain eval`."
+            ),
+        )
+    try:
+        datasets.validate_dataset(path, schema)
+    except CliError as exc:
+        raise CliError(
+            code=exc.code,
+            message=f"{path}: {exc.message}",
+            remediation=exc.remediation,
+        ) from exc
+
+
+def _resolve_named_suites(raw_entries: list[str]) -> dict[str, list[Path]]:
+    """Resolve, name, and validate every ``--suite`` entry, in order given.
+
+    Each entry may be a single ``.jsonl`` file or a directory (expanded to its
+    sorted ``*.jsonl`` children by :func:`~sloth.tune.datasets.resolve_suite_paths`).
+    The suite's name is its own path stem, sanitised via
+    :func:`~sloth.tune.metrics.sanitize_suite_name` — two entries that sanitise
+    to the same name is a collision and raises before any file is even resolved.
+    Every resolved file is schema-detected and validated (see
+    :func:`_validate_suite_file`) before any container launch or ML seam call.
+
+    Returns
+    -------
+    dict[str, list[Path]]
+        ``{suite_name: [resolved_file, ...]}``, insertion-ordered to match
+        *raw_entries*.
+
+    Raises
+    ------
+    CliError(code=1)
+        On a name collision, a missing/empty suite path, or the first
+        invalid/undetectable file.
+    """
+    named: dict[str, list[Path]] = {}
+    sources: dict[str, str] = {}
     for raw in raw_entries:
-        report = validate_suite(raw, schema="task")
-        resolved.extend(Path(str(f["path"])) for f in report["files"])
-    return resolved
+        name = metrics.sanitize_suite_name(raw)
+        if name in named:
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=(
+                    f"--suite name collision: {sources[name]!r} and {raw!r} "
+                    f"both resolve to suite name {name!r}"
+                ),
+                remediation=(
+                    "Rename one of the suite files/directories so their stems "
+                    "differ — the suite name is derived from the path stem."
+                ),
+            )
+        files = datasets.resolve_suite_paths(raw)
+        for file_path in files:
+            _validate_suite_file(file_path)
+        named[name] = files
+        sources[name] = raw
+    return named
 
 
 def _validate_batch_size(batch_size: int) -> None:
@@ -199,6 +333,65 @@ def _render_suite_label(suite_paths: list[Path]) -> str:
     if len(suite_paths) == 1:
         return str(suite_paths[0])
     return f"{len(suite_paths)} files"
+
+
+# ---------------------------------------------------------------------------
+# Train/eval overlap check (host, before any container launch)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_train_dataset(target_dir: Path, train_dataset_arg: str | None) -> Path | None:
+    """Return the training dataset path to overlap-check against, or ``None``.
+
+    ``--train-dataset`` (when given) always wins. Otherwise, when
+    ``<target_dir>/training_metadata.json`` exists, its ``dataset.path`` field
+    (written by :func:`sloth.tune.metadata.write_metadata`) is used. Returns
+    ``None`` when neither source is available — the caller skips the check and
+    emits a diagnostic rather than failing.
+    """
+    if train_dataset_arg:
+        return Path(train_dataset_arg)
+    try:
+        record = metadata.read_metadata(target_dir)
+    except CliError:
+        return None
+    dataset_path = record.get("dataset", {}).get("path")
+    return Path(dataset_path) if dataset_path else None
+
+
+def _check_train_eval_overlap(
+    target_dir: Path,
+    train_dataset_arg: str | None,
+    suite_paths: list[Path],
+) -> None:
+    """Run the cross-schema train/eval overlap check, before any container launch.
+
+    Raises ``CliError(code=1)`` with every duplicated ``file:line`` location
+    named in the hint when an overlap is found. When no training dataset can be
+    resolved (neither ``--train-dataset`` nor a readable
+    ``training_metadata.json``), the check is skipped and a diagnostic is
+    emitted on stderr instead of failing.
+    """
+    train_dataset = _resolve_train_dataset(target_dir, train_dataset_arg)
+    if train_dataset is None:
+        emit_diagnostic(
+            "note: no --train-dataset given and no training_metadata.json found; "
+            "skipping train/eval overlap check"
+        )
+        return
+    overlaps = datasets.overlap_check(train_dataset, suite_paths)
+    if overlaps:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=(
+                f"train/eval overlap detected between {train_dataset} and the eval "
+                f"suite(s) at {len(overlaps)} location(s)"
+            ),
+            remediation=(
+                "Remove or replace the overlapping row(s), or use a different eval "
+                "suite. Overlapping locations: " + "; ".join(overlaps)
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -233,18 +426,21 @@ def _launch_container(
     *,
     quant: str | None,
     batch_size: int,
+    perplexity: bool = False,
+    tool_call_family: str | None = None,
 ) -> dict[str, Any]:
     """Re-run this eval inside the NGC container with ``--in-container``.
 
     Every resolved suite file is forwarded as its own ``--suite <abs path>`` flag
     (a directory is already expanded to individual files by
-    :func:`_resolve_and_validate_suite` before this is called), matching the
+    :func:`_resolve_named_suites` before this is called), matching the
     in-container argv contract: ``eval --in-container --json --suite <p> [--suite
-    <p> ...] [--quant q] [--batch-size n]`` plus ``--adapter``/``--model``.
-    ``--json`` is always forwarded to the container (unconditionally, regardless
-    of the host's own ``--json`` flag) so the container always prints a
-    structured result line for :func:`~sloth.tune.container.launch` to parse and
-    return; the caller re-renders that dict for the host's own ``--json`` flag.
+    <p> ...] [--quant q] [--batch-size n] [--perplexity] [--tool-call-family f]``
+    plus ``--adapter``/``--model``. ``--json`` is always forwarded to the
+    container (unconditionally, regardless of the host's own ``--json`` flag) so
+    the container always prints a structured result line for
+    :func:`~sloth.tune.container.launch` to parse and return; the caller
+    re-renders that dict for the host's own ``--json`` flag.
 
     Identity mounts (``host == container``) for the target's and every suite file's
     parent dirs make the host-absolute paths in *sloth_args* resolve unchanged
@@ -266,6 +462,10 @@ def _launch_container(
     if quant:
         sloth_args += ["--quant", str(quant)]
     sloth_args += ["--batch-size", str(batch_size)]
+    if perplexity:
+        sloth_args.append("--perplexity")
+    if tool_call_family:
+        sloth_args += ["--tool-call-family", str(tool_call_family)]
     sloth_args.append("--json")
     sloth_args.append("--in-container")
 
@@ -294,7 +494,7 @@ def _launch_container(
 
 
 def _render_text(target: _EvalTarget, suite_label: str, summary: dict[str, Any]) -> str:
-    """Render the eval summary for stdout in text mode."""
+    """Render one suite's eval summary for stdout in text mode."""
     lines = [
         f"eval suite: {suite_label}",
         f"{target.kind + ':':<11} {target.path}",
@@ -313,9 +513,22 @@ def _render_text(target: _EvalTarget, suite_label: str, summary: dict[str, Any])
     return "\n".join(lines)
 
 
+def _render_named_report_text(
+    target: _EvalTarget,
+    named_suites: dict[str, list[Path]],
+    named_results: dict[str, dict[str, Any]],
+) -> str:
+    """Render one text block per suite, in the order *named_results* provides."""
+    blocks = []
+    for name, payload in named_results.items():
+        suite_label = _render_suite_label(named_suites.get(name, []))
+        blocks.append(f"suite: {name}\n" + _render_text(target, suite_label, payload))
+    return "\n\n".join(blocks)
+
+
 # ---------------------------------------------------------------------------
 # ML-seam call — bridges the CURRENT run_eval/run_eval_model signature and the
-# richer one t5 (a sibling task) is adding
+# richer one t6 (a sibling task) is adding
 # ---------------------------------------------------------------------------
 
 
@@ -326,14 +539,77 @@ def _call_eval_seam(
     *,
     quant: str | None,
     batch_size: int,
+    perplexity: bool = False,
+    tool_call_family: str | None = None,
 ) -> dict[str, Any]:
     """Call *func* (``run_eval`` or ``run_eval_model``) with the full suite contract.
 
-    Both seams accept ``suite_paths`` (every resolved file, scored per file and in
-    aggregate), ``quant`` (GGUF selector; ignored by the adapter path) and
-    ``batch_size`` as keyword arguments.
+    Both seams accept ``suite_paths`` (every resolved file, scored per file and
+    in aggregate), ``quant`` (GGUF selector; ignored by the adapter path), and
+    ``batch_size`` as keyword arguments. ``perplexity`` and ``tool_call_family``
+    are forwarded the same way, but only when *func*'s signature actually
+    accepts them (via :func:`inspect.signature`) — this shim tolerates the
+    older seam signature (without those two keywords) that ships until a
+    sibling task adds them, and any signature carrying ``**kwargs``.
     """
-    return func(str(target_path), suite_paths=suite_paths, quant=quant, batch_size=batch_size)
+    candidate_kwargs: dict[str, Any] = {
+        "suite_paths": suite_paths,
+        "quant": quant,
+        "batch_size": batch_size,
+        "perplexity": perplexity,
+        "tool_call_family": tool_call_family,
+    }
+    try:
+        parameters = inspect.signature(func).parameters
+        accepts_var_keyword = any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+        )
+    except (TypeError, ValueError):
+        parameters = {}
+        accepts_var_keyword = True
+
+    if accepts_var_keyword:
+        kwargs = candidate_kwargs
+    else:
+        kwargs = {k: v for k, v in candidate_kwargs.items() if k in parameters}
+
+    return func(str(target_path), **kwargs)
+
+
+def _normalize_named_results(
+    raw_result: dict[str, Any], suite_names: list[str]
+) -> dict[str, dict[str, Any]]:
+    """Normalize a seam/launch return value into ``{suite_name: payload}``.
+
+    If *raw_result* is already suite-keyed (``{"suites": {...}}`` — the shape a
+    richer seam, or this module's own in-container JSON emission, produces),
+    that inner mapping is returned as-is. Otherwise *raw_result* is the older,
+    single-payload shape and is duplicated under every name in *suite_names* —
+    a faithful (if not per-suite-precise) fallback until every seam reports
+    per-suite results natively.
+    """
+    if isinstance(raw_result, dict) and "suites" in raw_result:
+        return dict(raw_result["suites"])
+    return {name: raw_result for name in suite_names}
+
+
+def _write_named_eval_json(
+    target_dir: Path,
+    named_results: dict[str, dict[str, Any]],
+    *,
+    batch_size: int,
+) -> None:
+    """Write ``<target_dir>/eval/<name>.json`` for every suite in *named_results*.
+
+    Mirrors :func:`sloth.tune._trainer.write_eval_json`'s failure handling: an
+    :class:`OSError` (e.g. a read-only target directory) becomes a stderr
+    diagnostic rather than losing an otherwise-complete eval run.
+    """
+    for name, payload in named_results.items():
+        try:
+            metrics.write_eval_json(target_dir, name, payload, batch_size=batch_size)
+        except OSError as exc:
+            emit_diagnostic(f"note: could not write eval/{name}.json: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -345,10 +621,11 @@ def cmd_eval(args: argparse.Namespace) -> int | None:
     """Handler for ``sloth eval``.
 
     On the **host** (``--in-container`` not set): resolves the single target
-    (``--adapter`` XOR ``--model``) and the suite file, then delegates GPU/ML work
-    to the NGC container via :func:`sloth.tune.container.launch` (forwarding all
-    args plus ``--in-container`` to prevent recursion).  Identity bind-mounts are
-    added for the parent directories of the target and suite paths so the
+    (``--adapter`` XOR ``--model``) and every named suite, runs the train/eval
+    overlap check, then delegates GPU/ML work to the NGC container via
+    :func:`sloth.tune.container.launch` (forwarding all args plus
+    ``--in-container`` to prevent recursion).  Identity bind-mounts are added
+    for the parent directories of the target and suite paths so the
     host-absolute paths forwarded in sloth_args resolve unchanged inside the
     container (see :func:`_launch_container`).
     Returns ``None`` on success (implicit fall-through); :class:`CliError` is
@@ -358,15 +635,16 @@ def cmd_eval(args: argparse.Namespace) -> int | None:
     **Inside the container** (``--in-container`` is set): validates inputs, calls
     the ML seam for the resolved target — :func:`~sloth.tune._trainer.run_eval`
     for ``--adapter``, :func:`~sloth.tune._exporter.run_eval_model` for
-    ``--model`` — and emits results via the output contract.
+    ``--model`` — writes ``eval/<suite>.json`` for every named suite, and emits
+    results (keyed by suite name) via the output contract.
 
     Parameters
     ----------
     args:
         Parsed namespace with ``adapter``, ``model``, ``suite`` (a list — one
         entry per ``--suite`` flag; a bare string is also accepted for direct
-        callers), ``quant``, ``batch_size``, ``json``, and ``in_container``
-        attributes.
+        callers), ``quant``, ``batch_size``, ``perplexity``, ``tool_call_family``,
+        ``train_dataset``, ``json``, and ``in_container`` attributes.
 
     Returns
     -------
@@ -376,6 +654,9 @@ def cmd_eval(args: argparse.Namespace) -> int | None:
     json_mode = bool(getattr(args, "json", False))
     in_container = bool(getattr(args, "in_container", False))
     quant = getattr(args, "quant", None)
+    perplexity = bool(getattr(args, "perplexity", False))
+    tool_call_family = getattr(args, "tool_call_family", None) or None
+    train_dataset_arg = getattr(args, "train_dataset", None)
     _raw_batch_size = getattr(args, "batch_size", None)
     batch_size = DEFAULT_BATCH_SIZE if _raw_batch_size is None else int(_raw_batch_size)
 
@@ -385,58 +666,79 @@ def cmd_eval(args: argparse.Namespace) -> int | None:
     # --- resolve the target: exactly one of --adapter / --model --------------
     target = _resolve_target(args)
 
-    # --- resolve + validate the suite (file(s) or directory(ies)) -------------
+    # --- resolve, name, and validate every suite ------------------------------
     # A directory is expanded to its sorted *.jsonl children and every file is
-    # task-schema-validated BEFORE any container launch — a malformed suite
-    # anywhere in a directory costs no docker/GPU spend (fails fast, names the
-    # file and line). ``args.suite`` is normally a list (argparse
+    # schema-detected and validated BEFORE any container launch — a malformed
+    # suite anywhere in a directory costs no docker/GPU spend (fails fast,
+    # names the file and line). ``args.suite`` is normally a list (argparse
     # ``action="append"``); a bare string is accepted too so direct callers
     # (and existing single-suite tests) keep working unchanged.
     raw_suite = args.suite
     if isinstance(raw_suite, str):
         raw_suite = [raw_suite]
-    suite_paths = _resolve_and_validate_suite(list(raw_suite))
+    named_suites = _resolve_named_suites(list(raw_suite))
+    suite_names = list(named_suites.keys())
+    suite_paths = [p for files in named_suites.values() for p in files]
 
-    # --- HOST PATH: route GPU/ML work through the NGC container --------------
+    # --- HOST PATH: overlap check, then route GPU/ML work through the NGC container
     if not in_container:
+        # Runs before any docker invocation — an overlap is a user error that
+        # should never cost a container launch.
+        _check_train_eval_overlap(target.directory, train_dataset_arg, suite_paths)
+
         # launch() raises CliError on any container/docker failure and otherwise
-        # returns the parsed JSON result the container printed (the same summary
-        # dict the in-container branch below builds). Emit it through the HOST's
-        # own output contract so a host caller sees the same shape the
-        # in-container path would have printed.
-        summary = _launch_container(
+        # returns the parsed JSON result the container printed — already
+        # suite-keyed, since the container's own cmd_eval always runs --json.
+        # normalize() tolerates a flat/legacy dict too (e.g. a test double).
+        raw_result = _launch_container(
             target,
             [p.resolve() for p in suite_paths],
             quant=quant,
             batch_size=batch_size,
+            perplexity=perplexity,
+            tool_call_family=tool_call_family,
         )
+        named_results = _normalize_named_results(raw_result, suite_names)
         if json_mode:
-            emit_result(summary, json_mode=True)
+            emit_result({"suites": named_results}, json_mode=True)
         else:
             emit_result(
-                _render_text(target, _render_suite_label(suite_paths), summary), json_mode=False
+                _render_named_report_text(target, named_suites, named_results), json_mode=False
             )
         return
 
     # --- IN-CONTAINER PATH: delegate to the ML seam -------------------------
     # Both seams lazy-import torch/transformers/peft inside their bodies; this
-    # module stays ML-free. The suite was already task-schema-validated above.
+    # module stays ML-free. Every suite file was already validated above.
     if target.flag == "--model":
-        summary: dict[str, Any] = _call_eval_seam(
-            run_eval_model, target.path, suite_paths, quant=quant, batch_size=batch_size
+        raw_result = _call_eval_seam(
+            run_eval_model,
+            target.path,
+            suite_paths,
+            quant=quant,
+            batch_size=batch_size,
+            perplexity=perplexity,
+            tool_call_family=tool_call_family,
         )
     else:
-        summary = _call_eval_seam(
-            run_eval, target.path, suite_paths, quant=quant, batch_size=batch_size
+        raw_result = _call_eval_seam(
+            run_eval,
+            target.path,
+            suite_paths,
+            quant=quant,
+            batch_size=batch_size,
+            perplexity=perplexity,
+            tool_call_family=tool_call_family,
         )
 
-    # --- emit results --------------------------------------------------------
+    named_results = _normalize_named_results(raw_result, suite_names)
+    _write_named_eval_json(target.directory, named_results, batch_size=batch_size)
+
+    # --- emit results (always suite-keyed) ------------------------------------
     if json_mode:
-        emit_result(summary, json_mode=True)
+        emit_result({"suites": named_results}, json_mode=True)
     else:
-        emit_result(
-            _render_text(target, _render_suite_label(suite_paths), summary), json_mode=False
-        )
+        emit_result(_render_named_report_text(target, named_suites, named_results), json_mode=False)
 
 
 # ---------------------------------------------------------------------------
@@ -467,9 +769,11 @@ def register(sub: argparse._SubParsersAction) -> None:
         action="append",
         metavar="PATH",
         help=(
-            "Path to a task-schema JSONL eval suite, or a directory of them "
-            "(every *.jsonl child is scored). Repeatable: pass --suite more than "
-            "once to combine several files/directories."
+            "Path to a JSONL eval suite (chat/task/instruction/structured/toolcall "
+            "schema, auto-detected), or a directory of them (every *.jsonl child is "
+            "scored). Repeatable: pass --suite more than once to score several named "
+            "suites in one invocation (name = the path's stem; a stem collision "
+            "between two --suite entries exits 1)."
         ),
     )
     p.add_argument(
@@ -489,6 +793,33 @@ def register(sub: argparse._SubParsersAction) -> None:
         default=DEFAULT_BATCH_SIZE,
         metavar="N",
         help=f"Generation batch size for the eval loop (default: {DEFAULT_BATCH_SIZE}).",
+    )
+    p.add_argument(
+        "--perplexity",
+        action="store_true",
+        help="Also compute held-out perplexity/loss during eval (forwarded in-container).",
+    )
+    p.add_argument(
+        "--tool-call-family",
+        dest="tool_call_family",
+        default=None,
+        metavar="FAMILY",
+        help=(
+            "Tool-call parsing family to score toolcall-schema suites against "
+            "(forwarded in-container); ignored when no toolcall suite is present."
+        ),
+    )
+    p.add_argument(
+        "--train-dataset",
+        dest="train_dataset",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Training dataset to check every --suite against for train/eval overlap "
+            "before any container launch. Defaults to the dataset recorded in the "
+            "target's training_metadata.json when present; skipped (with a stderr "
+            "diagnostic) when neither is available."
+        ),
     )
     p.add_argument("--json", action="store_true", help="Emit structured JSON.")
     p.add_argument(

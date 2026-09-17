@@ -279,22 +279,35 @@ inference is local and offline (`local_files_only=True`); the heavy ML stack is
 imported lazily inside the inference backend, so importing the verb stays
 torch-free.
 
-The suite is one or more JSONL files whose records conform to the **task**
-schema (`{"task", "input", "expected_output"}`). `--suite` accepts a single file
-or a directory — a directory is expanded to its sorted `*.jsonl` children — and
-is repeatable (`--suite a.jsonl --suite dir/`). Every resolved file is validated
-against the task schema **before any container is launched**: a malformed file
-anywhere in a `--suite` directory exits `1` naming the file and line, and costs
-no docker/GPU spend. `--batch-size` is validated on the host too — a value
-below `1` exits `1` before the suite is even checked. Each record's prediction
-is compared to its `expected_output` for an exact match and scored with a
-stdlib token-level F1 (`f1`, no external scoring dependency). The result is an
-aggregate summary (`total`, `exact_match`, `exact_match_pct`, `f1`) at the top
-level, plus a per-file `files` list (the same fields, scoped to each resolved
-suite file) and per-record `results`. `eval.json` (the summary plus
-`suite_paths` / `target` / `written_at`) is written into the directory that
-was evaluated: the adapter directory for `--adapter`, or the export directory
-for `--model` — the parent directory when a single `.gguf` file is passed.
+Each `--suite` flag names one eval suite — its name is the given path's stem
+(sanitised), and `--suite` is repeatable (`--suite a.jsonl --suite b/`) to
+score several named suites in **one invocation**. `--suite` accepts a single
+file or a directory — a directory is expanded to its sorted `*.jsonl`
+children. Each record's schema (chat / task / instruction / structured /
+toolcall) is auto-detected from its keys and validated **before any container
+is launched**: an undetectable or malformed record anywhere in a `--suite`
+directory exits `1` naming the file and line, and costs no docker/GPU spend.
+Two `--suite` entries whose stems sanitise to the same name is a collision and
+exits `1` with a `hint:` before anything else runs. `--batch-size` is
+validated on the host too — a value below `1` exits `1` before the suite is
+even checked.
+
+When a training dataset can be identified — `--train-dataset PATH`, or the
+`dataset.path` recorded in the target's `training_metadata.json` — a
+train/eval overlap check runs on the host, **before any container launch**:
+an overlapping row anywhere in the suites exits `1` naming every duplicated
+`file:line`. When neither is available, the check is skipped with a stderr
+diagnostic, not a failure.
+
+Each record's prediction is compared to its `expected_output` for an exact
+match and scored with a stdlib token-level F1 (`f1`, no external scoring
+dependency). Results are always reported **keyed by suite name**:
+`{"suites": {<name>: {total, exact_match, exact_match_pct, f1, results, ...}}}`
+in `--json` mode, and one text block per suite otherwise. One invocation
+writes `eval/<name>.json` for every named suite (batch size and target
+included) into the directory that was evaluated: the adapter directory for
+`--adapter`, or the export directory for `--model` — the parent directory
+when a single `.gguf` file is passed.
 
 ## Two targets: `--adapter` or `--model`
 
@@ -316,32 +329,45 @@ for a plain bf16 merged directory or a GGUF).
     unsloth-cli eval --adapter adapters/qwen3-4b-qlora --suite data/eval.jsonl
     unsloth-cli eval --model exports/qwen3-4b-awq --suite examples/eval/
     unsloth-cli eval --model exports/qwen3-4b-gguf --suite data/eval.jsonl --quant q4_k_m
+    unsloth-cli eval --adapter adapters/qwen3-4b-qlora \\
+        --suite regression.jsonl --suite toolcalls.jsonl --json
     unsloth-cli eval --adapter adapters/qwen3-4b-qlora --suite examples/eval/ \\
-        --batch-size 16 --json
+        --train-dataset data/train.jsonl --perplexity --tool-call-family qwen
 
 ## Key flags
 
 - `--adapter DIR` — adapter directory produced by `unsloth-cli train`.
 - `--model DIR` — merged / quantized / GGUF directory produced by
   `unsloth-cli export` (mutually exclusive with `--adapter`).
-- `--suite PATH` (required, repeatable) — a task-schema JSONL eval suite file,
-  or a directory of them (every `*.jsonl` child is scored, sorted). Pass
-  `--suite` more than once to combine several files/directories.
+- `--suite PATH` (required, repeatable) — names one eval suite (chat / task /
+  instruction / structured / toolcall schema, auto-detected): a single JSONL
+  file, or a directory of them (every `*.jsonl` child is scored, sorted). Pass
+  `--suite` more than once to score several named suites in one invocation;
+  two entries whose stems collide exit `1`.
 - `--quant NAME` — when `--model` holds several GGUF files, the quant tag to
   score (case-insensitive, e.g. `q4_k_m`); ignored for a single-GGUF or
   non-GGUF `--model` directory, and for `--adapter`.
 - `--batch-size N` — generation batch size for the eval loop (default: `8`);
   must be `>= 1` (`1` is the explicit unbatched mode) or the run exits `1`
-  before any suite validation or container launch.
-- `--json` — emit the scored summary and per-record results as structured JSON.
+  before any suite validation or container launch. Recorded in every written
+  `eval/<name>.json`.
+- `--perplexity` — also compute held-out perplexity/loss during eval;
+  forwarded into the container.
+- `--tool-call-family NAME` — the tool-call parsing family to score
+  toolcall-schema suites against; forwarded into the container.
+- `--train-dataset PATH` — the training dataset to check every `--suite`
+  against for train/eval overlap before any container launch. Defaults to the
+  dataset recorded in the target's `training_metadata.json` when present.
+- `--json` — emit the scored summary, keyed by suite name, as structured JSON.
 
 ## Exit codes
 
 - `0` success
 - `1` user-input error (both/neither target, missing adapter or model dir,
   a `--batch-size` below `1`, a missing `--suite` path, an empty `--suite`
-  directory, or a malformed record anywhere in the suite — named by file and
-  line, before any container launch)
+  directory, a `--suite` name collision, an undetectable/malformed record
+  anywhere in a suite — named by file and line, before any container launch —
+  or a train/eval overlap naming every duplicated `file:line`)
 - `2` environment / setup error (ML stack not installed, llama.cpp missing, OOM)
 """
 
