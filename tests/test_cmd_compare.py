@@ -976,3 +976,32 @@ def test_compare_base_does_not_gate_a_suite_only_one_side_has(
     legacy = payload["deltas"]["suites"]["legacy"]
     assert legacy["exact_match_pct"]["a"] is None
     assert legacy["exact_match_pct"]["b"] == 80.0
+
+
+def test_compare_base_precreates_results_dir_and_fails_on_empty_base_side(
+    base_fixture: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Live-measured 2026-09-17 (plan risk r15): docker created the bind-mounted
+    eval-base/ as root, the in-container writer got EACCES, and compare passed
+    with no base side. The dir must exist before the second launch, and a base
+    run that yields no results is exit 1, never a vacuous pass."""
+    adapter, suite_file = base_fixture
+    adapter_results = {"regression": _suite_payload("regression", suite_file)}
+    fake = _install(monkeypatch, _FakeLaunch(adapter_results, {}))  # base writes nothing
+    seen_existing: list[bool] = []
+    orig_call = fake.__call__
+
+    def _spy(sloth_args: list[str], **kwargs: object) -> dict:
+        if sloth_args[:2] == ["eval", "--model"]:
+            seen_existing.append((adapter / "eval-base").is_dir())
+        return orig_call(sloth_args, **kwargs)
+
+    monkeypatch.setattr(compare_mod.container, "launch", _spy)
+    with pytest.raises(CliError) as exc_info:
+        cmd_compare(_base_args(str(adapter), "unsloth/Qwen3-4B", json_mode=True))
+    assert exc_info.value.code == 1
+    assert "produced no results" in exc_info.value.message
+    assert exc_info.value.remediation
+    assert seen_existing == [True], "eval-base/ must be created by the host user before launch"

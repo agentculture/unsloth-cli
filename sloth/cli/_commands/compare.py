@@ -493,6 +493,11 @@ def _cmd_compare_base(args: argparse.Namespace) -> int:
         batch_size=batch_size,
         workdir=adapter_dir.resolve(),
     )
+    # Pre-create the base results dir AS THE HOST USER: docker creates a
+    # bind-mounted host path that does not exist yet as root, and the container
+    # runs as the host uid, so its writer would get EACCES on every suite and
+    # the base side would silently come back empty (live-measured 2026-09-17).
+    base_dir.mkdir(parents=True, exist_ok=True)
     _launch_eval(
         "--model",
         args.base,
@@ -504,6 +509,17 @@ def _cmd_compare_base(args: argparse.Namespace) -> int:
 
     eval_b = build_eval_summary(adapter_dir) or {}
     eval_a = build_eval_summary(adapter_dir, subdir=BASE_EVAL_DIR) or {}
+    if not (eval_a.get("suites") or {}):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"the base evaluation of {args.base} produced no results under {base_dir}",
+            remediation=(
+                "The second container run wrote nothing readable (check its stderr above "
+                "for 'could not write' notes or a load error); a compare with no base side "
+                "cannot pass. Re-run, or evaluate the base with "
+                f"`sloth eval --model {args.base} --results-dir {base_dir} ...` first."
+            ),
+        )
     summary_a = {"model": args.base, "output_dir": str(base_dir), "eval": eval_a or None}
     summary_b = build_summary(adapter_dir)
 

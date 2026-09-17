@@ -264,6 +264,7 @@ MMLU subject splits; in-container command as recorded on stderr:
 | `acc` | **0.5789** (`acc_norm` is not reported by the MMLU task and is stored as `null`) |
 | Per subject | 61 entries in `eval/mmlu.json`; highest `astronomy` 1.0, `high_school_psychology` 1.0, `medical_genetics` 1.0; lowest `elementary_mathematics` 0.0, `moral_scenarios` 0.0, `college_mathematics` 0.2 |
 | Adapter load | `peft=<adapter>` on the bf16 base **worked directly** — frame park v4 is resolved for LoRA adapters (a QLoRA / `load_in_4bit=True` adapter is still unmeasured; the documented fallback is to bench the merged-16bit export) |
+| Warm-cache check (`--offline`) | second run `uv run sloth bench … --offline --json`: **2 min 23 s** (vs 5 min 22 s cold), zero `Generating … split` lines, lm_eval logs `Using the latest cached version of the dataset … (offline mode is enabled)` for every subject, identical `acc` 0.5789 — the HF-cache mount makes the harness reproducible without network after the first fill (the only downloads on the second run are the uv dep-layer wheels, which are not HF traffic) |
 | Result file | `runs/demo-lora/eval/mmlu.json` (schema_version 2, `suite: "mmlu"`, `exact_match_pct = acc × 100` so `summarize` folds it) |
 
 A 5-per-subject smoke is a **noisy** estimate (285 documents); it is a
@@ -295,6 +296,50 @@ stop conditions, the whitespace token approximation) as much as at Q4_K_M
 itself (plan risk r14, follow-up). The two `0/46 on every format` caveats from
 the #22 run are closed by this table; the GGUF row is the one that now needs a
 diagnosis rather than a caveat.
+
+### `sloth compare --base` — base model vs the fixture adapter (batch 1)
+
+`uv run sloth compare --base LiquidAI/LFM2.5-1.2B-Base runs/demo-lora --config examples/demo-lora.toml --json`
+(2026-09-17, **1 h 12 min** wall: the adapter re-scored over the nine suites,
+then the untouched bf16 base over the same files, two sequential container
+runs, batch 1 reused from the adapter's result files). **Provenance caveat:**
+the base-side numbers below are taken from the second container run's stdout
+JSON as captured on stderr, because the run could not write
+`eval-base/<suite>.json` — docker had created that bind-mounted directory as
+root (plan risk r15, fixed in the same PR: compare now pre-creates it and
+refuses to pass with an empty base side). A verification re-run with the fix
+is recorded in the delivery doc if it completed before the PR.
+
+| Suite | Rows | Exact % base → adapter (Δ pp) | Token-F1 base → adapter (Δ) | Compliance % base → adapter | Choice acc % base → adapter (Δ pp) | Median latency ms base → adapter |
+|---|---|---|---|---|---|---|
+| `agentculture-terms` | 16 | 0.00 → 0.00 (+0.00) | 0.036 → 0.264 (+0.228) | — → — | — → — (—) | 6446 → 2377 |
+| `cli-contract` | 14 | 0.00 → 35.71 (+35.71) | 0.068 → 0.636 (+0.568) | — → — | — → — (—) | 6211 → 2151 |
+| `task-format` | 16 | 0.00 → 56.25 (+56.25) | 0.099 → 0.628 (+0.529) | — → — | — → — (—) | 6548 → 1464 |
+| `demo-corpus-holdout` | 59 | 0.00 → 10.17 (+10.17) | 0.073 → 0.359 (+0.286) | — → — | — → — (—) | 6724 → 1880 |
+| `regression` | 116 | 0.00 → 11.21 (+11.21) | 0.055 → 0.585 (+0.531) | — → — | — → — (—) | 6209 → 1260 |
+| `instruction-following` | 56 | 0.00 → 0.00 (+0.00) | 0.080 → 0.113 (+0.033) | 23.21 → 46.43 | — → — (—) | 6346 → 1891 |
+| `structured-output` | 55 | 0.00 → 0.00 (+0.00) | 0.000 → 0.000 (+0.000) | 20.00 → 76.36 | — → — (—) | 6540 → 2730 |
+| `tool-call` | 32 | 0.00 → 0.00 (+0.00) | 0.000 → 0.000 (+0.000) | 0.00 → 0.00 | — → — (—) | 3416 → 1581 |
+| `mmlu-subset` | 120 | 0.00 → 60.00 (+60.00) | 0.028 → 0.601 (+0.573) | — → — | 75.83 → 61.67 (-14.16) | 7141 → 984 |
+
+**Verdict against the `[eval.thresholds]` baseline (2 pp regression drop,
+95 % compliance, latency ratio 1.10, 100 rows minimum).** Computed by hand from
+the rows above because the captured compare run had no base side to gate:
+the regression-tagged suite *improves* (0 → 11.2 pp exact, F1 +0.53 — a Base
+checkpoint does not follow the `Task:/Input:/Output:` shape at all, the adapter
+does), latency improves (the adapter stops early; the base echoes to the
+100-token budget, 6–7 s per row), **but the gate still fails**: compliance is
+46 % / 76 % / 0 % against a 95 % floor, and seven of the nine suites have fewer
+than 100 rows. Recorded as **failing**, not tuned. The success signal's
+"target-task exact match > 0 with a positive delta" *is* met (0 → 14/46 over
+the three target suites; `agentculture-terms` alone stays 0 → 0 on exact,
++0.23 F1). And the table shows the degradation exact match and F1 alone could
+not report: the adapter **loses 14 pp of general knowledge** on the MMLU-style
+subset (75.8 % → 61.7 % letter accuracy) — a real regression that the current
+gate does not fail, because `regression_drop_pp` is applied to
+`exact_match_pct` on regression-tagged suites only (plan risk r16, follow-up).
+Base perplexity is not in the table: `compare --base` does not forward
+`--perplexity` yet.
 
 ## Serving latency + tok/s
 
