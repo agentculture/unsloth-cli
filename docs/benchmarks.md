@@ -300,15 +300,17 @@ diagnosis rather than a caveat.
 ### `sloth compare --base` — base model vs the fixture adapter (batch 1)
 
 `uv run sloth compare --base LiquidAI/LFM2.5-1.2B-Base runs/demo-lora --config examples/demo-lora.toml --json`
-(2026-09-17, **1 h 12 min** wall: the adapter re-scored over the nine suites,
-then the untouched bf16 base over the same files, two sequential container
-runs, batch 1 reused from the adapter's result files). **Provenance caveat:**
-the base-side numbers below are taken from the second container run's stdout
-JSON as captured on stderr, because the run could not write
-`eval-base/<suite>.json` — docker had created that bind-mounted directory as
-root (plan risk r15, fixed in the same PR: compare now pre-creates it and
-refuses to pass with an empty base side). A verification re-run with the fix
-is recorded in the delivery doc if it completed before the PR.
+(2026-09-17: the adapter re-scored over the nine suites, then the untouched
+bf16 base over the same files — two sequential container runs, batch 1 reused
+from the adapter's result files). Four runs were needed to get a valid one, and
+each failure is on record in `docs/tested.md`: the first two exposed defects in
+`compare --base` itself (the in-container `--model <hf-id>` rejection, then a
+root-owned bind-mounted `eval-base/` that made the verdict vacuous — plan risk
+r15); the third, with the fix, **failed closed** on the stale root-owned
+directory (exit 1, "produced no results"); the fourth, after removing it,
+completed in **1 h 16 min** with both sides on disk. The table is that fourth
+run's `--json` report; the base numbers agree with the ones captured from the
+second run's container stdout.
 
 | Suite | Rows | Exact % base → adapter (Δ pp) | Token-F1 base → adapter (Δ) | Compliance % base → adapter | Choice acc % base → adapter (Δ pp) | Median latency ms base → adapter |
 |---|---|---|---|---|---|---|
@@ -322,22 +324,22 @@ is recorded in the delivery doc if it completed before the PR.
 | `tool-call` | 32 | 0.00 → 0.00 (+0.00) | 0.000 → 0.000 (+0.000) | 0.00 → 0.00 | — → — (—) | 3416 → 1581 |
 | `mmlu-subset` | 120 | 0.00 → 60.00 (+60.00) | 0.028 → 0.601 (+0.573) | — → — | 75.83 → 61.67 (-14.16) | 7141 → 984 |
 
-**Verdict against the `[eval.thresholds]` baseline (2 pp regression drop,
-95 % compliance, latency ratio 1.10, 100 rows minimum).** Computed by hand from
-the rows above because the captured compare run had no base side to gate:
-the regression-tagged suite *improves* (0 → 11.2 pp exact, F1 +0.53 — a Base
-checkpoint does not follow the `Task:/Input:/Output:` shape at all, the adapter
-does), latency improves (the adapter stops early; the base echoes to the
-100-token budget, 6–7 s per row), **but the gate still fails**: compliance is
-46 % / 76 % / 0 % against a 95 % floor, and seven of the nine suites have fewer
-than 100 rows. Recorded as **failing**, not tuned. The success signal's
-"target-task exact match > 0 with a positive delta" *is* met (0 → 14/46 over
-the three target suites; `agentculture-terms` alone stays 0 → 0 on exact,
-+0.23 F1). And the table shows the degradation exact match and F1 alone could
-not report: the adapter **loses 14 pp of general knowledge** on the MMLU-style
-subset (75.8 % → 61.7 % letter accuracy) — a real regression that the current
-gate does not fail, because `regression_drop_pp` is applied to
-`exact_match_pct` on regression-tagged suites only (plan risk r16, follow-up).
+**Verdict — the tool's own, exit 1.** `compare --base` reported
+`passed: false` with **17 failed checks: 14 × `min_suite_rows`** (seven of the
+nine suites have fewer than 100 rows, on both sides) **and 3 × `compliance`**
+(instruction-following 46.4 %, structured-output 76.4 %, tool-call 0 % against
+the 95 % floor). The regression gate passes (the regression-tagged suite
+*improves*: 0 → 11.2 pp exact, F1 +0.53 — a Base checkpoint does not follow the
+`Task:/Input:/Output:` shape at all, the adapter does) and so does the latency
+gate (the adapter stops early; the base echoes to the 100-token budget, 6.5–7.4 s
+per row). Recorded as **failing**, not tuned. The success signal's "target-task
+exact match > 0 with a positive delta" *is* met (0 → 14/46 over the three
+target suites; `agentculture-terms` alone stays 0 → 0 on exact, +0.23 F1). And
+the table shows the degradation exact match and F1 alone could not report: the
+adapter **loses 14 pp of general knowledge** on the MMLU-style subset (75.8 % →
+61.7 % letter accuracy) — a real regression that the current gate does not fail,
+because `regression_drop_pp` is applied to `exact_match_pct` on regression-tagged
+suites only (plan risk r16, follow-up).
 Base perplexity is not in the table: `compare --base` does not forward
 `--perplexity` yet.
 

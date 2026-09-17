@@ -103,7 +103,7 @@ Quoted from the `devague summary` skeleton:
 |-------|------------|----------|
 | Every suite family in the announcement is measured by a real Spark run (h1) | high | `docs/benchmarks.md` fixture-adapter section: train, nine suites at batch 8 and 1, bench cold + offline, compare, four export formats — every table cites its command |
 | Target-task exact match > 0 with a positive delta over the base (c23) | high, **met** | batch 1: 0/46 (base) → 14/46 (adapter); `cli-contract` 5/14, `task-format` 9/16; `agentculture-terms` stays 0/16 exact (+0.23 F1) because the corpus teaches full-sentence answers (r3) |
-| Regression-suite delta ≥ −2 pp (c23) | high, **met on the gated metric, failing on the ungated one** | `regression.jsonl` exact 0 → 11.2 pp, F1 +0.53; but MMLU-style letter accuracy **75.8 % → 61.7 %** (−14 pp), which the gate does not cover (r16) |
+| Regression-suite delta ≥ −2 pp (c23) | high, **met on the gated metric (tool verdict), failing on the ungated one** | `regression.jsonl` exact 0 → 11.2 pp, F1 +0.53; but MMLU-style letter accuracy **75.8 % → 61.7 %** (−14 pp), which the gate does not cover (r16) |
 | Structured-output compliance ≥ 95 % (c23) | high, **failing** | 76.4 % (base 20 %); instruction-following 46.4 % (base 23 %); tool-call 0 % on a Base checkpoint (expected) |
 | Median latency within 10 % of base (c23) | high, **met** | adapter 1.0–2.7 s per row vs base 6.2–7.1 s (base echoes to the token budget) — batch 1 |
 | Held-out perplexity lower than the base's (c23) | **unverified** | adapter holdout perplexity 1.51 measured; `compare --base` does not forward `--perplexity`, so no base perplexity exists (follow-up) |
@@ -125,10 +125,30 @@ user's):
 | `l4` | `control-absent` | t13 generated the MMLU-style subset before checking its answer distribution (61/120 keyed "B") |
 | `l5` | `grader-unverified` | t13's first lazy-import guard used `ast.walk` and its first scorer test used the internal constraint shape |
 
+## Post-review fixes (Qodo, 21 findings)
+
+17 real findings fixed with tests on the same PR (partial/mixed `[run.dataset_map]`
+refused; empty holdout partitions refused; hub datasets stamped `dataset.source`
+and the overlap skip now explicit; `additionalProperties` schema objects
+accepted; token-weighted aggregate perplexity; `--schema` honoured for `hf:`
+data; directory suites keep their name in-container; `compare --base` writes
+the adapter side to `eval-compare/`, resolves relative base and suite paths,
+clears stale results, compares hub dataset identity; QLoRA bench precision from
+`resolved.load_in_4bit`; Qwen3 tool-call parser without a brace regex; raw
+`ImportError`s → exit 2; eval-only schemas refused for training; missing hub
+columns → exit 1; `sloth validate --config`). One answered by design (`--offline`
+governs the Hub only), one not reproducible (no line exceeds 100 columns), one
+filed cross-repo (agentculture/colleague#499). Two pre-existing tests that had
+encoded a bug (partial-map inference; flattened directory suites) were
+corrected. Tests: 1144 passed after the fixes.
+
 ## Remaining Work
 
-- Verification `compare --base` run with the r15 fix — queued after the offline
-  bench; its outcome is appended below when it completes.
+- ~~Verification `compare --base` run with the r15 fix~~ — done: run 3 failed
+  closed on the stale root-owned directory (exit 1, as designed); run 4 after
+  removing it completed with both sides on disk and the tool's own verdict
+  (`passed: false`, 14 × `min_suite_rows` + 3 × `compliance`), matching the
+  hand-computed one. See `docs/tested.md`.
 - r13: per-family padding guard in `_generate_predictions` (default batch 1 for
   `lfm2`, or right-padding with a position-id fix); until then every LFM2 number
   is batch 1.

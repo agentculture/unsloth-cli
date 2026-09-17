@@ -36,6 +36,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Review fixes (PR #29): `sloth validate --config PATH` reads `dataset` and
+  `[run.dataset_map]` from the run TOML; partial or mixed dataset maps, empty
+  holdout partitions, missing hub columns and eval-only training schemas are
+  refused with exit 1; `compare --base` re-scores the adapter into
+  `eval-compare/` (leaving `eval/` untouched), clears stale results, resolves
+  relative base/suite paths, pre-creates `eval-base/` as the host user and
+  fails closed on an empty base side; aggregate perplexity is token-weighted;
+  QLoRA bench precision comes from `resolved.load_in_4bit`; the Qwen3
+  tool-call parser no longer uses a brace regex.
 - `sloth validate --suite` detects each file's schema (deviation d1) instead of
   forcing the task schema, so a directory may mix suite kinds.
 - `sloth eval --json` now emits `{"suites": {<name>: <payload>}}`; `summarize`
