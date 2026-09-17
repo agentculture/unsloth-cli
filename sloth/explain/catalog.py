@@ -296,6 +296,18 @@ the same mounted Hugging Face cache used for models — check an `hf:` dataset
 offline first with `sloth validate --dataset hf:<org>/<name> --dataset-map
 ...`.
 
+An `[eval]` section with `holdout_fraction > 0` turns on **training-time eval**:
+the local dataset is split with `seed` into `<stem>.train.jsonl` /
+`<stem>.holdout.jsonl` before the model loads, the holdout is passed to the
+trainer as its eval set, and evaluation runs every `eval_steps` (when
+`eval_steps = 0` it defaults to a quarter of `max_steps`, at least 1). The
+resolved split — fraction, seed, both paths, both row counts, and the effective
+`eval_steps` — plus the per-step `loss_history` (`train_loss` / `eval_loss`),
+`final_train_loss` and `final_eval_loss` are written into
+`training_metadata.json`, so the run is reproducible and its loss curve
+inspectable. An `hf:` dataset has no local file to split, so the holdout is
+skipped with a note on stderr and training proceeds without an eval set.
+
 ## Exit codes
 
 - `0` success

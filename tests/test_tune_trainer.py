@@ -64,7 +64,7 @@ def _write_chat_dataset(path: Path) -> Path:
     return path
 
 
-def _make_fake_backend() -> tuple[SimpleNamespace, dict]:
+def _make_fake_backend(log_history: list | None = None) -> tuple[SimpleNamespace, dict]:
     """Return a fake backend mimicking _load_backend()'s interface + an event log."""
     events: dict = {
         "from_pretrained": [],
@@ -102,6 +102,9 @@ def _make_fake_backend() -> tuple[SimpleNamespace, dict]:
     class FakeTrainer:
         def __init__(self, **kw):
             events["trainer"].append(kw)
+            # Mirrors transformers' ``Trainer.state.log_history`` — the source
+            # _run_real reads loss history from (NOT the TrainOutput return).
+            self.state = SimpleNamespace(log_history=list(log_history or []))
 
         def train(self):
             events["trained"].append(True)
@@ -1611,3 +1614,194 @@ def test_run_eval_signature_keeps_backward_compatible_keywords() -> None:
     params = inspect.signature(run_eval).parameters
     for name in ("perplexity", "tool_call_family", "base_load_in_4bit"):
         assert params[name].default is None or params[name].default is False
+
+
+# ---------------------------------------------------------------------------
+# Training-time eval: holdout split -> eval_dataset + loss history (t7)
+# ---------------------------------------------------------------------------
+
+
+def _write_task_dataset(path: Path, count: int = 10) -> Path:
+    """Write *count* task-schema rows — enough for a non-degenerate holdout split."""
+    path.write_text(
+        "".join(
+            json.dumps({"task": "echo", "input": f"in-{i}", "expected_output": f"out-{i}"}) + "\n"
+            for i in range(count)
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+class TestTrainingTimeEval:
+    """``[eval] holdout_fraction > 0`` wires an eval_dataset into SFTTrainer."""
+
+    def _config_with_eval(
+        self, tmp_path: Path, *, fraction: float = 0.2, seed: int = 7, eval_steps: int = 5
+    ) -> RunConfig:
+        from sloth.tune.config import EvalConfig
+
+        config = _config(tmp_path, method="lora")
+        config.eval = EvalConfig(holdout_fraction=fraction, seed=seed, eval_steps=eval_steps)
+        return config
+
+    def _run(self, tmp_path, monkeypatch, config, log_history=None):
+        backend, events = _make_fake_backend(log_history)
+        monkeypatch.setattr(_trainer, "_load_backend", lambda: backend)
+        fake_module, _, from_list_calls = _fake_datasets_module()
+        monkeypatch.setitem(sys.modules, "datasets", fake_module)
+        result = run_training(config, dry_run=False)
+        return result, events, from_list_calls
+
+    def test_sft_config_and_trainer_receive_eval_kwargs(self, tmp_path: Path, monkeypatch) -> None:
+        config = self._config_with_eval(tmp_path)
+        _write_task_dataset(Path(config.dataset))
+
+        _, events, from_list_calls = self._run(tmp_path, monkeypatch, config)
+
+        sft_kwargs = events["sft_config"][0]
+        assert sft_kwargs["eval_strategy"] == "steps"
+        assert sft_kwargs["eval_steps"] == 5
+        trainer_kwargs = events["trainer"][0]
+        assert "eval_dataset" in trainer_kwargs
+        assert trainer_kwargs["eval_dataset"] is not None
+        # train rows + holdout rows were each wrapped via Dataset.from_list
+        assert len(from_list_calls) == 2
+        assert len(from_list_calls[0]) == 8
+        assert len(from_list_calls[1]) == 2
+
+    def test_no_eval_kwargs_when_holdout_fraction_zero(self, tmp_path: Path, monkeypatch) -> None:
+        config = self._config_with_eval(tmp_path, fraction=0.0)
+        _write_task_dataset(Path(config.dataset))
+
+        _, events, from_list_calls = self._run(tmp_path, monkeypatch, config)
+
+        assert "eval_strategy" not in events["sft_config"][0]
+        assert "eval_steps" not in events["sft_config"][0]
+        assert "eval_dataset" not in events["trainer"][0]
+        assert len(from_list_calls) == 1
+
+    def test_no_eval_kwargs_when_eval_section_absent(self, tmp_path: Path, monkeypatch) -> None:
+        config = _config(tmp_path, method="lora")
+        assert config.eval is None
+        _write_task_dataset(Path(config.dataset))
+
+        _, events, _ = self._run(tmp_path, monkeypatch, config)
+
+        assert "eval_strategy" not in events["sft_config"][0]
+        assert "eval_dataset" not in events["trainer"][0]
+
+    def test_eval_steps_zero_defaults_to_quarter_of_max_steps(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        config = self._config_with_eval(tmp_path, eval_steps=0)
+        config.max_steps = 40
+        _write_task_dataset(Path(config.dataset))
+
+        result, events, _ = self._run(tmp_path, monkeypatch, config)
+
+        assert events["sft_config"][0]["eval_steps"] == 10
+        data = json.loads(Path(result["metadata_path"]).read_text(encoding="utf-8"))
+        assert data["holdout"]["eval_steps"] == 10
+
+    def test_eval_steps_defaults_to_at_least_one(self, tmp_path: Path, monkeypatch) -> None:
+        config = self._config_with_eval(tmp_path, eval_steps=0)
+        config.max_steps = 2
+        _write_task_dataset(Path(config.dataset))
+
+        _, events, _ = self._run(tmp_path, monkeypatch, config)
+
+        assert events["sft_config"][0]["eval_steps"] == 1
+
+    def test_metadata_records_holdout_and_loss_history(self, tmp_path: Path, monkeypatch) -> None:
+        config = self._config_with_eval(tmp_path)
+        _write_task_dataset(Path(config.dataset))
+        log_history = [
+            {"loss": 2.0, "step": 1},
+            {"loss": 1.5, "step": 5},
+            {"eval_loss": 1.7, "step": 5},
+        ]
+
+        result, _, _ = self._run(tmp_path, monkeypatch, config, log_history=log_history)
+
+        data = json.loads(Path(result["metadata_path"]).read_text(encoding="utf-8"))
+        holdout = data["holdout"]
+        assert holdout["fraction"] == 0.2
+        assert holdout["seed"] == 7
+        assert holdout["eval_steps"] == 5
+        assert holdout["train_count"] == 8
+        assert holdout["holdout_count"] == 2
+        assert holdout["train_path"].endswith("train.train.jsonl")
+        assert holdout["holdout_path"].endswith("train.holdout.jsonl")
+        assert data["loss_history"] == [
+            {"step": 1, "train_loss": 2.0, "eval_loss": None},
+            {"step": 5, "train_loss": 1.5, "eval_loss": 1.7},
+        ]
+        assert data["final_train_loss"] == 1.5
+        assert data["final_eval_loss"] == 1.7
+        # the recorded dataset stays the ORIGINAL path, not the split train file
+        assert data["dataset"]["path"] == config.dataset
+
+    def test_loss_history_recorded_without_a_holdout(self, tmp_path: Path, monkeypatch) -> None:
+        """No ``[eval]`` section still records the training loss curve."""
+        config = _config(tmp_path, method="lora")
+        _write_task_dataset(Path(config.dataset))
+
+        result, _, _ = self._run(
+            tmp_path, monkeypatch, config, log_history=[{"loss": 0.5, "step": 1}]
+        )
+
+        data = json.loads(Path(result["metadata_path"]).read_text(encoding="utf-8"))
+        assert data["loss_history"] == [{"step": 1, "train_loss": 0.5, "eval_loss": None}]
+        assert data["final_train_loss"] == 0.5
+        assert "holdout" not in data
+
+    def test_chat_dataset_split_is_reproducible(self, tmp_path: Path, monkeypatch) -> None:
+        """A chat source splits too (rows are rendered to task rows by split_holdout)."""
+        config = self._config_with_eval(tmp_path)
+        Path(config.dataset).write_text(
+            "".join(
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": f"q-{i}"},
+                            {"role": "assistant", "content": f"a-{i}"},
+                        ]
+                    }
+                )
+                + "\n"
+                for i in range(10)
+            ),
+            encoding="utf-8",
+        )
+
+        result, _, from_list_calls = self._run(tmp_path, monkeypatch, config)
+
+        assert len(from_list_calls) == 2
+        data = json.loads(Path(result["metadata_path"]).read_text(encoding="utf-8"))
+        assert data["holdout"]["train_count"] == 8
+        assert data["holdout"]["holdout_count"] == 2
+
+    def test_hf_dataset_skips_split_with_diagnostic(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        """An ``hf:`` dataset has no local file to split — skip it, loudly."""
+        config = self._config_with_eval(tmp_path)
+        config.dataset = "hf:acme/demo:train"
+        config.dataset_map = {"task": "task", "input": "input", "expected_output": "output"}
+        monkeypatch.setattr(
+            _trainer,
+            "load_external_records",
+            lambda spec, mapping: [
+                {"task": "echo", "input": "a", "expected_output": "b"},
+            ],
+        )
+
+        result, events, from_list_calls = self._run(tmp_path, monkeypatch, config)
+
+        assert len(from_list_calls) == 1
+        assert "eval_dataset" not in events["trainer"][0]
+        captured = capsys.readouterr()
+        assert "holdout" in captured.err.lower()
+        data = json.loads(Path(result["metadata_path"]).read_text(encoding="utf-8"))
+        assert "holdout" not in data
