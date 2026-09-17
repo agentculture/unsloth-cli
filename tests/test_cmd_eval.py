@@ -18,17 +18,20 @@ Covers:
 from __future__ import annotations
 
 import argparse
+import inspect
 import io
 import json
 import socket
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 import sloth.cli._commands.eval as eval_mod
 import sloth.tune._exporter as exporter_mod
+import sloth.tune._trainer as trainer_mod
 import sloth.tune.container as container_mod
 from sloth.cli._commands.eval import cmd_eval, register
 from sloth.cli._errors import CliError
@@ -969,12 +972,21 @@ class _FakeParam:
 class _FakeModel:
     def __init__(self) -> None:
         self.eval_called = False
+        self.forward_calls: list[str] = []
 
     def parameters(self) -> Any:
         return iter([_FakeParam()])
 
     def eval(self) -> None:
         self.eval_called = True
+
+    def __call__(
+        self, input_ids: Any = None, attention_mask: Any = None, labels: Any = None
+    ) -> Any:
+        """A labelled forward pass — the only shape run_perplexity may use."""
+        assert labels is not None, "run_perplexity must pass labels= for a scored pass"
+        self.forward_calls.append(input_ids)
+        return SimpleNamespace(loss=0.0)
 
     def generate(self, input_ids: str, max_new_tokens: int = 0) -> list[str]:
         # prompt + continuation, like a real generate(); the continuation echoes the
@@ -1432,3 +1444,157 @@ def test_batch_size_one_is_accepted(
     assert rc in (None, 0)
     forwarded = captured["sloth_args"]
     assert forwarded[forwarded.index("--batch-size") + 1] == "1"
+
+
+# ---------------------------------------------------------------------------
+# t6 — run_eval_model: latency + token counts, per-schema scoring, perplexity
+# ---------------------------------------------------------------------------
+
+
+class _Clock:
+    """A deterministic ``perf_counter`` stand-in advancing *step* seconds per call."""
+
+    def __init__(self, step: float = 0.5) -> None:
+        self.now = 0.0
+        self.step = step
+
+    def __call__(self) -> float:
+        value = self.now
+        self.now += self.step
+        return value
+
+
+def _freeze_clock(monkeypatch: pytest.MonkeyPatch, step: float = 0.5) -> None:
+    monkeypatch.setattr(trainer_mod.time, "perf_counter", _Clock(step))
+
+
+def test_run_eval_model_reports_timing_and_base_precision(
+    tmp_model: Path, tmp_suite: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every row carries generated_tokens + latency_ms; the suite carries the rollups."""
+    answers = {
+        "Task: reverse\nInput: abc\nOutput:": "cba",
+        "Task: upper\nInput: hello\nOutput:": "HELLO",
+    }
+    monkeypatch.setattr(exporter_mod, "_load_eval_backend", lambda: _fake_backend(answers))
+    _freeze_clock(monkeypatch, step=0.5)
+
+    summary = exporter_mod.run_eval_model(
+        str(tmp_model), str(tmp_suite), batch_size=1, base_load_in_4bit=True
+    )
+
+    for row in summary["results"]:
+        assert row["generated_tokens"] > 0
+        assert row["latency_ms"] == 500.0
+    assert summary["median_latency_ms"] == 500.0
+    assert summary["tokens_per_s"] > 0
+    assert summary["batch_size"] == 1
+    assert summary["base_load_in_4bit"] is True
+
+
+def test_run_eval_model_gguf_reports_timing(
+    tmp_path: Path, tmp_suite: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The llama.cpp path times each process and approximates its token count."""
+    model_dir = tmp_path / "gguf-out"
+    model_dir.mkdir()
+    (model_dir / "Model.Q4_K_M.gguf").write_bytes(b"\x00")
+    monkeypatch.setattr(
+        exporter_mod,
+        "_run_llama_completion",
+        lambda gguf, prompt, max_tokens: "cba" if "reverse" in prompt else "HELLO",
+    )
+    _freeze_clock(monkeypatch, step=0.25)
+
+    summary = exporter_mod.run_eval_model(str(model_dir), str(tmp_suite))
+
+    assert [r["latency_ms"] for r in summary["results"]] == [250.0, 250.0]
+    assert [r["generated_tokens"] for r in summary["results"]] == [1, 1]
+    assert summary["median_latency_ms"] == 250.0
+
+
+def test_run_eval_model_perplexity_on_gguf_is_a_user_error(
+    tmp_path: Path, tmp_suite: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Perplexity needs a transformers forward pass — a GGUF export cannot give one."""
+    model_dir = tmp_path / "gguf-out"
+    model_dir.mkdir()
+    (model_dir / "Model.Q4_K_M.gguf").write_bytes(b"\x00")
+
+    with pytest.raises(CliError) as exc_info:
+        exporter_mod.run_eval_model(str(model_dir), str(tmp_suite), perplexity=True)
+    assert exc_info.value.code == 1
+    assert "perplexity" in exc_info.value.message.lower()
+    assert exc_info.value.remediation
+
+
+def test_run_eval_model_perplexity_uses_a_labelled_forward_pass(
+    tmp_model: Path, tmp_suite: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = _fake_backend({})
+    monkeypatch.setattr(exporter_mod, "_load_eval_backend", lambda: backend)
+
+    summary = exporter_mod.run_eval_model(str(tmp_model), str(tmp_suite), perplexity=True)
+
+    assert summary["perplexity"] == pytest.approx(1.0)  # loss 0.0 ⇒ exp(0) == 1
+    assert summary["files"][0]["perplexity"] == pytest.approx(1.0)
+
+
+def test_run_eval_model_writes_a_suite_keyed_eval_json(
+    tmp_model: Path, tmp_suite: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(exporter_mod, "_load_eval_backend", lambda: _fake_backend({}))
+
+    exporter_mod.run_eval_model(
+        str(tmp_model), str(tmp_suite), batch_size=2, base_load_in_4bit=False
+    )
+
+    written = json.loads((tmp_model / "eval" / "suite.json").read_text(encoding="utf-8"))
+    assert written["suite"] == "suite"
+    assert written["target"] == "model"
+    assert written["batch_size"] == 2
+    assert written["base_load_in_4bit"] is False
+    assert (tmp_model / "eval.json").is_file()
+
+
+def test_run_eval_model_scores_an_instruction_suite(
+    tmp_model: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    suite = tmp_path / "instr.jsonl"
+    suite.write_text(
+        json.dumps(
+            {
+                "task": "short",
+                "input": "abc",
+                "expected_output": "ok",
+                "constraints": [{"max_words": 1}],
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "task": "short",
+                "input": "xyz",
+                "expected_output": "ok",
+                "constraints": [{"max_words": 1}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    answers = {
+        "Task: short\nInput: abc\nOutput:": "ok",
+        "Task: short\nInput: xyz\nOutput:": "far too many words",
+    }
+    monkeypatch.setattr(exporter_mod, "_load_eval_backend", lambda: _fake_backend(answers))
+
+    summary = exporter_mod.run_eval_model(str(tmp_model), str(suite))
+
+    assert [r["constraints_passed"] for r in summary["results"]] == [True, False]
+    assert summary["compliance_pct"] == 50.0
+
+
+def test_run_eval_model_signature_keeps_backward_compatible_keywords() -> None:
+    params = inspect.signature(exporter_mod.run_eval_model).parameters
+    for name in ("perplexity", "tool_call_family", "base_load_in_4bit"):
+        assert params[name].default is None or params[name].default is False
