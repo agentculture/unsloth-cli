@@ -2439,3 +2439,34 @@ def test_register_results_dir_flag() -> None:
         ["eval", "--adapter", "a", "--suite", "s.jsonl", "--results-dir", "out"]
     )
     assert args.results_dir == "out"
+
+
+def test_run_eval_model_scores_a_letter_choice_suite(tmp_path: Path, monkeypatch) -> None:
+    """t13 integration: the --model path passes the suite rows to the extra-metrics
+    resolver so a letter-choice suite (e.g. examples/eval/mmlu-subset.jsonl) gets
+    choice_match / choice_acc_pct like the --adapter path does."""
+    from sloth.tune import _exporter as exporter_mod
+
+    suite = tmp_path / "mmlu-subset.jsonl"
+    suite.write_text(
+        '{"task": "mc", "input": "Q1?\\nA. x\\nB. y\\nAnswer with the letter.", '
+        '"expected_output": "B"}\n'
+        '{"task": "mc", "input": "Q2?\\nA. x\\nB. y\\nAnswer with the letter.", '
+        '"expected_output": "A"}\n',
+        encoding="utf-8",
+    )
+    model_dir = tmp_path / "merged"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text("{}", encoding="utf-8")
+    from sloth.tune._trainer import eval_prompt
+
+    rows_in = [json.loads(line) for line in suite.read_text(encoding="utf-8").splitlines()]
+    answers = {
+        eval_prompt(rows_in[0]): "Answer: B",
+        eval_prompt(rows_in[1]): "The answer is (B).",
+    }
+    monkeypatch.setattr(exporter_mod, "_load_eval_backend", lambda: _fake_backend(answers))
+    result = exporter_mod.run_eval_model(str(model_dir), suite_paths=[suite], batch_size=1)
+    rows = result["results"]
+    assert [r.get("choice_match") for r in rows] == [True, False]
+    assert result["choice_acc_pct"] == 50.0

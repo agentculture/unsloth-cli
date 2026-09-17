@@ -1156,8 +1156,13 @@ def run_eval_model(
         )
     # Resolved before any model load, so an unknown tool-call family costs no GPU.
     extra_metrics = [
-        _extra_metrics_for(schema, model_id=str(directory), tool_call_family=tool_call_family)
-        for _path, schema, _records in records_by_file
+        _extra_metrics_for(
+            schema,
+            model_id=str(directory),
+            tool_call_family=tool_call_family,
+            records=file_records,
+        )
+        for _path, schema, file_records in records_by_file
     ]
 
     model = tokenizer = torch_mod = None
