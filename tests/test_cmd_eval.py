@@ -2265,10 +2265,13 @@ class TestNamedResultsSplitPerSuite:
         a, b = tmp_path / "alpha.jsonl", tmp_path / "beta.jsonl"
         raw = self._seam_payload([a, b])
         named = _normalize_named_results(raw, ["alpha", "beta"], {"alpha": [a], "beta": [b]})
-        assert named["alpha"]["exact_match"] == 1 and named["beta"]["exact_match"] == 0
-        assert named["alpha"]["total"] == 1 and named["beta"]["total"] == 1
+        assert named["alpha"]["exact_match"] == 1
+        assert named["beta"]["exact_match"] == 0
+        assert named["alpha"]["total"] == 1
+        assert named["beta"]["total"] == 1
         # run-level fields are carried onto every suite payload
-        assert named["alpha"]["batch_size"] == 4 and named["beta"]["base_load_in_4bit"] is True
+        assert named["alpha"]["batch_size"] == 4
+        assert named["beta"]["base_load_in_4bit"] is True
         # and the aggregate is NOT duplicated under both names
         assert named["alpha"] is not named["beta"]
 
@@ -2389,8 +2392,9 @@ def test_model_accepts_a_hugging_face_repo_id_with_results_dir(
 
 
 def test_model_repo_id_without_results_dir_is_a_user_error(tmp_suite: Path) -> None:
+    args = _make_args(model="unsloth/Qwen3-4B", suite=str(tmp_suite), in_container=True)
     with pytest.raises(CliError) as exc_info:
-        cmd_eval(_make_args(model="unsloth/Qwen3-4B", suite=str(tmp_suite), in_container=True))
+        cmd_eval(args)
     assert exc_info.value.code == 1
     assert "--results-dir" in exc_info.value.remediation
 
@@ -2398,8 +2402,9 @@ def test_model_repo_id_without_results_dir_is_a_user_error(tmp_suite: Path) -> N
 def test_missing_model_dir_is_still_an_error_not_a_repo_id(tmp_suite: Path, tmp_path: Path) -> None:
     """A path-shaped --model that does not exist must still fail fast, never be
     mistaken for a hub id."""
+    args = _make_args(model=str(tmp_path / "missing" / "dir"), suite=str(tmp_suite))
     with pytest.raises(CliError) as exc_info:
-        cmd_eval(_make_args(model=str(tmp_path / "missing" / "dir"), suite=str(tmp_suite)))
+        cmd_eval(args)
     assert exc_info.value.code == 1
     assert "model directory not found" in exc_info.value.message
 
@@ -2499,4 +2504,5 @@ def test_run_eval_model_accepts_a_remote_hf_repo_id(tmp_path: Path, monkeypatch)
     assert result["exact_match"] == 1
     assert result["model_dir"] == "LiquidAI/LFM2.5-1.2B-Base"
     assert result["quant_method"] is None
-    assert not (tmp_path / "eval").exists() and not (tmp_path / "eval.json").exists()
+    assert not (tmp_path / "eval").exists()
+    assert not (tmp_path / "eval.json").exists()

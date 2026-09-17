@@ -379,8 +379,9 @@ def test_compare_unresolvable_a_raises_cli_error_1(tmp_path: Path) -> None:
     dir_b.mkdir()
     write_metadata(dir_b, model="m", method="lora", dataset_path=dataset, hyperparameters={})
 
+    args = _args("totally-bogus", str(dir_b), runs_root=str(tmp_path))
     with pytest.raises(CliError) as exc_info:
-        cmd_compare(_args("totally-bogus", str(dir_b), runs_root=str(tmp_path)))
+        cmd_compare(args)
     assert exc_info.value.code == 1
 
 
@@ -652,8 +653,9 @@ def test_compare_base_regression_drop_exits_1(
             {"regression": _suite_payload("regression", suite_file, exact_match_pct=80.0)},
         ),
     )
+    args = _base_args(str(adapter), "unsloth/Qwen3-4B", json_mode=True)
     with pytest.raises(CliError) as exc_info:
-        cmd_compare(_base_args(str(adapter), "unsloth/Qwen3-4B", json_mode=True))
+        cmd_compare(args)
     assert exc_info.value.code == 1
     assert "regression" in exc_info.value.remediation
 
@@ -685,12 +687,11 @@ def test_compare_base_regression_flag_tags_another_suite(
     capsys.readouterr()
 
     fake.calls.clear()
+    args = _base_args(
+        str(adapter), "unsloth/Qwen3-4B", regression_suite=["holdout"], json_mode=True
+    )
     with pytest.raises(CliError) as exc_info:
-        cmd_compare(
-            _base_args(
-                str(adapter), "unsloth/Qwen3-4B", regression_suite=["holdout"], json_mode=True
-            )
-        )
+        cmd_compare(args)
     assert exc_info.value.code == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["thresholds"]["regression_suites"] == ["holdout"]
@@ -709,8 +710,9 @@ def test_compare_base_compliance_below_minimum_exits_1(
             {"regression": _suite_payload("regression", suite_file, compliance_pct=99.0)},
         ),
     )
+    args = _base_args(str(adapter), "unsloth/Qwen3-4B", json_mode=True)
     with pytest.raises(CliError) as exc_info:
-        cmd_compare(_base_args(str(adapter), "unsloth/Qwen3-4B", json_mode=True))
+        cmd_compare(args)
     assert exc_info.value.code == 1
     payload = json.loads(capsys.readouterr().out)
     assert [f["check"] for f in payload["verdict"]["failures"]] == ["compliance"]
@@ -730,8 +732,9 @@ def test_compare_base_latency_ratio_over_max_exits_1(
             {"regression": _suite_payload("regression", suite_file, median_latency_ms=100.0)},
         ),
     )
+    args = _base_args(str(adapter), "unsloth/Qwen3-4B", json_mode=True)
     with pytest.raises(CliError) as exc_info:
-        cmd_compare(_base_args(str(adapter), "unsloth/Qwen3-4B", json_mode=True))
+        cmd_compare(args)
     assert exc_info.value.code == 1
     payload = json.loads(capsys.readouterr().out)
     assert [f["check"] for f in payload["verdict"]["failures"]] == ["latency"]
@@ -751,8 +754,9 @@ def test_compare_base_suite_under_min_rows_exits_1(
             {"regression": _suite_payload("regression", suite_file, total=12)},
         ),
     )
+    args = _base_args(str(adapter), "unsloth/Qwen3-4B", json_mode=True)
     with pytest.raises(CliError) as exc_info:
-        cmd_compare(_base_args(str(adapter), "unsloth/Qwen3-4B", json_mode=True))
+        cmd_compare(args)
     assert exc_info.value.code == 1
     payload = json.loads(capsys.readouterr().out)
     assert {f["check"] for f in payload["verdict"]["failures"]} == {"min_suite_rows"}
@@ -772,8 +776,9 @@ def test_compare_base_precision_mismatch_exits_1(
             {"regression": _suite_payload("regression", suite_file, base_load_in_4bit=False)},
         ),
     )
+    args = _base_args(str(adapter), "unsloth/Qwen3-4B", json_mode=True)
     with pytest.raises(CliError) as exc_info:
-        cmd_compare(_base_args(str(adapter), "unsloth/Qwen3-4B", json_mode=True))
+        cmd_compare(args)
     assert exc_info.value.code == 1
     assert "base_load_in_4bit" in exc_info.value.remediation
     payload = json.loads(capsys.readouterr().out)
@@ -831,8 +836,9 @@ def test_compare_base_oom_on_second_run_exits_2_and_keeps_first_results(
             fail_on=2,
         ),
     )
+    args = _base_args(str(adapter), "unsloth/Qwen3-4B", json_mode=True)
     with pytest.raises(CliError) as exc_info:
-        cmd_compare(_base_args(str(adapter), "unsloth/Qwen3-4B", json_mode=True))
+        cmd_compare(args)
     assert exc_info.value.code == 2
     assert "memory" in exc_info.value.message.lower()
     assert "batch-size" in exc_info.value.remediation
@@ -876,8 +882,9 @@ def test_compare_base_without_adapter_eval_results_exits_1(
         raise AssertionError("no container may be launched without suites to score")
 
     monkeypatch.setattr(compare_mod.container, "launch", _must_not_launch)
+    args = _base_args(str(adapter), "unsloth/Qwen3-4B")
     with pytest.raises(CliError) as exc_info:
-        cmd_compare(_base_args(str(adapter), "unsloth/Qwen3-4B"))
+        cmd_compare(args)
     assert exc_info.value.code == 1
     assert "sloth eval --adapter" in exc_info.value.remediation
 
@@ -891,8 +898,9 @@ def test_compare_base_rejects_a_second_positional(
         raise AssertionError("argument validation must happen before any container launch")
 
     monkeypatch.setattr(compare_mod.container, "launch", _must_not_launch)
+    args = _base_args(str(adapter), "unsloth/Qwen3-4B", b=str(adapter))
     with pytest.raises(CliError) as exc_info:
-        cmd_compare(_base_args(str(adapter), "unsloth/Qwen3-4B", b=str(adapter)))
+        cmd_compare(args)
     assert exc_info.value.code == 1
 
 
@@ -900,8 +908,9 @@ def test_compare_without_base_still_requires_two_targets(tmp_path: Path) -> None
     """``sloth compare <a>`` (no --base) is a user error with a hint — the same
     exit 1 argparse used to produce, now routed through the CliError contract
     so --base can take a single positional."""
+    args = _args(str(tmp_path), None)
     with pytest.raises(CliError) as exc_info:
-        cmd_compare(_args(str(tmp_path), None))
+        cmd_compare(args)
     assert exc_info.value.code == 1
     assert "compare <a> <b>" in exc_info.value.remediation
 
@@ -999,8 +1008,9 @@ def test_compare_base_precreates_results_dir_and_fails_on_empty_base_side(
         return orig_call(sloth_args, **kwargs)
 
     monkeypatch.setattr(compare_mod.container, "launch", _spy)
+    args = _base_args(str(adapter), "unsloth/Qwen3-4B", json_mode=True)
     with pytest.raises(CliError) as exc_info:
-        cmd_compare(_base_args(str(adapter), "unsloth/Qwen3-4B", json_mode=True))
+        cmd_compare(args)
     assert exc_info.value.code == 1
     assert "produced no results" in exc_info.value.message
     assert exc_info.value.remediation

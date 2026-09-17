@@ -87,23 +87,26 @@ def tmp_adapter(tmp_path: Path) -> Path:
 
 def test_both_targets_is_a_user_error(tmp_adapter: Path) -> None:
     """--adapter and --model together exit 1 with a remediation."""
+    args = _make_args(adapter=str(tmp_adapter), model=str(tmp_adapter))
     with pytest.raises(CliError) as excinfo:
-        cmd_bench(_make_args(adapter=str(tmp_adapter), model=str(tmp_adapter)))
+        cmd_bench(args)
     assert excinfo.value.code == 1
     assert excinfo.value.remediation
 
 
 def test_neither_target_is_a_user_error() -> None:
     """Neither --adapter nor --model exits 1 with a remediation."""
+    args = _make_args()
     with pytest.raises(CliError) as excinfo:
-        cmd_bench(_make_args())
+        cmd_bench(args)
     assert excinfo.value.code == 1
 
 
 def test_missing_adapter_directory_is_a_user_error(tmp_path: Path) -> None:
     """A path that is not a directory exits 1 naming it."""
+    args = _make_args(adapter=str(tmp_path / "nope"))
     with pytest.raises(CliError) as excinfo:
-        cmd_bench(_make_args(adapter=str(tmp_path / "nope")))
+        cmd_bench(args)
     assert excinfo.value.code == 1
     assert "nope" in excinfo.value.message
 
@@ -116,16 +119,18 @@ def test_limit_below_one_is_rejected_before_any_launch(
     monkeypatch.setattr(
         bench_mod.container, "launch", lambda *a, **kw: launched.append(a) or dict(_FAKE_PAYLOAD)
     )
+    args = _make_args(adapter=str(tmp_adapter), limit=0)
     with pytest.raises(CliError) as excinfo:
-        cmd_bench(_make_args(adapter=str(tmp_adapter), limit=0))
+        cmd_bench(args)
     assert excinfo.value.code == 1
     assert launched == []
 
 
 def test_negative_num_fewshot_is_rejected(tmp_adapter: Path) -> None:
     """A negative few-shot count is a user error."""
+    args = _make_args(adapter=str(tmp_adapter), num_fewshot=-1)
     with pytest.raises(CliError) as excinfo:
-        cmd_bench(_make_args(adapter=str(tmp_adapter), num_fewshot=-1))
+        cmd_bench(args)
     assert excinfo.value.code == 1
 
 
@@ -239,8 +244,9 @@ def test_launch_failure_propagates(tmp_adapter: Path, monkeypatch: pytest.Monkey
         raise CliError(code=2, message="docker missing", remediation="install docker")
 
     monkeypatch.setattr(bench_mod.container, "launch", _boom)
+    args = _make_args(adapter=str(tmp_adapter))
     with pytest.raises(CliError) as excinfo:
-        cmd_bench(_make_args(adapter=str(tmp_adapter)))
+        cmd_bench(args)
     assert excinfo.value.code == 2
 
 

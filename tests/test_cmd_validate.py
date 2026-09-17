@@ -165,8 +165,9 @@ def test_invalid_role_rejected_same_as_train(
     bad = _write_dataset(
         tmp_path, '{"messages": [{"role": "wizard", "content": "x"}]}\n', name="bad.jsonl"
     )
+    args = _make_args(bad, schema="chat")
     with pytest.raises(CliError) as exc_info:
-        cmd_validate(_make_args(bad, schema="chat"))
+        cmd_validate(args)
     assert exc_info.value.code == 1
     assert "wizard" in exc_info.value.message
     assert exc_info.value.remediation
@@ -176,9 +177,10 @@ def test_invalid_dataset_matches_validate_dataset_directly(tmp_path: Path) -> No
     """The CliError raised by the verb is identical in shape to calling
     validate_dataset() directly — proving no rules are duplicated."""
     bad = _write_dataset(tmp_path, '{"messages": []}\n', name="bad.jsonl")
+    args = _make_args(bad, schema="chat")
 
     with pytest.raises(CliError) as from_verb:
-        cmd_validate(_make_args(bad, schema="chat"))
+        cmd_validate(args)
 
     with pytest.raises(CliError) as from_lib:
         validate_dataset(bad, "chat")
@@ -190,24 +192,27 @@ def test_invalid_dataset_matches_validate_dataset_directly(tmp_path: Path) -> No
 def test_invalid_json_line_rejected(tmp_path: Path) -> None:
     """Malformed JSON on a line raises CliError(code=1)."""
     bad = _write_dataset(tmp_path, "not valid json\n", name="bad.jsonl")
+    args = _make_args(bad, schema="chat")
     with pytest.raises(CliError) as exc_info:
-        cmd_validate(_make_args(bad, schema="chat"))
+        cmd_validate(args)
     assert exc_info.value.code == 1
 
 
 def test_empty_dataset_rejected(tmp_path: Path) -> None:
     """A dataset with no records (empty file) raises CliError(code=1)."""
     empty = _write_dataset(tmp_path, "", name="empty.jsonl")
+    args = _make_args(empty, schema="chat")
     with pytest.raises(CliError) as exc_info:
-        cmd_validate(_make_args(empty, schema="chat"))
+        cmd_validate(args)
     assert exc_info.value.code == 1
 
 
 def test_invalid_dataset_error_hint_contract(tmp_path: Path) -> None:
     """The invalid-dataset CliError renders as ``error:``/``hint:`` lines."""
     bad = _write_dataset(tmp_path, "not valid json\n", name="bad.jsonl")
+    args = _make_args(bad, schema="chat")
     with pytest.raises(CliError) as exc_info:
-        cmd_validate(_make_args(bad, schema="chat"))
+        cmd_validate(args)
     buf = io.StringIO()
     emit_error(exc_info.value, json_mode=False, stream=buf)
     text = buf.getvalue()
@@ -218,8 +223,9 @@ def test_invalid_dataset_error_hint_contract(tmp_path: Path) -> None:
 def test_invalid_dataset_json_error(tmp_path: Path) -> None:
     """The invalid-dataset CliError renders as structured JSON when requested."""
     bad = _write_dataset(tmp_path, "not valid json\n", name="bad.jsonl")
+    args = _make_args(bad, schema="chat", json_mode=True)
     with pytest.raises(CliError) as exc_info:
-        cmd_validate(_make_args(bad, schema="chat", json_mode=True))
+        cmd_validate(args)
     buf = io.StringIO()
     emit_error(exc_info.value, json_mode=True, stream=buf)
     payload = json.loads(buf.getvalue())
@@ -231,8 +237,9 @@ def test_invalid_dataset_json_error(tmp_path: Path) -> None:
 def test_task_schema_mismatch_rejected(tmp_path: Path) -> None:
     """A record missing a required task key is rejected against --schema task."""
     bad = _write_dataset(tmp_path, '{"task": "x", "input": "y"}\n', name="bad_task.jsonl")
+    args = _make_args(bad, schema="task")
     with pytest.raises(CliError) as exc_info:
-        cmd_validate(_make_args(bad, schema="task"))
+        cmd_validate(args)
     assert exc_info.value.code == 1
     assert "expected_output" in exc_info.value.message
 
@@ -245,8 +252,9 @@ def test_task_schema_mismatch_rejected(tmp_path: Path) -> None:
 
 def test_missing_file_raises_cli_error_1(tmp_path: Path) -> None:
     """A dataset path that does not exist raises CliError(code=1)."""
+    args = _make_args(tmp_path / "nope.jsonl")
     with pytest.raises(CliError) as exc_info:
-        cmd_validate(_make_args(tmp_path / "nope.jsonl"))
+        cmd_validate(args)
     assert exc_info.value.code == 1
     assert "not found" in exc_info.value.message
     assert exc_info.value.remediation
@@ -258,15 +266,17 @@ def test_missing_file_does_not_call_validate_dataset(
     """A missing file is caught before validate_dataset is ever invoked."""
     mock_validate = Mock()
     monkeypatch.setattr(validate_mod, "validate_dataset", mock_validate)
+    args = _make_args(tmp_path / "nope.jsonl")
     with pytest.raises(CliError):
-        cmd_validate(_make_args(tmp_path / "nope.jsonl"))
+        cmd_validate(args)
     mock_validate.assert_not_called()
 
 
 def test_missing_file_error_hint_contract(tmp_path: Path) -> None:
     """The missing-file CliError renders as ``error:``/``hint:`` lines."""
+    args = _make_args(tmp_path / "nope.jsonl")
     with pytest.raises(CliError) as exc_info:
-        cmd_validate(_make_args(tmp_path / "nope.jsonl"))
+        cmd_validate(args)
     buf = io.StringIO()
     emit_error(exc_info.value, json_mode=False, stream=buf)
     text = buf.getvalue()
@@ -570,8 +580,9 @@ def test_suite_accepts_every_known_schema_and_rejects_unknown(
         "toolcall",
     ]
 
+    args = _make_args(suite=chat_suite, schema="bogus", json_mode=True)
     with pytest.raises(CliError) as exc_info:
-        cmd_validate(_make_args(suite=chat_suite, schema="bogus", json_mode=True))
+        cmd_validate(args)
     assert exc_info.value.code == 1
     assert "bogus" in exc_info.value.message
 
