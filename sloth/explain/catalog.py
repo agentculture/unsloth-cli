@@ -28,10 +28,13 @@ buildable/deployable package baseline. Clone it, rename the package, edit
 - `unsloth-cli cli overview` — describe the CLI surface.
 - `unsloth-cli validate` — validate a JSONL dataset file, or an eval suite
   (file or directory), standalone.
-- `unsloth-cli config init` — write a starting `run.toml` with validated defaults.
+- `unsloth-cli config init` — write a starting `run.toml` with validated
+  defaults, including the commented-out `[eval]` / `[eval.thresholds]` /
+  `[run.dataset_map]` template.
 - `unsloth-cli train` — validate a dataset and run/plan a LoRA/QLoRA adapter job.
-- `unsloth-cli eval` — score an adapter against a local task-schema eval suite
-  (a file or a directory of them).
+- `unsloth-cli eval` — score an adapter (or exported model) against one or
+  more named eval suites (repeatable `--suite`; chat/task/instruction/
+  structured/toolcall schema, auto-detected) — a file or a directory of them.
 - `unsloth-cli export` — export an adapter to a PEFT/safetensors layout.
 - `unsloth-cli bench` — score an adapter or model on a standard benchmark
   (MMLU via `lm_eval`, in the NGC container).
@@ -40,7 +43,8 @@ buildable/deployable package baseline. Clone it, rename the package, edit
 - `unsloth-cli summarize <run_id|dir>` — one JSON summary of a past run
   (training_metadata.json + trainer_state.json).
 - `unsloth-cli compare <a> <b>` — side-by-side config deltas + summaries for
-  two past runs.
+  two past runs; `compare --base <hf-id-or-dir> <adapter>` instead compares a
+  single adapter against its base model, gated on `[eval.thresholds]`.
 
 ## Exit-code policy
 
@@ -248,6 +252,50 @@ The generated `[run]` section also documents (as commented-out TOML) that
 hub columns onto the chat (`messages`) or task (`task`/`input`/
 `expected_output`) schema. See `unsloth-cli explain train`.
 
+## `[run.dataset_map]` keys
+
+One chat-schema key, three task-schema keys — pick the shape matching the
+`hf:` dataset's schema (mixing both is rejected):
+
+- `messages` — hub column holding the chat schema's `messages` list.
+- `task` / `input` / `expected_output` — hub columns holding the task
+  schema's three fields.
+
+Any other key in `[run.dataset_map]` is rejected with a `hint:` naming it.
+
+## `[eval]` / `[eval.thresholds]` keys (written commented-out)
+
+The generated file also documents, as commented-out TOML, the optional
+`[eval]` section (training-time eval; see `unsloth-cli explain train`) and its
+nested `[eval.thresholds]` table (the gate `unsloth-cli compare --base`
+applies; see `unsloth-cli explain compare`). Both stay commented so a freshly
+generated config leaves `eval`/`thresholds` unset (`None`) — uncomment and
+edit to turn either on. Unknown keys under either section are rejected with a
+`hint:` naming them.
+
+`[eval]`:
+
+- `holdout_fraction` (default `0.0`) — fraction of the local dataset held out
+  for training-time eval; `0` disables the split entirely.
+- `seed` (default: the run's top-level seed) — RNG seed for the holdout split.
+- `eval_steps` (default `0`) — how often (in training steps) to evaluate the
+  holdout; `0` means "a quarter of `max_steps`, at least 1" once
+  `holdout_fraction > 0`.
+- `perplexity` (default `false`) — also compute held-out perplexity/loss.
+- `tool_call_family` (default `""`, meaning auto-detect) — the tool-call
+  parsing family for toolcall-schema holdout rows.
+
+`[eval.thresholds]` — the baseline `unsloth-cli compare --base` applies:
+
+- `regression_drop_pp` (default `2.0`) — max percentage-point drop allowed on
+  a regression-tagged suite's `exact_match_pct` before the gate fails.
+- `compliance_min_pct` (default `95.0`) — minimum `compliance_pct` the
+  adapter must clear.
+- `latency_max_ratio` (default `1.10`) — max adapter/base median-latency
+  ratio allowed.
+- `min_suite_rows` (default `100`) — minimum rows a suite must have on either
+  side, or the gate refuses to compare it.
+
 ## Exit codes
 
 - `0` success — config written.
@@ -309,6 +357,10 @@ resolved split — fraction, seed, both paths, both row counts, and the effectiv
 `training_metadata.json`, so the run is reproducible and its loss curve
 inspectable. An `hf:` dataset has no local file to split, so the holdout is
 skipped with a note on stderr and training proceeds without an eval set.
+`[eval]` also accepts `perplexity` (also compute held-out perplexity/loss) and
+`tool_call_family` (the tool-call parsing family for toolcall-schema holdout
+rows; `""` auto-detects) — see `unsloth-cli explain config` for the full
+`[eval]`/`[eval.thresholds]` key reference.
 
 ## Exit codes
 
