@@ -85,6 +85,38 @@ is cheaper than a broken AWQ path, so **0.11.0 / 0.16.0** are the pins.
 with **transformers 4.57.1** and **trl 0.24.0**, and leave torchao alone. These
 are the values in `sloth/tune/container.py::DEP_LAYER_PACKAGES`.
 
+## Bumping the benchmark-layer pins (lm_eval / sacrebleu)
+
+`sloth/tune/container.py::DEP_LAYER_BENCH_PACKAGES` pins the
+lm-evaluation-harness (`lm_eval`, used by `sloth bench` for MMLU) and `sacrebleu`
+(the lazy GLEU/BLEU scorer). They are installed with a plain `uv pip install`
+**after** the two layers above, so a bump is validated the same way: measure
+inside the container, never guess from PyPI. Because the harness resolves its
+own dependency tree, the thing to check is that the install stays **additive** —
+no line for torch, torchvision, transformers, peft, trl, datasets or numpy in the
+`uv pip install` diff. The 2026-09-17 measurement (docs/tested.md) was: 45
+packages added, 0 changed.
+
+```bash
+docker run --rm -e HOME=/opt/sloth-home \
+  -v ~/.cache/unsloth-cli/home:/opt/sloth-home \
+  nvcr.io/nvidia/pytorch:25.11-py3 bash -lc '
+  export PATH="$HOME/.local/bin:$PATH"
+  . "$HOME/.unsloth-cli-venv/bin/activate"        # the venv the CLI already built
+  uv pip install --dry-run lm_eval==<new> sacrebleu==<new> | grep -E "^ [+-] (torch|transformers|peft|trl|datasets|numpy)"
+  # empty output = additive; anything printed = the window moved, stop here
+  uv pip install lm_eval==<new> sacrebleu==<new>
+  uv pip list | grep -iE "lm.eval|sacrebleu|transformers|peft|trl|datasets|torch "
+'
+```
+
+If the dry-run prints a torch/transformers/peft line, do **not** bump: the harness
+would move the pinned window (see the torchao deadlock above). Either hold the old
+pin or install the harness `--no-deps` and list its runtime deps explicitly, the
+way the `--no-deps` layer does for unsloth. Then edit the tuple, re-run
+`uv run pytest tests/test_tune_container.py`, and record the row in
+[`docs/tested.md`](tested.md).
+
 ## Bumping the unsloth / unsloth_zoo / bitsandbytes pins
 
 `sloth/tune/container.py::DEP_LAYER_NODEPS_PACKAGES` pins `unsloth`,
