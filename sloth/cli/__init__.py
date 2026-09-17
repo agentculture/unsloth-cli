@@ -62,6 +62,7 @@ def _argv_has_json(argv: list[str] | None) -> bool:
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    from sloth.cli._commands import bench as _bench_cmd
     from sloth.cli._commands import cli as _cli_group
     from sloth.cli._commands import compare as _compare_cmd
     from sloth.cli._commands import config as _config_cmd
@@ -103,6 +104,9 @@ def _build_parser() -> argparse.ArgumentParser:
     _train_cmd.register(sub)
     _eval_cmd.register(sub)
     _export_cmd.register(sub)
+    # Standard-benchmark verb (MMLU via lm_eval in the NGC container). Same
+    # torch-free discipline: the harness is reached only inside the container.
+    _bench_cmd.register(sub)
     # Run registry (issue #12 / colleague#291 S4b): train appends to
     # <runs-root>/runs.jsonl; runs/summarize/compare read it back — no
     # directory walking. Same torch-free discipline as the verbs above.

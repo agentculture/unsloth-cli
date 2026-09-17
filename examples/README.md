@@ -16,6 +16,7 @@ package at runtime.
 | `instruction-following.jsonl` | 56 | `instruction` | Constraint following: `must_refuse` (12 rows), `max_words`, `min_words`, `must_contain`, `must_not_contain`, `json_only` |
 | `structured-output.jsonl` | 55 | `structured` | JSON output against a `json_schema` (flat, `enum`, `items`, nested, `additionalProperties: false`) |
 | `tool-call.jsonl` | 32 | `toolcall` | Emitting `expected_tool_call` for a stated tool and its parameters |
+| `mmlu-subset.jsonl` | 120 | `task` | MMLU-**style** lettered multiple choice across 12 subjects (original questions — *not* MMLU rows) |
 
 `regression.jsonl` is deliberately generic: a *base* model should already score
 well on it. It is the guard that catches an adapter eroding general ability
@@ -34,6 +35,56 @@ The `instruction`, `structured` and `toolcall` suites are validated through
 `--suite` at the whole `examples/eval/` directory validates every `*.jsonl`
 child against the task schema and therefore rejects them; pass the task-schema
 files individually until the CLI grows per-schema suite handling.
+
+## MMLU-style subset (`eval/mmlu-subset.jsonl`)
+
+**This is not MMLU.** Not one row comes from `cais/mmlu`, `hails/mmlu_no_train`,
+or any other third-party dataset: all 120 questions and every distractor were
+written for this repository, and the file carries the repository's own licence
+(MIT, see [`../LICENSE`](../LICENSE)). It is an MMLU-*style* suite — the same
+lettered multiple-choice shape, spread over 12 subjects (astronomy, biology,
+chemistry, physics, world history, geography, mathematics, computer science,
+economics, psychology, logic, nutrition) — that exists so the letter-choice
+scoring path can be exercised **offline, with no download**, on a machine that
+has never fetched MMLU.
+
+For the real, quotable MMLU number, run the benchmark verb instead:
+
+```bash
+uv run sloth bench --adapter runs/qlora-smoke --benchmark mmlu
+```
+
+which runs the lm-evaluation-harness inside the NGC container (see
+[`../docs/dgx-spark.md`](../docs/dgx-spark.md)).
+
+Each row is task-schema, with the options rendered into `input` and a bare
+letter as `expected_output`:
+
+```json
+{"task": "mmlu-style multiple choice (astronomy)",
+ "input": "A light-year is a unit of what?\nA. Mass\nB. Time\nC. Distance\nD. Brightness\nAnswer with the letter.",
+ "expected_output": "C"}
+```
+
+Because *every* `expected_output` is a single `A`-`D` letter, `sloth eval`
+switches the file into **letter-choice scoring**: the model's answer letter is
+extracted (tolerating `"B"`, `"B."`, `"(B)"`, `"Answer: B"`) and reported as
+`choice_match` per row and `choice_acc_pct` for the suite, alongside the
+unchanged `exact_match` numbers.
+
+```bash
+uv run sloth eval --adapter runs/qlora-smoke --suite examples/eval/mmlu-subset.jsonl
+```
+
+The answer key is exactly balanced — 30 rows per letter — so always guessing a
+fixed letter scores chance (25%), not 50%. Regenerate the committed file with:
+
+```bash
+uv run python examples/generate_mmlu_subset.py
+```
+
+Like `generate_suites.py` it is pure stdlib and fully deterministic;
+`tests/test_examples_suites.py` asserts both the determinism and the balance.
 
 ## Demo corpus (`demo-corpus.jsonl`)
 
