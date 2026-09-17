@@ -124,6 +124,25 @@ home. Fixed by forwarding `SLOTH_ALLOWED_ROOTS` (the identity-mounted parents) i
 the container env (deviation d2). Every real `sloth export` on `main` between #20 and
 this fix was broken.
 
+## ✅ Tested — passed (2026-09-17, benchmark dep layer: lm_eval + sacrebleu)
+
+Same box and container as above, on the `feat/full-benchmark-suite` branch (plan
+`full-benchmark-suite`, task t12). The dep layer gains a third tuple,
+`DEP_LAYER_BENCH_PACKAGES = ("lm_eval==0.4.13", "sacrebleu==2.6.0")`, installed with a
+plain `uv pip install` **after** the `--no-deps` layer. Measured by mounting the
+already-built dep-layer venv (`~/.cache/unsloth-cli/home/.unsloth-cli-venv`) and
+installing the two packages into it, then diffing `uv pip list`.
+
+| Step | Invocation | Result |
+|------|------------|--------|
+| before | `uv pip list` in the built venv | transformers 4.57.1, peft 0.18.0, trl 0.24.0, datasets 4.8.5, accelerate 1.13.0, numpy 2.3.5, unsloth 2026.9.4, bitsandbytes 0.50.2 |
+| install | `uv pip install lm_eval==0.4.13 sacrebleu==2.6.0` (dry-run, then real) | ✅ **45 packages added, 0 changed, 0 removed** — evaluate 0.4.6, scikit-learn 1.9.1, scipy 1.18.1, sqlitedict 2.1.0, rouge-score 0.1.2, portalocker 4.3.2, tabulate 0.10.0, … ; no torch / torchvision / transformers / peft / trl / datasets / numpy line in the diff |
+| after | `uv pip list` | transformers 4.57.1, peft 0.18.0, trl 0.24.0, datasets 4.8.5, accelerate 1.13.0, numpy 2.3.5 unchanged; lm-eval 0.4.13, sacrebleu 2.6.0 present |
+| import | `python -c "import torch; …"` / transformers, peft, trl, datasets / lm_eval, sacrebleu / unsloth | ✅ `torch 2.10.0a0+b558c986e8.nv25.11 cuda 13.0 True`; `tf 4.57.1 peft 0.18.0 trl 0.24.0 ds 4.8.5`; `lm_eval 0.4.13 sacrebleu 2.6.0`; `import unsloth` still patches (🦥 banner) |
+
+Not exercised here: an actual `lm_eval` MMLU run (task t13) and the sacrebleu scorer
+(task t4) — this row only proves the pins coexist with the validated window.
+
 ## ❌ Not tested (explicit gaps)
 
 Do not assume these work just because the 1.7B path does. The code path is often
