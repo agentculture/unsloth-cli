@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess  # nosec B404 - scoring a GGUF means invoking llama-completion
 import time
@@ -840,6 +841,16 @@ def _load_eval_backend() -> _EvalBackend:
     )
 
 
+#: A Hugging Face repo id: exactly one ``/``, both halves plain identifiers
+#: (mirrors ``sloth.cli._commands.eval._HF_REPO_ID_RE``).
+_HF_REPO_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _is_hf_repo_id(value: str | Path) -> bool:
+    """True when *value* looks like ``org/name`` (never a local path form)."""
+    return bool(_HF_REPO_ID_RE.match(str(value)))
+
+
 def _quant_info(model_dir: Path) -> tuple[str | None, str | None]:
     """Return ``(quant_method, quant_format)`` read from ``<model_dir>/config.json``.
 
@@ -1119,12 +1130,18 @@ def run_eval_model(
     """
     resolved_suites = resolve_suite_paths(suite_path, suite_paths)
     directory = Path(model_dir)
+    # A Hugging Face repo id (org/name) that answers to nothing on disk is a
+    # *remote* base model — the form `sloth compare --base` scores. It loads from
+    # the mounted HF cache (still local_files_only), has no quantisation config
+    # or GGUF, and owns no directory: the caller (cmd_eval --results-dir) writes
+    # the result files, so no artifacts are written here.
+    remote = not directory.exists() and _is_hf_repo_id(model_dir)
     if directory.is_file() and directory.suffix == ".gguf":
         gguf_file = directory
         directory = directory.parent
     else:
         gguf_file = None
-    if not directory.is_dir():
+    if not directory.is_dir() and not remote:
         raise CliError(
             code=EXIT_USER_ERROR,
             message=f"model directory not found: {directory}",
@@ -1141,9 +1158,11 @@ def run_eval_model(
     for path in resolved_suites:
         schema = _detect_suite_schema(Path(path))
         records_by_file.append((path, schema, validate_dataset(Path(path), schema=schema)))
-    quant_method, quant_format = _quant_info(directory)
+    quant_method, quant_format = (None, None) if remote else _quant_info(directory)
 
-    gguf = gguf_file if gguf_file is not None else _find_gguf(directory, quant)
+    gguf = (
+        None if remote else (gguf_file if gguf_file is not None else _find_gguf(directory, quant))
+    )
     if perplexity and gguf is not None:
         raise CliError(
             code=EXIT_USER_ERROR,
@@ -1181,7 +1200,9 @@ def run_eval_model(
                     message=f"The eval backend is not installed: {exc}",
                     remediation=_EVAL_NGC_HINT,
                 ) from exc
-            model, tokenizer, device = _load_transformers_eval_model(backend, directory)
+            model, tokenizer, device = _load_transformers_eval_model(
+                backend, Path(model_dir) if remote else directory
+            )
             torch_mod = backend.torch
             generations = [
                 _generate_predictions(
@@ -1233,9 +1254,11 @@ def run_eval_model(
         )
 
     summary = build_summary(files, batch_size=batch_size, base_load_in_4bit=base_load_in_4bit)
-    summary["model_dir"] = str(directory)
+    summary["model_dir"] = str(model_dir) if remote else str(directory)
     summary["quant_method"] = quant_method
     summary["quant_format"] = quant_format
+    if remote:
+        return summary
     write_eval_artifacts(
         directory,
         files,

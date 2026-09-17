@@ -2470,3 +2470,33 @@ def test_run_eval_model_scores_a_letter_choice_suite(tmp_path: Path, monkeypatch
     rows = result["results"]
     assert [r.get("choice_match") for r in rows] == [True, False]
     assert result["choice_acc_pct"] == 50.0
+
+
+def test_run_eval_model_accepts_a_remote_hf_repo_id(tmp_path: Path, monkeypatch) -> None:
+    """compare --base integration: a Hugging Face repo id (org/name) that exists
+    nowhere on disk is a remote base model — loaded by id from the mounted HF
+    cache, no quantisation sniffing, no artifacts written by the seam (the CLI's
+    --results-dir writer owns that)."""
+    from sloth.tune import _exporter as exporter_mod
+    from sloth.tune._trainer import eval_prompt
+
+    suite = tmp_path / "s.jsonl"
+    suite.write_text('{"task": "t", "input": "q", "expected_output": "a"}\n', encoding="utf-8")
+    row = {"task": "t", "input": "q", "expected_output": "a"}
+    backend = _fake_backend({eval_prompt(row): "a"})
+    seen: list[str] = []
+    orig = backend.auto_model_for_causal_lm.from_pretrained
+
+    def _spy(path, *args, **kwargs):
+        seen.append(str(path))
+        return orig(path, *args, **kwargs)
+
+    backend.auto_model_for_causal_lm.from_pretrained = _spy
+    monkeypatch.setattr(exporter_mod, "_load_eval_backend", lambda: backend)
+    monkeypatch.chdir(tmp_path)
+    result = exporter_mod.run_eval_model("LiquidAI/LFM2.5-1.2B-Base", suite_paths=[suite])
+    assert seen == ["LiquidAI/LFM2.5-1.2B-Base"]
+    assert result["exact_match"] == 1
+    assert result["model_dir"] == "LiquidAI/LFM2.5-1.2B-Base"
+    assert result["quant_method"] is None
+    assert not (tmp_path / "eval").exists() and not (tmp_path / "eval.json").exists()

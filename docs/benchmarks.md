@@ -196,22 +196,79 @@ wall time / rows; `tokens_per_s` is generated tokens over generate wall time.
 | `mmlu-subset` (MMLU-style subset (letter choice)) | 120 | 8.33 | 0.1085 | — | 23.33 | 51.12 | 3507 | 28.7 |
 | `demo-corpus-holdout` (holdout) | 59 | 1.69 | 0.1201 | — | — | 1.51 | 2507 | 36.7 |
 
-**Reading this table honestly.** The fixture adapter does **not** meet the
-success signal: the three target-task suites are still **0/46 exact match** and
-the holdout suite scores 1/59 — while holdout *perplexity* is 1.51, i.e. the
-adapter learned the corpus's own phrasing (full-sentence answers such as "The
-distribution name is unsloth-cli.") but the suites expect terse answers
-("unsloth-cli"), and its generations echo the `Task:/Input:/Output:` template
-(a run of `:` characters, or `Input: …` repeated until the 100-token budget) —
-the corpus, not the metrics, needs rework (plan risk r3). What the new families
-*do* show on the same adapter: instruction-following compliance 19.6 % and
+**Reading this table honestly — batch 8 is invalid on LFM2.5.** Every
+accuracy figure above is an artefact of the batched eval path, not of the
+adapter: at batch 8 (left padding) the generations are degenerate — runs of `:`
+characters, or `Input: …` echoed until the 100-token budget — on **every**
+suite, whereas batch 1 on the same adapter, suites and prompts (next table)
+scores 5/14 on `cli-contract` and 9/16 on `task-format`. LFM2.5's short-conv
+layers do not tolerate left padding the way an attention-only model does, so the
+"batched is 2.4× faster but not bit-identical" caveat from the #22 run (risk r8)
+is, for LFM2, "batched is wrong" (plan risk r13). The table is kept because it is
+the measurement that exposed the defect, and because it shows what the new
+families report on garbage output: instruction-following compliance 19.6 % and
 structured-output compliance 12.7 % (constraint / JSON-schema checks that exact
-match and F1 alone could never report); tool-call compliance 0 % on a *Base*
-checkpoint that never emits LFM2 tool-call tokens (the 56 % "exact" figure on
-that suite is empty-vs-empty — tool-call rows carry no reference text, so
-`compliance_pct` is the metric there); the MMLU-style subset at 23.3 % letter
-accuracy (chance is 25 %); and per-row latency of 2.5–3.5 s at batch 8 because
-the echoing generations never stop early.
+match and F1 alone could never report), tool-call compliance 0 % (the 56 %
+"exact" figure on that suite is empty-vs-empty — tool-call rows carry no
+reference text, so `compliance_pct` is the metric there), letter accuracy at
+chance (23.3 % vs 25 %), and 2.5–3.5 s per row because the echoing generations
+never stop early. **All accuracy, perplexity and latency claims for LFM2 below
+are batch 1.**
+
+### `sloth eval` — every suite family on the fixture adapter (**batch 1**, the valid LFM2 numbers)
+
+Same command as above with `--batch-size 1` (2026-09-17, one invocation, nine
+named suites, 484 rows, **27 min 37 s** wall; bf16 LoRA; greedy,
+`max_new_tokens = 100`). Perplexity is a labelled forward pass and therefore
+identical to the batch-8 run; every generation-based column differs.
+
+| Suite (family) | Rows | Exact % | Token-F1 | Compliance % | Choice acc % | Perplexity | Median latency ms | tok/s |
+|---|---|---|---|---|---|---|---|---|
+| `agentculture-terms` (target-task) | 16 | 0.00 | 0.2641 | — | — | 16.21 | 2377 | 6.7 |
+| `cli-contract` (target-task) | 14 | 35.71 | 0.6357 | — | — | 11.35 | 2151 | 6.3 |
+| `task-format` (target-task) | 16 | 56.25 | 0.6277 | — | — | 20.23 | 1464 | 7.2 |
+| `regression` (regression) | 116 | 11.21 | 0.5852 | — | — | 32.40 | 1260 | 9.3 |
+| `instruction-following` (instruction following) | 56 | 0.00 | 0.1126 | 46.43 | — | 160.47 | 1891 | 7.6 |
+| `structured-output` (structured output) | 55 | 0.00 | 0.0000 | 76.36 | — | 251.85 | 2730 | 9.2 |
+| `tool-call` (tool call) | 32 | 0.00 | 0.0000 | 0.00 | — | 263.42 | 1581 | 5.9 |
+| `mmlu-subset` (MMLU-style subset (letter choice)) | 120 | 60.00 | 0.6012 | — | 61.67 | 51.12 | 984 | 4.7 |
+| `demo-corpus-holdout` (holdout) | 59 | 10.17 | 0.3595 | — | — | 1.51 | 1880 | 7.0 |
+
+**What this measures.** Target-task exact match is now non-zero on two of the
+three suites (`cli-contract` 5/14, `task-format` 9/16) and the holdout split
+scores 6/59 — the adapter *did* learn the trained behaviour, though
+`agentculture-terms` stays at 0/16 exact with token-F1 0.26 because the demo
+corpus teaches full-sentence answers ("The distribution name is unsloth-cli.")
+where the suite expects the bare term ("unsloth-cli"): F1 is the fairer
+target-task metric for this corpus (plan risk r3). Instruction-following
+compliance 46.4 % and structured-output compliance 76.4 % are the new
+families' verdicts on format/constraint behaviour; tool-call compliance is 0 %
+because a *Base* checkpoint never emits LFM2's `<|tool_call_start|>` wrapper
+(the suite is meaningful on an Instruct base). The MMLU-style subset scores
+61.7 % letter accuracy. Per-row latency at batch 1 is 1.0–2.7 s (5–9 tok/s in
+HF eager generation on the Spark with lobes' vLLM resident — a serving figure
+belongs to lobes, see below). Whether any of this is *better than the base
+model* is the `sloth compare --base` table.
+
+### `sloth bench` — MMLU through lm-evaluation-harness (fixture adapter)
+
+`uv run sloth bench --adapter runs/demo-lora --benchmark mmlu --limit 5 --json`
+(2026-09-17, **5 min 22 s** wall incl. container + first-run download of the 57
+MMLU subject splits; in-container command as recorded on stderr:
+`lm_eval --model hf --model_args pretrained=LiquidAI/LFM2.5-1.2B-Base,peft=<adapter> --tasks mmlu --num_fewshot 5 --limit 5 --output_path <tmp> --log_samples`).
+
+| Metric | Value |
+|--------|-------|
+| Harness | lm_eval 0.4.13, task `mmlu`, 5-shot, `--limit 5` (= 5 documents **per subject**, 57 subjects) |
+| Documents | 285 |
+| `acc` | **0.5789** (`acc_norm` is not reported by the MMLU task and is stored as `null`) |
+| Per subject | 61 entries in `eval/mmlu.json`; highest `astronomy` 1.0, `high_school_psychology` 1.0, `medical_genetics` 1.0; lowest `elementary_mathematics` 0.0, `moral_scenarios` 0.0, `college_mathematics` 0.2 |
+| Adapter load | `peft=<adapter>` on the bf16 base **worked directly** — frame park v4 is resolved for LoRA adapters (a QLoRA / `load_in_4bit=True` adapter is still unmeasured; the documented fallback is to bench the merged-16bit export) |
+| Result file | `runs/demo-lora/eval/mmlu.json` (schema_version 2, `suite: "mmlu"`, `exact_match_pct = acc × 100` so `summarize` folds it) |
+
+A 5-per-subject smoke is a **noisy** estimate (285 documents); it is a
+sanity number for the fixture adapter, not a claim comparable to published
+LFM2.5-1.2B MMLU figures, which use the full 14 042-document test set.
 
 ## Serving latency + tok/s
 
