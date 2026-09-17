@@ -147,11 +147,12 @@ the same pattern `sloth eval`'s `--adapter`/`--model` uses):
   passes here is guaranteed to pass `sloth eval`'s host-side validation too.
   `PATH` may be a single `.jsonl` file or a directory — a directory is
   expanded to its sorted `*.jsonl` children and every one is validated
-  **always against the task schema** (eval suites are task-schema only, the
-  same rule `sloth eval` enforces), reporting a per-file record count plus
-  the aggregate total. Passing an explicit `--schema` other than `task`
-  together with `--suite` exits `1` with a `hint:` — it would otherwise
-  report a suite as valid against a schema `sloth eval` will not accept.
+  against the schema **detected from its own first record** — `task`,
+  `chat`, `instruction`, `structured` or `toolcall`, the same detection
+  `sloth eval` applies — reporting a per-file record count and schema plus
+  the aggregate total, so one directory can mix suite kinds. Passing
+  `--schema` pins one schema for every file; a value outside the five known
+  schemas exits `1` with a `hint:`.
 
 `--dataset` also accepts an external `hf:<org>/<name>[:split]` Hugging Face
 Hub dataset id in place of a local path. Its rows are rendered to the chat or
@@ -178,13 +179,12 @@ machine with no GPU stack installed.
 
 - `--dataset PATH` — path to a JSONL training dataset file. Mutually
   exclusive with `--suite`.
-- `--suite PATH` — path to a task-schema JSONL eval suite, or a directory of
-  them (every `*.jsonl` child is validated). Mutually exclusive with
-  `--dataset`.
-- `--schema {chat,task}` — schema to validate against. With `--dataset`:
-  default auto-detect from the first record. With `--suite`: always `task`
-  (eval suites are task-schema only); passing `--schema chat` (or any value
-  other than `task`) together with `--suite` exits `1` with a `hint:`.
+- `--suite PATH` — path to a JSONL eval suite, or a directory of them (every
+  `*.jsonl` child is validated and its schema detected). Mutually exclusive
+  with `--dataset`.
+- `--schema {chat,instruction,structured,task,toolcall}` — schema to validate
+  against. Default: auto-detect from each file's first record. Passing it
+  pins that schema for every file.
 - `--dataset-map FIELD=COLUMN` (repeatable) — column mapping for an
   `hf:<org>/<name>[:split]` `--dataset`; ignored for a local JSONL `--dataset`.
 - `--json` — emit the result as structured JSON: `{valid, schema, line_count}`

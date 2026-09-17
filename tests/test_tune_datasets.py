@@ -734,3 +734,48 @@ class TestDetectSchemaBackwardsCompatible:
 
     def test_task_still_detects(self) -> None:
         assert detect_schema({"task": "t", "input": "i", "expected_output": "o"}) == "task"
+
+
+class TestDetectSchemaFiveWay:
+    """Deviation d1: detect_schema is the single five-way detector."""
+
+    def test_each_schema_is_detected_by_its_discriminating_key(self) -> None:
+        from sloth.tune.datasets import detect_schema
+
+        assert detect_schema({"messages": []}) == "chat"
+        assert detect_schema({"task": "t", "input": "i", "expected_output": "o"}) == "task"
+        assert (
+            detect_schema({"task": "t", "input": "i", "expected_output": "o", "constraints": []})
+            == "instruction"
+        )
+        assert detect_schema({"task": "t", "input": "i", "json_schema": {}}) == "structured"
+        assert detect_schema({"task": "t", "input": "i", "expected_tool_call": {}}) == "toolcall"
+        assert detect_schema({"foo": 1}) is None
+        assert detect_schema("not a dict") is None  # type: ignore[arg-type]
+
+    def test_detect_file_schema_reads_first_record_and_never_raises(self, tmp_path) -> None:
+        from sloth.tune.datasets import detect_file_schema
+
+        f = tmp_path / "s.jsonl"
+        f.write_text('\n{"task": "t", "input": "i", "json_schema": {}}\n', encoding="utf-8")
+        assert detect_file_schema(f) == "structured"
+        (tmp_path / "bad.jsonl").write_text("not json\n", encoding="utf-8")
+        assert detect_file_schema(tmp_path / "bad.jsonl") is None
+        assert detect_file_schema(tmp_path / "missing.jsonl") is None
+
+    def test_validate_suite_auto_mixes_schemas_and_falls_back_to_task(self, tmp_path) -> None:
+        from sloth.cli._errors import CliError
+        from sloth.tune.datasets import validate_suite
+
+        d = tmp_path / "suite"
+        d.mkdir()
+        (d / "a.jsonl").write_text(
+            '{"task": "t", "input": "i", "expected_output": "o"}\n', encoding="utf-8"
+        )
+        (d / "b.jsonl").write_text('{"messages": [{"role": "user", "content": "x"}]}\n')
+        report = validate_suite(d, schema="auto")
+        assert [f["schema"] for f in report["files"]] == ["task", "chat"]
+        (d / "c.jsonl").write_text("{}\n", encoding="utf-8")
+        with pytest.raises(CliError) as exc_info:
+            validate_suite(d, schema="auto")
+        assert "c.jsonl" in exc_info.value.message and "line 1" in exc_info.value.message

@@ -42,13 +42,21 @@ from typing import Any
 from sloth.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 from sloth.cli._output import emit_diagnostic, emit_result
 from sloth.tune._trainer import infer_hf_dataset_schema, is_hf_dataset_spec, load_external_records
-from sloth.tune.datasets import detect_schema, validate_dataset, validate_suite
+from sloth.tune.datasets import (
+    AUTO_SCHEMA,
+    KNOWN_SCHEMAS,
+    detect_schema,
+    validate_dataset,
+    validate_suite,
+)
 
 #: Schema assumed when the dataset's first record cannot be classified.
 DEFAULT_SCHEMA = "chat"
 
-#: Schema a --suite is validated against (eval suites are always task-schema).
-SUITE_SCHEMA = "task"
+#: Schema a --suite is validated against when ``--schema`` is not given: each
+#: file is detected separately (task / chat / instruction / structured / toolcall),
+#: exactly as ``sloth eval`` classifies it — so a directory may mix suite kinds.
+SUITE_SCHEMA = AUTO_SCHEMA
 
 #: Rows sampled from an ``hf:`` dataset for a cache-only ``--dataset`` validation.
 HF_VALIDATE_SAMPLE_ROWS = 50
@@ -64,25 +72,26 @@ def _cmd_validate_suite(args: argparse.Namespace) -> int | None:
 
     Uses the *same* :func:`~sloth.tune.datasets.validate_suite` function that
     ``sloth eval`` calls for its pre-launch check, so a suite that passes here
-    is guaranteed to pass ``sloth eval``'s host-side validation too. ``--suite``
-    is **always** validated against the task schema — ``sloth eval`` never
-    accepts anything else — so an explicit ``--schema`` other than ``task``
-    is a user error rather than being silently honoured (that would let a
-    suite be reported "valid" here and still be rejected by ``sloth eval``).
+    is guaranteed to pass ``sloth eval``'s host-side validation too. Without
+    ``--schema`` every file's schema is **detected** from its first record
+    (:data:`SUITE_SCHEMA` is ``"auto"``), which is how ``sloth eval`` treats a
+    suite directory; an explicit ``--schema`` pins one known schema for every
+    file, and a file that does not match it is a user error.
     """
     json_mode = bool(getattr(args, "json", False))
     suite_arg = args.suite
     requested_schema = getattr(args, "schema", None)
-    if requested_schema is not None and requested_schema != SUITE_SCHEMA:
+    if requested_schema is not None and requested_schema not in KNOWN_SCHEMAS:
         raise CliError(
             code=EXIT_USER_ERROR,
-            message=(
-                f"--schema {requested_schema} is not supported with --suite "
-                f"(eval suites are always validated against the {SUITE_SCHEMA!r} schema)"
+            message=f"--schema {requested_schema} is not a known suite schema",
+            remediation=(
+                "Drop --schema to detect each file's schema, or pass one of: "
+                + ", ".join(sorted(KNOWN_SCHEMAS))
+                + "."
             ),
-            remediation=("Drop --schema when using --suite, or pass --schema task explicitly."),
         )
-    schema = SUITE_SCHEMA
+    schema = requested_schema or SUITE_SCHEMA
 
     report = validate_suite(suite_arg, schema=schema)
     files = report["files"]
@@ -100,7 +109,9 @@ def _cmd_validate_suite(args: argparse.Namespace) -> int | None:
     else:
         lines = [f"suite:  {suite_arg}", f"schema: {schema}"]
         for entry in files:
-            lines.append(f"  {entry['path']}: {entry['line_count']} records")
+            lines.append(
+                f"  {entry['path']}: {entry['line_count']} records ({entry.get('schema', schema)})"
+            )
         lines.append(f"total:  {total} records across {len(files)} file(s)")
         lines.append("status: valid")
         emit_result("\n".join(lines), json_mode=False)
@@ -346,18 +357,19 @@ def register(sub: argparse._SubParsersAction) -> None:
         default=None,
         metavar="PATH",
         help=(
-            "Path to a task-schema JSONL eval suite, or a directory of them "
-            "(every *.jsonl child is validated). Mutually exclusive with --dataset."
+            "Path to a JSONL eval suite, or a directory of them (every *.jsonl child "
+            "is validated; each file's schema is detected). Mutually exclusive with "
+            "--dataset."
         ),
     )
     p.add_argument(
         "--schema",
-        choices=["chat", "task"],
+        choices=sorted(KNOWN_SCHEMAS),
         default=None,
         help=(
-            "Schema to validate against. With --dataset: default auto-detect "
-            "from the first record. With --suite: always 'task' (eval suites "
-            "are task-schema only); passing anything else with --suite exits 1."
+            "Schema to validate against. Default: auto-detect from each file's "
+            "first record (task, chat, instruction, structured or toolcall). "
+            "Passing it pins that schema for every file."
         ),
     )
     p.add_argument(

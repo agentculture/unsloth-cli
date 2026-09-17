@@ -442,9 +442,9 @@ def test_suite_single_file_valid_json_shape(
     assert rc in (None, 0)
     payload = json.loads(capsys.readouterr().out)
     assert payload["valid"] is True
-    assert payload["schema"] == "task"
+    assert payload["schema"] == "auto"
     assert payload["total_records"] == 2
-    assert payload["files"] == [{"path": str(suite_file), "line_count": 2}]
+    assert payload["files"] == [{"path": str(suite_file), "line_count": 2, "schema": "task"}]
 
 
 def test_suite_directory_reports_per_file_counts(
@@ -524,23 +524,69 @@ def test_suite_uses_same_validate_suite_function_as_eval(
     monkeypatch.setattr(validate_mod, "validate_suite", _spy)
     rc = cmd_validate(_make_args(suite=suite_dir))
     assert rc in (None, 0)
-    assert calls == [(str(suite_dir), "task")]
+    assert calls == [(str(suite_dir), "auto")]
 
 
-def test_suite_with_non_task_schema_raises_cli_error(tmp_path: Path) -> None:
-    """qodo: a --suite validated against a non-task --schema must NOT be
-    reported valid — sloth eval always enforces the task schema for suites,
-    so a chat-schema file that "passes" here with --schema chat would fail
-    sloth eval anyway. --suite always validates against task; an explicit
-    non-task --schema is a user error."""
+def test_suite_accepts_every_known_schema_and_rejects_unknown(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Deviation d1 (plan full-benchmark-suite): eval suites are no longer
+    task-only — chat, instruction, structured and toolcall suites are scored by
+    ``sloth eval`` — so ``--suite --schema chat`` on a chat file is valid, and
+    a directory mixing schemas validates file by file. An unknown --schema is
+    still a user error."""
     chat_suite = tmp_path / "chat_suite.jsonl"
     chat_suite.write_text('{"messages": [{"role": "user", "content": "hi"}]}\n', encoding="utf-8")
-    args = _make_args(suite=chat_suite, schema="chat", json_mode=True)
+    rc = cmd_validate(_make_args(suite=chat_suite, schema="chat", json_mode=True))
+    assert rc in (None, 0)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema"] == "chat"
+    assert payload["files"][0]["schema"] == "chat"
+
+    mixed = tmp_path / "mixed"
+    mixed.mkdir()
+    (mixed / "a-task.jsonl").write_text(
+        '{"task": "t", "input": "i", "expected_output": "o"}\n', encoding="utf-8"
+    )
+    (mixed / "b-instruction.jsonl").write_text(
+        '{"task": "t", "input": "i", "expected_output": "o", '
+        '"constraints": [{"max_words": 5}]}\n',
+        encoding="utf-8",
+    )
+    (mixed / "c-structured.jsonl").write_text(
+        '{"task": "t", "input": "i", "json_schema": {"type": "object"}}\n', encoding="utf-8"
+    )
+    (mixed / "d-toolcall.jsonl").write_text(
+        '{"task": "t", "input": "i", "expected_tool_call": {"name": "f", "arguments": {}}}\n',
+        encoding="utf-8",
+    )
+    rc = cmd_validate(_make_args(suite=mixed, json_mode=True))
+    assert rc in (None, 0)
+    payload = json.loads(capsys.readouterr().out)
+    assert [f["schema"] for f in payload["files"]] == [
+        "task",
+        "instruction",
+        "structured",
+        "toolcall",
+    ]
+
     with pytest.raises(CliError) as exc_info:
-        cmd_validate(args)
-    err = exc_info.value
-    assert err.code == 1
-    assert err.remediation
+        cmd_validate(_make_args(suite=chat_suite, schema="bogus", json_mode=True))
+    assert exc_info.value.code == 1
+    assert "bogus" in exc_info.value.message
+
+
+def test_documented_examples_eval_directory_validates() -> None:
+    """The documented ``sloth validate --suite examples/eval/`` (catalog, validate
+    docstring) must keep working with the four new-schema suites present."""
+    root = Path(__file__).resolve().parents[1]
+    report = validate_suite(root / "examples" / "eval", schema="auto")
+    schemas = {Path(f["path"]).name: f["schema"] for f in report["files"]}
+    assert schemas["instruction-following.jsonl"] == "instruction"
+    assert schemas["structured-output.jsonl"] == "structured"
+    assert schemas["tool-call.jsonl"] == "toolcall"
+    assert schemas["regression.jsonl"] == "task"
+    assert report["total_records"] > 250
 
 
 def test_suite_with_explicit_task_schema_is_accepted(
