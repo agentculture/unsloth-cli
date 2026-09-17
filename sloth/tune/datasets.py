@@ -562,14 +562,55 @@ _SCHEMA_VALIDATORS = {
 
 
 def detect_schema(record: dict) -> str | None:
-    """Guess the schema of a single parsed record; returns ``"chat"``, ``"task"``, or ``None``."""
+    """Guess the schema of a single parsed record.
+
+    Returns one of :data:`KNOWN_SCHEMAS` — ``"chat"``, ``"toolcall"``,
+    ``"structured"``, ``"instruction"``, ``"task"`` — or ``None`` when the
+    record matches none of them. Detection is by discriminating key, checked
+    from the most specific shape to the least: ``messages`` → chat,
+    ``expected_tool_call`` → toolcall, ``json_schema`` → structured,
+    ``constraints`` → instruction, otherwise the task key set. A task-shaped
+    record with no ``constraints`` key is reported as ``"task"`` (the two
+    validators accept it identically in that case). This is the single
+    detector every host-side and in-container path uses, so a suite file is
+    classified the same way by ``sloth validate``, ``sloth eval`` and the
+    trainer's scoring.
+    """
     if not isinstance(record, dict):
         return None
     keys = set(record.keys())
     if "messages" in keys:
         return "chat"
+    if "expected_tool_call" in keys:
+        return "toolcall"
+    if "json_schema" in keys:
+        return "structured"
+    if "constraints" in keys:
+        return "instruction"
     if keys == TASK_KEYS or (keys <= TASK_KEYS and len(keys) > 0 and "task" in keys):
         return "task"
+    return None
+
+
+def detect_file_schema(path: str | os.PathLike) -> str | None:
+    """Detect a JSONL file's schema from its first non-blank, parseable record.
+
+    Returns ``None`` when the file is empty, its first record is not JSON, or
+    the record matches no known schema; callers decide whether that is an
+    error. Never raises on a missing file — :func:`validate_dataset` reports
+    that with the proper ``CliError``.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                try:
+                    return detect_schema(json.loads(line))
+                except json.JSONDecodeError:
+                    return None
+    except OSError:
+        return None
     return None
 
 
@@ -701,6 +742,10 @@ def resolve_suite_paths(path: str | os.PathLike) -> list[Path]:
     )
 
 
+#: ``validate_suite(schema=AUTO_SCHEMA)`` detects each file's schema separately.
+AUTO_SCHEMA = "auto"
+
+
 def validate_suite(path: str | os.PathLike, schema: str = "task") -> dict[str, object]:
     """Validate every ``.jsonl`` file under *path* (a single file or a directory).
 
@@ -714,13 +759,18 @@ def validate_suite(path: str | os.PathLike, schema: str = "task") -> dict[str, o
     path:
         A single ``.jsonl`` file, or a directory of them.
     schema:
-        ``"chat"`` or ``"task"`` (default ``"task"`` — the eval-suite schema).
+        One of :data:`KNOWN_SCHEMAS` applied to every file (default ``"task"``,
+        the historical eval-suite schema), or :data:`AUTO_SCHEMA` (``"auto"``)
+        to detect each file's schema from its first record with
+        :func:`detect_file_schema` — the mode ``sloth validate --suite`` and
+        ``sloth eval`` use, so a directory can mix task, chat, instruction,
+        structured and toolcall suites.
 
     Returns
     -------
     dict
-        ``{"files": [{"path": str, "line_count": int}, ...], "total_records": int}``,
-        one entry per resolved file in sorted order.
+        ``{"files": [{"path": str, "line_count": int, "schema": str}, ...],
+        "total_records": int}``, one entry per resolved file in sorted order.
 
     Raises
     ------
@@ -732,8 +782,13 @@ def validate_suite(path: str | os.PathLike, schema: str = "task") -> dict[str, o
     reported: list[dict[str, object]] = []
     total = 0
     for file_path in files:
+        file_schema = schema
+        if schema == AUTO_SCHEMA:
+            # Undetectable (empty, non-JSON, or unknown keys) falls back to the
+            # historical task schema so the error below still names the line.
+            file_schema = detect_file_schema(file_path) or "task"
         try:
-            records = validate_dataset(file_path, schema)
+            records = validate_dataset(file_path, file_schema)
         except CliError as exc:
             # Re-raise with the file name prepended so a directory suite's
             # failure names both the offending file and the line within it.
@@ -742,7 +797,7 @@ def validate_suite(path: str | os.PathLike, schema: str = "task") -> dict[str, o
                 message=f"{file_path}: {exc.message}",
                 remediation=exc.remediation,
             ) from exc
-        reported.append({"path": str(file_path), "line_count": len(records)})
+        reported.append({"path": str(file_path), "line_count": len(records), "schema": file_schema})
         total += len(records)
     return {"files": reported, "total_records": total}
 
