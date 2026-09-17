@@ -34,6 +34,7 @@ import sloth.tune.container as container  # noqa: E402
 from sloth.cli._errors import CliError
 from sloth.tune.container import (
     CHECKOUT_MOUNT,
+    DEP_LAYER_BENCH_PACKAGES,
     DEP_LAYER_NODEPS_PACKAGES,
     DEP_LAYER_PACKAGES,
     NGC_IMAGE,
@@ -1089,3 +1090,44 @@ class TestNodepsLayerPins:
             "llmcompressor==0.11.0",
             "compressed-tensors==0.16.0",
         )
+
+
+class TestBenchLayerPins:
+    """DEP_LAYER_BENCH_PACKAGES (plan full-benchmark-suite, t12) — lm_eval + sacrebleu.
+
+    Measured live 2026-09-17 inside nvcr.io/nvidia/pytorch:25.11-py3 on top of the
+    built dep layer: the install is additive and leaves the pinned window
+    (transformers 4.57.1 / peft 0.18.0 / trl 0.24.0 / datasets 4.8.5) and the nv
+    torch in place (docs/tested.md).
+    """
+
+    def test_pins_are_exact(self) -> None:
+        assert DEP_LAYER_BENCH_PACKAGES == ("lm_eval==0.4.13", "sacrebleu==2.6.0")
+        for pkg in DEP_LAYER_BENCH_PACKAGES:
+            assert "==" in pkg, f"bench-layer package is not pinned: {pkg}"
+
+    def test_bench_layer_installed_after_nodeps_layer(self, tmp_path: Path) -> None:
+        from sloth.tune.container import _inner_script
+
+        script = _inner_script(["eval", "--adapter", str(tmp_path)])
+        bench_line = "uv pip install " + " ".join(DEP_LAYER_BENCH_PACKAGES)
+        nodeps_line = "uv pip install --no-deps " + " ".join(DEP_LAYER_NODEPS_PACKAGES)
+        assert bench_line in script
+        assert script.index(nodeps_line) < script.index(bench_line)
+        assert script.index(bench_line) < script.index("python -m sloth")
+
+    def test_bench_layer_reaches_docker_command(self, tmp_path: Path) -> None:
+        joined = " ".join(
+            build_command(
+                ["eval", "--adapter", str(tmp_path)],
+                workdir=tmp_path,
+                checkout=tmp_path / "checkout",
+            )
+        )
+        for pkg in DEP_LAYER_BENCH_PACKAGES:
+            assert pkg in joined, f"pin did not reach the docker command: {pkg}"
+
+    def test_host_dependencies_still_empty(self) -> None:
+        # The GPU/bench stack is container-only; the host package stays pure stdlib.
+        text = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+        assert "dependencies = []" in text

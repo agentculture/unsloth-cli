@@ -132,8 +132,8 @@ class TestWriteMetadata:
         )
         data = json.loads((adapter_dir / "training_metadata.json").read_text(encoding="utf-8"))
         assert data["dataset"]["path"] == str(dataset)
-        # existing keys unchanged, one new key added
-        assert set(data["dataset"]) == {"path", "sha256", "line_count"}
+        # existing keys unchanged, plus the dataset-kind marker
+        assert set(data["dataset"]) == {"path", "sha256", "line_count", "source"}
 
     def test_timestamp_defaults_to_utc_iso(self, tmp_path: Path) -> None:
         dataset = _make_dataset(tmp_path, ['{"x": 1}'])
@@ -239,3 +239,256 @@ class TestDatasetDigestLineCount:
         path.write_text('{"a": 1}\n\n{"b": 2}\n   \n', encoding="utf-8")
         _, count = dataset_digest(path)
         assert count == 2
+
+
+# ---------------------------------------------------------------------------
+# write_metadata for an external (hf:) dataset — t11 / c34
+# ---------------------------------------------------------------------------
+
+
+class TestWriteMetadataHfDataset:
+    def test_records_hf_id_split_and_revision_instead_of_sha256(self, tmp_path: Path) -> None:
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        write_metadata(
+            adapter_dir,
+            model="unsloth/Qwen3-4B",
+            method="qlora",
+            dataset_path="hf:my-org/my-dataset:train",
+            hyperparameters=HYPERPARAMS,
+            timestamp=FIXED_TS,
+            hf_revision="abc123",
+        )
+        data = json.loads((adapter_dir / "training_metadata.json").read_text(encoding="utf-8"))
+        assert data["dataset"] == {
+            "hf_id": "my-org/my-dataset",
+            "split": "train",
+            "revision": "abc123",
+            "source": "hf",
+        }
+        assert "sha256" not in data["dataset"]
+        assert "line_count" not in data["dataset"]
+        assert "path" not in data["dataset"]
+
+    def test_split_defaults_to_train_when_omitted(self, tmp_path: Path) -> None:
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        write_metadata(
+            adapter_dir,
+            model="m",
+            method="lora",
+            dataset_path="hf:my-org/my-dataset",
+            hyperparameters={},
+            timestamp=FIXED_TS,
+        )
+        data = json.loads((adapter_dir / "training_metadata.json").read_text(encoding="utf-8"))
+        assert data["dataset"]["hf_id"] == "my-org/my-dataset"
+        assert data["dataset"]["split"] == "train"
+
+    def test_revision_defaults_to_main_when_not_given(self, tmp_path: Path) -> None:
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        write_metadata(
+            adapter_dir,
+            model="m",
+            method="lora",
+            dataset_path="hf:my-org/my-dataset:validation",
+            hyperparameters={},
+            timestamp=FIXED_TS,
+        )
+        data = json.loads((adapter_dir / "training_metadata.json").read_text(encoding="utf-8"))
+        assert data["dataset"]["split"] == "validation"
+        assert data["dataset"]["revision"] == "main"
+
+    def test_round_trips_through_read_metadata(self, tmp_path: Path) -> None:
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        write_metadata(
+            adapter_dir,
+            model="m",
+            method="qlora",
+            dataset_path="hf:my-org/my-dataset:train",
+            hyperparameters={},
+            timestamp=FIXED_TS,
+            hf_revision="v2",
+        )
+        recovered = read_metadata(adapter_dir)
+        assert recovered["dataset"] == {
+            "hf_id": "my-org/my-dataset",
+            "split": "train",
+            "revision": "v2",
+            "source": "hf",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Training-time eval: loss_history + holdout provenance (t7)
+# ---------------------------------------------------------------------------
+
+
+class TestWriteMetadataLossHistory:
+    """``log_history`` from ``trainer.state`` is folded into the metadata record."""
+
+    def _write(self, tmp_path: Path, **extra) -> dict:
+        dataset = _make_dataset(tmp_path, ['{"task": "t", "input": "i", "expected_output": "o"}'])
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        write_metadata(
+            adapter_dir,
+            model="unsloth/Qwen3-4B",
+            method="lora",
+            dataset_path=dataset,
+            hyperparameters={"lora_r": 8},
+            timestamp="2026-01-01T00:00:00+00:00",
+            **extra,
+        )
+        return read_metadata(adapter_dir)
+
+    def test_absent_when_no_log_history_given(self, tmp_path: Path) -> None:
+        data = self._write(tmp_path)
+        assert "loss_history" not in data
+        assert "holdout" not in data
+
+    def test_merges_train_and_eval_entries_by_step(self, tmp_path: Path) -> None:
+        log_history = [
+            {"loss": 2.0, "step": 1},
+            {"loss": 1.5, "step": 2},
+            {"eval_loss": 1.9, "step": 2},
+            {"loss": 1.0, "step": 3},
+            {"eval_loss": 1.2, "step": 4},
+            {"train_runtime": 0.4, "step": 4},
+        ]
+        data = self._write(tmp_path, log_history=log_history)
+
+        assert data["loss_history"] == [
+            {"step": 1, "train_loss": 2.0, "eval_loss": None},
+            {"step": 2, "train_loss": 1.5, "eval_loss": 1.9},
+            {"step": 3, "train_loss": 1.0, "eval_loss": None},
+            {"step": 4, "train_loss": None, "eval_loss": 1.2},
+        ]
+        assert data["final_train_loss"] == 1.0
+        assert data["final_eval_loss"] == 1.2
+
+    def test_final_train_loss_key_is_honoured(self, tmp_path: Path) -> None:
+        """HF appends a summary entry keyed ``train_loss`` — it counts as a train loss."""
+        data = self._write(
+            tmp_path,
+            log_history=[{"loss": 3.0, "step": 1}, {"train_loss": 2.5, "step": 2}],
+        )
+        assert data["final_train_loss"] == 2.5
+        assert data["final_eval_loss"] is None
+
+    def test_empty_log_history_records_empty_list_and_null_finals(self, tmp_path: Path) -> None:
+        data = self._write(tmp_path, log_history=[])
+        assert data["loss_history"] == []
+        assert data["final_train_loss"] is None
+        assert data["final_eval_loss"] is None
+
+    def test_holdout_block_is_recorded_verbatim(self, tmp_path: Path) -> None:
+        holdout = {
+            "fraction": 0.2,
+            "seed": 7,
+            "train_path": str(tmp_path / "d.train.jsonl"),
+            "holdout_path": str(tmp_path / "d.holdout.jsonl"),
+            "train_count": 8,
+            "holdout_count": 2,
+            "eval_steps": 15,
+        }
+        data = self._write(tmp_path, holdout=holdout)
+        assert data["holdout"] == holdout
+
+
+# ---------------------------------------------------------------------------
+# dataset.source + resolved.load_in_4bit (qodo PR #29 findings 2 and 4)
+# ---------------------------------------------------------------------------
+
+
+class TestDatasetSourceField:
+    """Every dataset record says *what kind* of dataset it was.
+
+    A hub dataset carries no ``dataset.path``, so a consumer that keys off the
+    path alone (the eval-side train/eval overlap check) silently skipped hub
+    runs. ``dataset.source`` states it outright.
+    """
+
+    def test_local_dataset_records_source_file(self, tmp_path: Path) -> None:
+        dataset = _make_dataset(tmp_path, ['{"a": 1}'])
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        write_metadata(
+            adapter_dir,
+            model="m",
+            method="lora",
+            dataset_path=dataset,
+            hyperparameters={},
+            timestamp=FIXED_TS,
+        )
+        data = json.loads((adapter_dir / "training_metadata.json").read_text(encoding="utf-8"))
+        assert data["dataset"]["source"] == "file"
+        assert data["dataset"]["path"] == str(dataset)
+
+    def test_hf_dataset_records_source_hf(self, tmp_path: Path) -> None:
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        write_metadata(
+            adapter_dir,
+            model="m",
+            method="qlora",
+            dataset_path="hf:my-org/my-dataset:train",
+            hyperparameters={},
+            timestamp=FIXED_TS,
+        )
+        data = json.loads((adapter_dir / "training_metadata.json").read_text(encoding="utf-8"))
+        assert data["dataset"]["source"] == "hf"
+        assert "path" not in data["dataset"]
+
+
+class TestResolvedLoadIn4bit:
+    """``resolved.load_in_4bit`` is the *effective* precision the run trained at.
+
+    ``hyperparameters.load_in_4bit`` is the raw config value; training forces
+    4-bit for a ``qlora`` method regardless, so a downstream bench reading the
+    raw value alone would benchmark a QLoRA adapter at the wrong precision.
+    """
+
+    def test_qlora_run_resolves_to_true_even_when_the_flag_is_off(self, tmp_path: Path) -> None:
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        write_metadata(
+            adapter_dir,
+            model="m",
+            method="qlora",
+            dataset_path="hf:my-org/my-dataset",
+            hyperparameters={"load_in_4bit": False},
+            timestamp=FIXED_TS,
+        )
+        data = json.loads((adapter_dir / "training_metadata.json").read_text(encoding="utf-8"))
+        assert data["resolved"]["load_in_4bit"] is True
+
+    def test_lora_run_resolves_to_the_configured_flag(self, tmp_path: Path) -> None:
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        write_metadata(
+            adapter_dir,
+            model="m",
+            method="lora",
+            dataset_path="hf:my-org/my-dataset",
+            hyperparameters={"load_in_4bit": False},
+            timestamp=FIXED_TS,
+        )
+        data = json.loads((adapter_dir / "training_metadata.json").read_text(encoding="utf-8"))
+        assert data["resolved"]["load_in_4bit"] is False
+
+    def test_lora_run_with_the_flag_on_resolves_to_true(self, tmp_path: Path) -> None:
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        write_metadata(
+            adapter_dir,
+            model="m",
+            method="lora",
+            dataset_path="hf:my-org/my-dataset",
+            hyperparameters={"load_in_4bit": True},
+            timestamp=FIXED_TS,
+        )
+        data = json.loads((adapter_dir / "training_metadata.json").read_text(encoding="utf-8"))
+        assert data["resolved"]["load_in_4bit"] is True

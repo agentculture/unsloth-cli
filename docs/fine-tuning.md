@@ -1,5 +1,61 @@
 # Fine-tuning reference
 
+## Agent path
+
+The machine-readable loop, before any of the human-oriented text below: score
+an adapter, then gate it against its base model, both in `--json`.
+
+```bash
+sloth eval --adapter runs/qlora-smoke --suite examples/eval/regression.jsonl \
+    --suite examples/eval/instruction-following.jsonl --json
+```
+
+`sloth eval --json` always reports results **keyed by suite name**:
+
+```text
+{"suites": {<name>: {total, exact_match, exact_match_pct, f1, results, ...}}}
+```
+
+(verbatim from `sloth explain eval`; a `--model` target additionally carries
+`model_dir`, `quant_method`, `quant_format`). Exit codes: `0` success; `1`
+user-input error (both/neither target, a missing `--suite` path, a name
+collision, a malformed suite record, a train/eval overlap, `--batch-size < 1`);
+`2` environment/setup error (ML stack missing, llama.cpp missing, OOM).
+
+Once the adapter has eval results on disk, gate it against its base model:
+
+```bash
+sloth compare --base unsloth/Qwen3-4B runs/qlora-smoke --json
+```
+
+`sloth compare --base --json` reports:
+
+```text
+{a, b, deltas: {suites: {<suite>: {<metric>: {a, b, delta}}}}, thresholds,
+ verdict: {passed, failures}}
+```
+
+(verbatim from `sloth explain compare`). The `verdict` block is the answer an
+agent should branch on: `verdict.passed` is `true`/`false`, and
+`verdict.failures` names every failed check (a regression-tagged suite's
+`exact_match_pct` drop beyond `regression_drop_pp`, `compliance_pct` below
+`compliance_min_pct`, a latency ratio above `latency_max_ratio`, a suite with
+fewer than `min_suite_rows` rows, or a `base_load_in_4bit` mismatch). The
+report is written to stdout **before** a failing gate's error goes to stderr,
+so an agent parsing stdout always gets `thresholds` + `verdict` even on exit
+`1`. Exit codes: `0` success (gate passed); `1` user-input error (target
+resolution, missing `<b>`/`--base` conflict, no eval results to compare
+against, or a failed `--base` threshold check); `2` environment error (the
+container could not run — an OOM eval lands here with a `hint:`).
+
+An agent driving the full loop non-interactively should run
+`sloth train` → `sloth eval --json` → `sloth compare --base --json` and stop
+on the first non-zero exit, surfacing the CLI's `error:`/`hint:` output
+verbatim — this is exactly what the [`/finetune`](../.claude/skills/finetune/SKILL.md)
+skill automates.
+
+## Overview
+
 unsloth-cli adds three flat verbs — **`train`**, **`eval`**, **`export`** — for
 Spark-friendly **LoRA / QLoRA adapter** tuning of Qwen models, plus a
 [`/finetune`](../.claude/skills/finetune/SKILL.md) skill that drives the full
@@ -91,6 +147,35 @@ sloth export --adapter runs/qlora-smoke --format gguf --dry-run --json          
 Exit codes: `0` success; `1` user-input error (missing/incomplete adapter,
 unsupported `--format`, bad `--quant`, non-empty `--output` without `--force`);
 `2` environment error (container exits non-zero, insufficient disk space).
+
+### `sloth bench --adapter <dir> --benchmark mmlu`
+
+Where `sloth eval` scores your own local suite, `sloth bench` scores the
+**standard public benchmark**: it runs the lm-evaluation-harness (`lm_eval`,
+part of the container's benchmark dep layer) inside the NGC container and writes
+`<target>/eval/mmlu.json` in the *same* result shape a suite produces — flat
+`acc` / `acc_norm` / `exact_match_pct` / `total`, plus `per_subject` and a
+`harness` provenance block — so `sloth summarize` and `sloth compare` fold a
+benchmark in with no special-casing. `--adapter` benches a LoRA/QLoRA adapter
+against the base model recorded in its `training_metadata.json`
+(`pretrained=<base>,peft=<dir>`, with `load_in_4bit=True` for a QLoRA run);
+`--model` benches a merged/exported directory. If the harness cannot load the
+4-bit-base + PEFT-adapter combination, the run exits `2` with a `hint:` naming
+the fallback — export merged to 16-bit and bench that directory with `--model`.
+`--limit N` shrinks a run to a smoke test, and `--offline` forbids network
+access outright (see the warm-cache check in [`dgx-spark.md`](dgx-spark.md)).
+For a network-free, MMLU-*style* check there is also
+`examples/eval/mmlu-subset.jsonl` — 120 committed, original lettered questions
+across 12 subjects, scored through `sloth eval --suite`, which detects an
+all-letter answer key and reports `choice_acc_pct` on the letter the model
+picked.
+
+```bash
+sloth bench --adapter runs/qlora-smoke --benchmark mmlu            # full 5-shot MMLU
+sloth bench --adapter runs/qlora-smoke --limit 20 --json           # smoke run
+sloth bench --model runs/qlora-smoke-export --offline              # merged export, no network
+sloth eval  --adapter runs/qlora-smoke --suite examples/eval/mmlu-subset.jsonl
+```
 
 ## Dataset schemas
 

@@ -42,8 +42,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess  # nosec B404 - scoring a GGUF means invoking llama-completion
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,16 +53,22 @@ from typing import Any, Sequence
 
 from sloth.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 from sloth.cli._output import emit_diagnostic
-from sloth.tune import metrics
 from sloth.tune._trainer import (
     DEFAULT_EVAL_BATCH_SIZE,
+    GenerationRun,
     _detect_dataset_schema,
+    _detect_suite_schema,
+    _extra_metrics_for,
     _format_records,
     _generate_predictions,
     _is_gpu_oom,
+    build_file_entry,
+    build_summary,
     eval_prompt,
     resolve_suite_paths,
-    write_eval_json,
+    run_perplexity,
+    score_suite,
+    write_eval_artifacts,
 )
 from sloth.tune.datasets import validate_dataset
 
@@ -833,6 +841,16 @@ def _load_eval_backend() -> _EvalBackend:
     )
 
 
+#: A Hugging Face repo id: exactly one ``/``, both halves plain identifiers
+#: (mirrors ``sloth.cli._commands.eval._HF_REPO_ID_RE``).
+_HF_REPO_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _is_hf_repo_id(value: str | Path) -> bool:
+    """True when *value* looks like ``org/name`` (never a local path form)."""
+    return bool(_HF_REPO_ID_RE.match(str(value)))
+
+
 def _quant_info(model_dir: Path) -> tuple[str | None, str | None]:
     """Return ``(quant_method, quant_format)`` read from ``<model_dir>/config.json``.
 
@@ -975,29 +993,43 @@ def _run_llama_completion(gguf: Path, prompt: str, max_tokens: int) -> str:
     return output
 
 
-def _predict_gguf(gguf: Path, records: list[dict[str, Any]], max_tokens: int) -> list[str]:
+def _predict_gguf(gguf: Path, records: list[dict[str, Any]], max_tokens: int) -> GenerationRun:
     """Return one completion per record, scored through llama.cpp.
 
     llama.cpp's ``llama-completion`` takes exactly one prompt per process, so this
     path is inherently unbatched — ``--batch-size`` applies to the transformers
-    path only.
+    path only — and each row's ``latency_ms`` is that process's own wall time.
+
+    There is **no tokenizer** on this path (the GGUF's vocabulary lives inside
+    the llama.cpp process), so ``generated_tokens`` is the completion's
+    whitespace-word count: an approximation, reported so the two seams carry the
+    same keys, and not comparable token-for-token with the transformers path.
+    Chat rows fall back to :func:`eval_prompt`'s plain-text rendering for the
+    same reason.
     """
-    return [_run_llama_completion(gguf, eval_prompt(record), max_tokens) for record in records]
+    run = GenerationRun()
+    for record in records:
+        started = time.perf_counter()
+        prediction = _run_llama_completion(gguf, eval_prompt(record), max_tokens)
+        elapsed = time.perf_counter() - started
+        run.predictions.append(prediction)
+        run.generated_tokens.append(len(prediction.split()))
+        run.latency_ms.append(elapsed * 1000.0)
+        run.generate_seconds += elapsed
+    return run
 
 
-def _predict_transformers(
-    backend: _EvalBackend,
-    model_dir: Path,
-    records: list[dict[str, Any]],
-    max_tokens: int,
-    batch_size: int = DEFAULT_EVAL_BATCH_SIZE,
-) -> list[str]:
-    """Return one completion per record from a transformers-loadable directory.
+def _load_transformers_eval_model(backend: _EvalBackend, model_dir: Path) -> tuple[Any, Any, Any]:
+    """Load ``(model, tokenizer, device)`` from a transformers-loadable directory.
 
     ``AutoModelForCausalLM.from_pretrained(dir, dtype=torch.bfloat16)`` auto-detects a
     compressed-tensors checkpoint (AWQ ``pack-quantized`` / NVFP4
     ``nvfp4-pack-quantized``) from ``config.json``; a bf16 merged dir loads plainly.
     ``local_files_only=True`` keeps the run offline.
+
+    The model is returned (rather than generated from in place) because the caller
+    may need a second pass over it — :func:`sloth.tune._trainer.run_perplexity`
+    scores the same loaded model with a labelled forward pass.
 
     Generation itself is delegated to :func:`sloth.tune._trainer._generate_predictions`
     — the same left-padded, batched loop the ``--adapter`` seam uses — so both
@@ -1012,16 +1044,193 @@ def _predict_transformers(
     model.eval()
     # Tokenized inputs must share the model's device, else generate() raises
     # "Expected all tensors to be on the same device" (same constraint as run_eval).
-    device = next(model.parameters()).device
-    return _generate_predictions(
-        backend.torch,
-        model,
-        tokenizer,
-        [eval_prompt(record) for record in records],
-        batch_size=batch_size,
-        max_new_tokens=max_tokens,
-        device=device,
-    )
+    return model, tokenizer, next(model.parameters()).device
+
+
+@dataclass
+class _EvalModelTarget:
+    """What ``--model`` resolved to: where it lives and how it is quantized."""
+
+    directory: Path
+    gguf: Path | None
+    remote: bool
+    quant_method: str | None
+    quant_format: str | None
+
+
+def _locate_model_target(model_dir: str) -> tuple[Path, Path | None, bool]:
+    """Return ``(directory, gguf_file, remote)`` for the ``--model`` reference.
+
+    A Hugging Face repo id (org/name) that answers to nothing on disk is a
+    *remote* base model — the form ``sloth compare --base`` scores. It loads from
+    the mounted HF cache (still ``local_files_only``), has no quantisation config
+    or GGUF, and owns no directory: the caller (``cmd_eval --results-dir``) writes
+    the result files, so no artifacts are written for it.
+
+    A direct ``.gguf`` file is accepted too; the returned directory is then its
+    parent (where ``eval.json`` can be written).
+
+    Raises
+    ------
+    CliError(code=1)
+        When the reference is neither an existing directory nor a repo id.
+    """
+    directory = Path(model_dir)
+    remote = not directory.exists() and _is_hf_repo_id(model_dir)
+    if directory.is_file() and directory.suffix == ".gguf":
+        gguf_file: Path | None = directory
+        directory = directory.parent
+    else:
+        gguf_file = None
+    if not directory.is_dir() and not remote:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"model directory not found: {directory}",
+            remediation=(
+                "Pass an existing merged/quantized model directory with --model <path>. "
+                "Run `sloth export` to produce one."
+            ),
+        )
+    return directory, gguf_file, remote
+
+
+def _resolve_model_target(
+    directory: Path, gguf_file: Path | None, remote: bool, quant: str | None
+) -> _EvalModelTarget:
+    """Fill in the located target's backend/quantisation facts.
+
+    A remote repo id carries none of them. Otherwise the quantisation config is
+    read from ``config.json`` and the GGUF to score is the direct file when one
+    was named, else whatever :func:`_find_gguf` selects (``None`` for a
+    transformers-loadable directory).
+    """
+    if remote:
+        return _EvalModelTarget(directory, None, True, None, None)
+    quant_method, quant_format = _quant_info(directory)
+    if gguf_file is not None:
+        gguf: Path | None = gguf_file
+    else:
+        gguf = _find_gguf(directory, quant)
+    return _EvalModelTarget(directory, gguf, False, quant_method, quant_format)
+
+
+def _validate_eval_suites(
+    resolved_suites: Sequence[str | Path],
+) -> list[tuple[str | Path, str, list[dict[str, Any]]]]:
+    """Return ``(path, schema, records)`` per suite file, validated up front.
+
+    Called BEFORE any model load — a broken suite must cost no GPU time. Each
+    file's schema is sniffed from its first record, so one call can mix a task
+    suite with an instruction/structured/toolcall one.
+    """
+    records_by_file: list[tuple[str | Path, str, list[dict[str, Any]]]] = []
+    for path in resolved_suites:
+        schema = _detect_suite_schema(Path(path))
+        records_by_file.append((path, schema, validate_dataset(Path(path), schema=schema)))
+    return records_by_file
+
+
+def _load_eval_backend_or_fail() -> Any:
+    """Import the eval backend, mapping an ImportError to the NGC remediation."""
+    try:
+        return _load_eval_backend()
+    except ImportError as exc:
+        raise CliError(
+            code=EXIT_ENV_ERROR,
+            message=f"The eval backend is not installed: {exc}",
+            remediation=_EVAL_NGC_HINT,
+        ) from exc
+
+
+def _generate_eval_runs(
+    target: _EvalModelTarget,
+    model_dir: str,
+    records_by_file: Sequence[tuple[Any, Any, list[dict[str, Any]]]],
+    *,
+    batch_size: int,
+    max_new_tokens: int,
+) -> tuple[list[GenerationRun], Any, Any, Any]:
+    """Return ``(generations, model, tokenizer, torch_mod)`` for every suite file.
+
+    The GGUF path keeps ``model``/``tokenizer``/``torch_mod`` at ``None`` (there is
+    no in-process model to score perplexity with). A GPU out-of-memory failure is
+    mapped to ``CliError(code=2)``; every other exception propagates untouched.
+    """
+    model = tokenizer = torch_mod = None
+    try:
+        if target.gguf is not None:
+            generations = [
+                _predict_gguf(target.gguf, file_records, max_new_tokens)
+                for _path, _schema, file_records in records_by_file
+            ]
+        else:
+            backend = _load_eval_backend_or_fail()
+            model, tokenizer, device = _load_transformers_eval_model(
+                backend, Path(model_dir) if target.remote else target.directory
+            )
+            torch_mod = backend.torch
+            generations = [
+                _generate_predictions(
+                    backend.torch,
+                    model,
+                    tokenizer,
+                    [eval_prompt(record, tokenizer) for record in file_records],
+                    batch_size=batch_size,
+                    max_new_tokens=max_new_tokens,
+                    device=device,
+                )
+                for _path, _schema, file_records in records_by_file
+            ]
+    except CliError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if _is_gpu_oom(exc):
+            raise CliError(
+                code=EXIT_ENV_ERROR,
+                message=f"GPU out of memory during eval: {exc}",
+                remediation=_OOM_HINT,
+            ) from exc
+        raise
+    return generations, model, tokenizer, torch_mod
+
+
+def _score_eval_files(
+    records_by_file: Sequence[tuple[Any, Any, list[dict[str, Any]]]],
+    generations: Sequence[GenerationRun],
+    extra_metrics: Sequence[Any],
+    *,
+    model: Any,
+    tokenizer: Any,
+    torch_mod: Any,
+    perplexity: bool,
+) -> list[dict[str, Any]]:
+    """Score each suite file into its ``files`` entry, numbering rows continuously."""
+    files: list[dict[str, Any]] = []
+    cursor = 0
+    for (path, schema, file_records), generation, extra in zip(
+        records_by_file, generations, extra_metrics
+    ):
+        scored = score_suite(
+            file_records,
+            schema,
+            generation,
+            start_index=cursor,
+            source=str(path),
+            extra_metrics=extra,
+        )
+        cursor += len(file_records)
+        files.append(
+            build_file_entry(
+                path,
+                scored,
+                perplexity=(
+                    run_perplexity(model, tokenizer, file_records, torch_mod=torch_mod)
+                    if perplexity and model is not None
+                    else None
+                ),
+            )
+        )
+    return files
 
 
 def run_eval_model(
@@ -1032,6 +1241,9 @@ def run_eval_model(
     quant: str | None = None,
     batch_size: int = DEFAULT_EVAL_BATCH_SIZE,
     max_new_tokens: int = EVAL_MAX_NEW_TOKENS,
+    perplexity: bool = False,
+    tool_call_family: str | None = None,
+    base_load_in_4bit: bool | None = None,
 ) -> dict[str, Any]:
     """Evaluate a merged / quantized model **directory** against a task-schema suite.
 
@@ -1069,13 +1281,26 @@ def run_eval_model(
         the llama.cpp path is one process per prompt and ignores it).
     max_new_tokens:
         Generation budget per item.
+    perplexity:
+        Also score each suite with :func:`sloth.tune._trainer.run_perplexity`.
+        Only a transformers-loadable export can produce it (a labelled forward
+        pass); asking for it on a GGUF is a ``CliError(code=1)``.
+    tool_call_family:
+        Overrides tool-call family detection for a ``toolcall`` suite (what a run
+        config's ``[eval] tool_call_family`` supplies).
+    base_load_in_4bit:
+        The base model's load precision, recorded verbatim into the result and
+        the written eval files. ``None`` means "not stated".
 
     Returns
     -------
     dict
         The same shape as adapter eval — the aggregate ``total``,
         ``exact_match``, ``exact_match_pct``, ``f1``, ``results`` plus per-file
-        ``files`` entries — with ``model_dir``, ``quant_method`` and
+        ``files`` entries, the ``median_latency_ms`` / ``tokens_per_s`` rollups
+        over the per-row ``generated_tokens`` / ``latency_ms``, ``batch_size``,
+        ``base_load_in_4bit`` and (where applicable) ``compliance_pct`` /
+        ``perplexity`` — with ``model_dir``, ``quant_method`` and
         ``quant_format`` added (from ``config.json``'s ``quantization_config``;
         ``None`` for a plain bf16 merged dir or a GGUF). ``model_dir`` is always a
         directory: for a direct ``.gguf`` file target it is that file's parent, not
@@ -1090,69 +1315,61 @@ def run_eval_model(
         When the ML stack is unavailable, llama.cpp is missing, or the GPU OOMs.
     """
     resolved_suites = resolve_suite_paths(suite_path, suite_paths)
-    directory = Path(model_dir)
-    if directory.is_file() and directory.suffix == ".gguf":
-        gguf_file = directory
-        directory = directory.parent
-    else:
-        gguf_file = None
-    if not directory.is_dir():
+    directory, gguf_file, remote = _locate_model_target(model_dir)
+    records_by_file = _validate_eval_suites(resolved_suites)
+    target = _resolve_model_target(directory, gguf_file, remote, quant)
+    if perplexity and target.gguf is not None:
         raise CliError(
             code=EXIT_USER_ERROR,
-            message=f"model directory not found: {directory}",
+            message="perplexity is not available for a GGUF export",
             remediation=(
-                "Pass an existing merged/quantized model directory with --model <path>. "
-                "Run `sloth export` to produce one."
+                "Perplexity needs a labelled forward pass, which llama.cpp's completion "
+                "binary does not expose. Evaluate a transformers-loadable export "
+                "(bf16 merged, AWQ or NVFP4) for perplexity, or drop the request."
             ),
         )
-
-    # Validate every suite file BEFORE any model load — a broken suite must cost no
-    # GPU time. Records are then scored as one flat batch so the model is loaded
-    # once, and split back per file for the ``files`` entries afterwards.
-    records_by_file = [
-        (path, validate_dataset(Path(path), schema="task")) for path in resolved_suites
+    # Resolved before any model load, so an unknown tool-call family costs no GPU.
+    extra_metrics = [
+        _extra_metrics_for(
+            schema,
+            model_id=str(directory),
+            tool_call_family=tool_call_family,
+            records=file_records,
+        )
+        for _path, schema, file_records in records_by_file
     ]
-    records = [record for _, file_records in records_by_file for record in file_records]
-    quant_method, quant_format = _quant_info(directory)
 
-    gguf = gguf_file if gguf_file is not None else _find_gguf(directory, quant)
-    try:
-        if gguf is not None:
-            predictions = _predict_gguf(gguf, records, max_new_tokens)
-        else:
-            try:
-                backend = _load_eval_backend()
-            except ImportError as exc:
-                raise CliError(
-                    code=EXIT_ENV_ERROR,
-                    message=f"The eval backend is not installed: {exc}",
-                    remediation=_EVAL_NGC_HINT,
-                ) from exc
-            predictions = _predict_transformers(
-                backend, directory, records, max_new_tokens, batch_size
-            )
-    except CliError:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        if _is_gpu_oom(exc):
-            raise CliError(
-                code=EXIT_ENV_ERROR,
-                message=f"GPU out of memory during eval: {exc}",
-                remediation=_OOM_HINT,
-            ) from exc
-        raise
+    generations, model, tokenizer, torch_mod = _generate_eval_runs(
+        target,
+        model_dir,
+        records_by_file,
+        batch_size=batch_size,
+        max_new_tokens=max_new_tokens,
+    )
 
-    files: list[dict[str, Any]] = []
-    cursor = 0
-    for path, file_records in records_by_file:
-        chunk = predictions[cursor : cursor + len(file_records)]
-        scored = metrics.score_records(file_records, chunk, start_index=cursor, source=str(path))
-        cursor += len(file_records)
-        files.append(metrics.file_entry(path, scored))
+    files = _score_eval_files(
+        records_by_file,
+        generations,
+        extra_metrics,
+        model=model,
+        tokenizer=tokenizer,
+        torch_mod=torch_mod,
+        perplexity=perplexity,
+    )
 
-    summary = metrics.aggregate(files)
-    summary["model_dir"] = str(directory)
-    summary["quant_method"] = quant_method
-    summary["quant_format"] = quant_format
-    write_eval_json(directory, summary, resolved_suites, target="model")
+    summary = build_summary(files, batch_size=batch_size, base_load_in_4bit=base_load_in_4bit)
+    summary["model_dir"] = str(model_dir) if target.remote else str(target.directory)
+    summary["quant_method"] = target.quant_method
+    summary["quant_format"] = target.quant_format
+    if target.remote:
+        return summary
+    write_eval_artifacts(
+        target.directory,
+        files,
+        resolved_suites,
+        summary,
+        target="model",
+        batch_size=batch_size,
+        base_load_in_4bit=base_load_in_4bit,
+    )
     return summary

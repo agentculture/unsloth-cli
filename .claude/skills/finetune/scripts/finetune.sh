@@ -8,8 +8,9 @@
 # `error:`/`hint:` line verbatim.
 #
 # Usage:
-#   finetune.sh run --config <run.toml> --suite <suite.jsonl | dir> [--dry-run] [--json]
-#                    [--export-format FMT] [--quant LIST]
+#   finetune.sh run --config <run.toml> --suite <suite.jsonl | dir> [--suite ...]
+#                    [--dry-run] [--json] [--batch-size N] [--perplexity]
+#                    [--export-format FMT] [--quant LIST] [--base REF]
 #   finetune.sh <verb> [args...]   # thin pass-through to `sloth <verb>`
 #   finetune.sh help
 
@@ -51,8 +52,9 @@ usage() {
 finetune.sh — drive the validate → train → eval → export loop for unsloth-cli.
 
 Usage:
-  finetune.sh run --config <run.toml> --suite <suite.jsonl | dir> [--dry-run] [--json]
-                   [--export-format <fmt>] [--quant <list>]
+  finetune.sh run --config <run.toml> --suite <suite.jsonl | dir> [--suite ...]
+                   [--dry-run] [--json] [--batch-size <n>] [--perplexity]
+                   [--export-format <fmt>] [--quant <list>] [--base <ref>]
   finetune.sh <verb> [args...]
   finetune.sh help
 
@@ -64,9 +66,15 @@ Commands:
 
 run flags:
   --config <run.toml>    TOML describing model, dataset, output, method. (required)
-  --suite <suite.jsonl | dir>  Task-schema JSONL eval suite. (required)
+  --suite <suite.jsonl | dir>  Task-schema JSONL eval suite. Repeatable — pass
+                          --suite more than once to score several named suites
+                          in the eval step. (required, at least one)
   --dry-run              Validate + resolve the plan only; no GPU, no torch import.
   --json                 Forward --json to every sloth call (machine-readable output).
+  --batch-size <n>       Forwarded to `sloth eval --batch-size <n>` (generation
+                          batch size for the eval step).
+  --perplexity           Forwarded to `sloth eval --perplexity` (also compute
+                          held-out perplexity/loss during eval).
   --export-format <fmt>  Format for the export step: safetensors, merged-16bit,
                           merged-4bit, gguf, awq, nvfp4 (default: safetensors).
                           Forwarded to `sloth export --format <fmt>`.
@@ -74,12 +82,20 @@ run flags:
                           <adapter>-<format> next to the adapter; safetensors stays in place).
   --quant <list>         Comma-separated ggml quantizations for --export-format gguf
                           (e.g. q4_k_m,q8_0). Forwarded to `sloth export --quant <list>`.
+  --base <ref>           Adapter-vs-base-model comparison ref (a Hugging Face
+                          repo id or a local model directory). When given, adds
+                          step 5: `sloth compare --base <ref> <adapter_dir>`.
 
 Loop steps (run without --dry-run):
-  step 1/4  sloth train --config <c> --dry-run          validate + plan (GPU-free, always)
-  step 2/4  sloth train --config <c>                    real training (GPU required)
-  step 3/4  sloth eval  --adapter <out> --suite          eval the adapter
-  step 4/4  sloth export --adapter <out> --format <fmt>  export (safetensors: host; else container)
+  step 1/N  sloth train --config <c> --dry-run              validate + plan (GPU-free, always)
+  step 2/N  sloth train --config <c>                        real training (GPU required)
+  step 3/N  sloth eval  --adapter <out> --suite ... [...]   eval the adapter
+  step 4/N  sloth export --adapter <out> --format <fmt>     export (safetensors: host; else container)
+  step 5/5  sloth compare --base <ref> <out> [--config <c>] adapter-vs-base-model
+                                                             comparison, gated on [eval.thresholds]
+                                                             (only when --base is given; N is 5)
+
+N is 5 when --base is given, 4 otherwise (step 5 is skipped, not printed, without --base).
 
 With --dry-run: only step 1 runs; exits 0 on success, surfacing the resolved plan.
 The loop stops on the first non-zero exit code, forwarding the CLI's error:/hint:.
@@ -95,8 +111,15 @@ Examples:
   # Full end-to-end run with JSON output:
   finetune.sh run --config run.toml --suite eval.jsonl --json
 
+  # Score several named suites, with perplexity and a larger eval batch size:
+  finetune.sh run --config run.toml --suite regression.jsonl --suite toolcalls.jsonl \\
+      --batch-size 16 --perplexity
+
   # Full run exporting a gguf instead of safetensors:
   finetune.sh run --config run.toml --suite eval.jsonl --export-format gguf --quant q4_k_m
+
+  # Full run, then compare the trained adapter against its base model (step 5):
+  finetune.sh run --config run.toml --suite eval.jsonl --base unsloth/Qwen3-4B --json
 
   # Drive eval alone (pass-through):
   finetune.sh eval --adapter adapters/my-lora --suite eval.jsonl --json
@@ -105,8 +128,10 @@ EOF
 
 # ── orchestrated loop ──────────────────────────────────────────────────────────
 cmd_run() {
-    local config="" suite="" dry_run=false json_flag=false
+    local config="" dry_run=false json_flag=false
     local export_format="safetensors" quant="" export_output=""
+    local batch_size="" perplexity=false base=""
+    local -a suites=()
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -123,7 +148,23 @@ cmd_run() {
                     printf 'hint: finetune.sh run --config <run.toml> --suite <suite.jsonl | dir> [--dry-run] [--json]\n' >&2
                     exit 1
                 fi
-                suite="$2"; shift 2 ;;
+                suites+=("$2"); shift 2 ;;
+            --batch-size)
+                if [ $# -lt 2 ]; then
+                    printf 'error: --batch-size requires an argument.\n' >&2
+                    printf 'hint: finetune.sh run --config <run.toml> --suite <suite.jsonl | dir> --batch-size <n>\n' >&2
+                    exit 1
+                fi
+                batch_size="$2"; shift 2 ;;
+            --perplexity)
+                perplexity=true; shift ;;
+            --base)
+                if [ $# -lt 2 ]; then
+                    printf 'error: --base requires an argument.\n' >&2
+                    printf 'hint: finetune.sh run --config <run.toml> --suite <suite.jsonl | dir> --base <hf-id-or-dir>\n' >&2
+                    exit 1
+                fi
+                base="$2"; shift 2 ;;
             --export-format)
                 if [ $# -lt 2 ]; then
                     printf 'error: --export-format requires an argument.\n' >&2
@@ -163,7 +204,7 @@ cmd_run() {
         printf 'hint: finetune.sh run --config <run.toml> --suite <suite.jsonl | dir> [--dry-run] [--json]\n' >&2
         exit 1
     fi
-    if [ -z "$suite" ]; then
+    if [ "${#suites[@]}" -eq 0 ]; then
         printf 'error: --suite is required.\n' >&2
         printf 'hint: finetune.sh run --config <run.toml> --suite <suite.jsonl | dir> [--dry-run] [--json]\n' >&2
         exit 1
@@ -175,6 +216,20 @@ cmd_run() {
         json_arg=(--json)
     fi
 
+    # Build the repeatable --suite array (one --suite flag per entry) once;
+    # forwarded to the eval step.
+    local suite_arg=()
+    local s
+    for s in "${suites[@]}"; do
+        suite_arg+=(--suite "$s")
+    done
+
+    # Total step count: 5 when --base is given (adds the compare step), 4 otherwise.
+    local total_steps=4
+    if [ -n "$base" ]; then
+        total_steps=5
+    fi
+
     # --dry-run: step 1 only — validate + resolve plan, no GPU.
     if $dry_run; then
         printf 'step 1/1  validate + plan (dry-run, GPU-free)\n' >&2
@@ -183,7 +238,7 @@ cmd_run() {
     fi
 
     # Real run — step 1: dry-run first (validate + capture plan JSON for adapter dir).
-    printf 'step 1/4  validate + plan (dry-run)\n' >&2
+    printf 'step 1/%d  validate + plan (dry-run)\n' "$total_steps" >&2
     local plan_json
     plan_json=$("${SLOTH[@]}" train --config "$config" --dry-run --json) || {
         local rc=$?
@@ -209,12 +264,21 @@ cmd_run() {
     fi
 
     # Step 2: Real training (GPU required).
-    printf 'step 2/4  train (real run — GPU + tuning stack required)\n' >&2
+    printf 'step 2/%d  train (real run — GPU + tuning stack required)\n' "$total_steps" >&2
     "${SLOTH[@]}" train --config "$config" "${json_arg[@]}" || exit $?
 
-    # Step 3: Eval.
-    printf 'step 3/4  eval\n' >&2
-    "${SLOTH[@]}" eval --adapter "$adapter_dir" --suite "$suite" "${json_arg[@]}" || exit $?
+    # Step 3: Eval. --suite is repeatable (suite_arg holds one --suite per entry);
+    # --batch-size and --perplexity are forwarded only when given.
+    local eval_arg=()
+    if [ -n "$batch_size" ]; then
+        eval_arg+=(--batch-size "$batch_size")
+    fi
+    if $perplexity; then
+        eval_arg+=(--perplexity)
+    fi
+    printf 'step 3/%d  eval\n' "$total_steps" >&2
+    "${SLOTH[@]}" eval --adapter "$adapter_dir" "${suite_arg[@]}" \
+        "${eval_arg[@]}" "${json_arg[@]}" || exit $?
 
     # Step 4: Export. --export-format defaults to safetensors (host, no GPU);
     # any other format runs inside the NGC container. --quant is forwarded
@@ -234,9 +298,20 @@ cmd_run() {
     elif [ -n "$export_output" ]; then
         export_arg+=(--output "$export_output")
     fi
-    printf 'step 4/4  export → %s\n' "$export_format" >&2
+    printf 'step 4/%d  export → %s\n' "$total_steps" "$export_format" >&2
     "${SLOTH[@]}" export --adapter "$adapter_dir" --format "$export_format" \
         "${export_arg[@]}" "${json_arg[@]}" || exit $?
+
+    # Step 5: adapter-vs-base-model compare (only when --base is given).
+    if [ -n "$base" ]; then
+        local compare_arg=()
+        if [ -n "$config" ]; then
+            compare_arg+=(--config "$config")
+        fi
+        printf 'step 5/5  compare --base %s\n' "$base" >&2
+        "${SLOTH[@]}" compare --base "$base" "$adapter_dir" \
+            "${compare_arg[@]}" "${json_arg[@]}" || exit $?
+    fi
 
     printf 'done: adapter at %s\n' "$adapter_dir" >&2
 }

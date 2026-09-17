@@ -122,6 +122,23 @@ DEP_LAYER_NODEPS_PACKAGES: tuple[str, ...] = (
     "bitsandbytes==0.50.2",
 )
 
+#: Benchmark layer installed with a plain ``uv pip install`` *after* the
+#: ``--no-deps`` layer: the lm-evaluation-harness (``sloth bench`` / MMLU) and
+#: sacrebleu (the lazy GLEU/BLEU scorer in :mod:`sloth.tune.scorers`). Pinned to
+#: the versions measured live 2026-09-17 on NGC 25.11 (torch
+#: ``2.10.0a0+b558c986e8.nv25.11``, CUDA 13.0) by installing them into the
+#: already-built dep-layer venv and diffing ``uv pip list``: the install is
+#: purely additive (45 new packages — evaluate 0.4.6, scikit-learn 1.9.1,
+#: sqlitedict 2.1.0, rouge-score, ...) and leaves transformers 4.57.1, peft
+#: 0.18.0, trl 0.24.0, datasets 4.8.5, accelerate 1.13.0, numpy 2.3.5 and the
+#: nv torch untouched; ``import torch`` still reports CUDA available and
+#: ``import unsloth`` still patches. Row recorded in docs/tested.md; bump
+#: procedure in docs/dgx-spark.md ("Bumping the benchmark-layer pins").
+DEP_LAYER_BENCH_PACKAGES: tuple[str, ...] = (
+    "lm_eval==0.4.13",
+    "sacrebleu==2.6.0",
+)
+
 #: Pinned version of the astral uv standalone installer (supply-chain safety).
 UV_INSTALLER_VERSION: str = "0.9.2"
 
@@ -240,6 +257,7 @@ def _inner_script(sloth_args: list[str]) -> str:
     """
     install_deps = "uv pip install " + shlex.join(DEP_LAYER_PACKAGES)
     install_nodeps = "uv pip install --no-deps " + shlex.join(DEP_LAYER_NODEPS_PACKAGES)
+    install_bench = "uv pip install " + shlex.join(DEP_LAYER_BENCH_PACKAGES)
     entrypoint = f"PYTHONPATH={CHECKOUT_MOUNT} python -m sloth " + shlex.join(sloth_args)
     curl_guard = (
         "  command -v curl >/dev/null 2>&1"
@@ -271,6 +289,10 @@ def _inner_script(sloth_args: list[str]) -> str:
             "uv pip uninstall torch 2>/dev/null || true",
             "uv pip uninstall torchvision 2>/dev/null || true",
             install_nodeps,
+            # Benchmark layer (lm-evaluation-harness + sacrebleu) last: a full
+            # resolution, measured additive against the layers above (see
+            # DEP_LAYER_BENCH_PACKAGES).
+            install_bench,
             entrypoint,
         ]
     )

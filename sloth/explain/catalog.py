@@ -28,17 +28,23 @@ buildable/deployable package baseline. Clone it, rename the package, edit
 - `unsloth-cli cli overview` — describe the CLI surface.
 - `unsloth-cli validate` — validate a JSONL dataset file, or an eval suite
   (file or directory), standalone.
-- `unsloth-cli config init` — write a starting `run.toml` with validated defaults.
+- `unsloth-cli config init` — write a starting `run.toml` with validated
+  defaults, including the commented-out `[eval]` / `[eval.thresholds]` /
+  `[run.dataset_map]` template.
 - `unsloth-cli train` — validate a dataset and run/plan a LoRA/QLoRA adapter job.
-- `unsloth-cli eval` — score an adapter against a local task-schema eval suite
-  (a file or a directory of them).
+- `unsloth-cli eval` — score an adapter (or exported model) against one or
+  more named eval suites (repeatable `--suite`; chat/task/instruction/
+  structured/toolcall schema, auto-detected) — a file or a directory of them.
 - `unsloth-cli export` — export an adapter to a PEFT/safetensors layout.
+- `unsloth-cli bench` — score an adapter or model on a standard benchmark
+  (MMLU via `lm_eval`, in the NGC container).
 - `unsloth-cli runs list` / `runs show <run_id>` — enumerate/inspect past runs
   from the run registry (`<runs-root>/runs.jsonl`) — no directory walking.
 - `unsloth-cli summarize <run_id|dir>` — one JSON summary of a past run
   (training_metadata.json + trainer_state.json).
 - `unsloth-cli compare <a> <b>` — side-by-side config deltas + summaries for
-  two past runs.
+  two past runs; `compare --base <hf-id-or-dir> <adapter>` instead compares a
+  single adapter against its base model, gated on `[eval.thresholds]`.
 
 ## Exit-code policy
 
@@ -147,11 +153,37 @@ the same pattern `sloth eval`'s `--adapter`/`--model` uses):
   passes here is guaranteed to pass `sloth eval`'s host-side validation too.
   `PATH` may be a single `.jsonl` file or a directory — a directory is
   expanded to its sorted `*.jsonl` children and every one is validated
-  **always against the task schema** (eval suites are task-schema only, the
-  same rule `sloth eval` enforces), reporting a per-file record count plus
-  the aggregate total. Passing an explicit `--schema` other than `task`
-  together with `--suite` exits `1` with a `hint:` — it would otherwise
-  report a suite as valid against a schema `sloth eval` will not accept.
+  against the schema **detected from its own first record** — `task`,
+  `chat`, `instruction`, `structured` or `toolcall`, the same detection
+  `sloth eval` applies — reporting a per-file record count and schema plus
+  the aggregate total, so one directory can mix suite kinds. Passing
+  `--schema` pins one schema for every file; a value outside the five known
+  schemas exits `1` with a `hint:`.
+
+`--dataset` also accepts an external `hf:<org>/<name>[:split]` Hugging Face
+Hub dataset id in place of a local path. Its rows are rendered to the chat or
+task schema via a `--dataset-map FIELD=COLUMN` mapping (repeatable; the same
+keys as `[run.dataset_map]` in `run.toml`: `messages` for chat, or
+`task`/`input`/`expected_output` for task) and the first 50 rows are checked
+**offline, without launching a container** when the dataset is already
+cached locally. When it is not cached (or the `datasets` library is not
+installed), the check exits `2` with a `hint:` naming `sloth train` as the
+way to populate the shared Hugging Face cache. `--schema` is honoured here
+too: the mapped rows are validated against the **pinned** schema and the
+report names it (`schema_source: pinned`); without it the schema is inferred
+from the mapping (`schema_source: inferred`). A `--schema` that contradicts
+the mapping — `--schema task` with a `messages` mapping, or `--schema chat`
+with a `task`/`input`/`expected_output` mapping — exits `1` with a `hint:`
+rather than being silently ignored.
+
+`--config PATH` reads a `run.toml` with the *same*
+`sloth.tune.config.load_config` `sloth train` uses and takes `dataset` from
+its `[run]` section and the column mapping from `[run.dataset_map]` when
+`--dataset` / `--dataset-map` are not passed — explicit flags always win, and
+`--suite` is never overridden. This is the entry point for a caller that holds
+only a run config (e.g. a sibling agent running
+`sloth validate --config run.toml --json`) and so cannot spell out the
+mapping on the command line.
 
 This module is pure stdlib — no torch/unsloth import, so it stays usable on a
 machine with no GPU stack installed.
@@ -161,6 +193,7 @@ machine with no GPU stack installed.
     unsloth-cli validate --dataset data/train.jsonl
     unsloth-cli validate --dataset data/train.jsonl --schema task
     unsloth-cli validate --dataset data/train.jsonl --json
+    unsloth-cli validate --config run.toml --json
     unsloth-cli validate --suite data/eval.jsonl
     unsloth-cli validate --suite examples/eval/ --json
 
@@ -168,16 +201,21 @@ machine with no GPU stack installed.
 
 - `--dataset PATH` — path to a JSONL training dataset file. Mutually
   exclusive with `--suite`.
-- `--suite PATH` — path to a task-schema JSONL eval suite, or a directory of
-  them (every `*.jsonl` child is validated). Mutually exclusive with
-  `--dataset`.
-- `--schema {chat,task}` — schema to validate against. With `--dataset`:
-  default auto-detect from the first record. With `--suite`: always `task`
-  (eval suites are task-schema only); passing `--schema chat` (or any value
-  other than `task`) together with `--suite` exits `1` with a `hint:`.
+- `--suite PATH` — path to a JSONL eval suite, or a directory of them (every
+  `*.jsonl` child is validated and its schema detected). Mutually exclusive
+  with `--dataset`.
+- `--schema {chat,instruction,structured,task,toolcall}` — schema to validate
+  against. Default: auto-detect from each file's first record. Passing it
+  pins that schema for every file.
+- `--dataset-map FIELD=COLUMN` (repeatable) — column mapping for an
+  `hf:<org>/<name>[:split]` `--dataset`; ignored for a local JSONL `--dataset`.
+- `--config PATH` — a `run.toml` supplying `--dataset` (from `[run] dataset`)
+  and `--dataset-map` (from `[run.dataset_map]`) when those flags are absent.
 - `--json` — emit the result as structured JSON: `{valid, schema, line_count}`
   for `--dataset`, or `{valid, schema, files, total_records}` for `--suite`
-  (`files` is a list of `{path, line_count}`, one per resolved file).
+  (`files` is a list of `{path, line_count}`, one per resolved file). An
+  `hf:` `--dataset` adds a `source` field naming the spec and a
+  `schema_source` field (`pinned` or `inferred`).
 
 ## Exit codes
 
@@ -185,10 +223,16 @@ machine with no GPU stack installed.
 - `1` user-input error — missing file, invalid JSON, a record that fails
   schema validation (the validator's own `CliError` propagates verbatim,
   naming the file and line for a `--suite` directory), an empty `--suite`
-  directory, an explicit non-`task` `--schema` passed with `--suite`, or
-  both/neither of `--dataset`/`--suite` passed.
+  directory, an explicit non-`task` `--schema` passed with `--suite`, both/
+  neither of `--dataset`/`--suite` passed, a malformed `--dataset-map` entry,
+  a `--schema` that contradicts the `--dataset-map` for an `hf:` `--dataset`,
+  or a missing/unresolvable `[run.dataset_map]`-equivalent mapping for an
+  `hf:` `--dataset`.
 - `2` environment error — the dataset file exists but cannot be opened
-  (e.g. a permission error).
+  (e.g. a permission error); a `--config` file that is missing or not valid
+  TOML; or, for an `hf:` `--dataset`, the `datasets` library is not
+  installed, or the dataset is not present in the local Hugging Face cache
+  (the `hint:` names `sloth train` as the way to cache it).
 """
 
 _CONFIG_INIT = """\
@@ -222,6 +266,56 @@ Refuses to overwrite an existing file unless `--force` is passed.
 The generated file omits `target_modules` (optional; a list of module names, a
 single regex string, or a known preset such as `"preset:lfm2"`). Add it under
 `[hyperparameters]` to extend which modules the adapter touches.
+
+The generated `[run]` section also documents (as commented-out TOML) that
+`dataset` may instead name an external Hugging Face Hub dataset —
+`"hf:<org>/<name>[:split]"` — with a `[run.dataset_map]` table mapping its
+hub columns onto the chat (`messages`) or task (`task`/`input`/
+`expected_output`) schema. See `unsloth-cli explain train`.
+
+## `[run.dataset_map]` keys
+
+One chat-schema key, three task-schema keys — pick the shape matching the
+`hf:` dataset's schema (mixing both is rejected):
+
+- `messages` — hub column holding the chat schema's `messages` list.
+- `task` / `input` / `expected_output` — hub columns holding the task
+  schema's three fields.
+
+Any other key in `[run.dataset_map]` is rejected with a `hint:` naming it.
+
+## `[eval]` / `[eval.thresholds]` keys (written commented-out)
+
+The generated file also documents, as commented-out TOML, the optional
+`[eval]` section (training-time eval; see `unsloth-cli explain train`) and its
+nested `[eval.thresholds]` table (the gate `unsloth-cli compare --base`
+applies; see `unsloth-cli explain compare`). Both stay commented so a freshly
+generated config leaves `eval`/`thresholds` unset (`None`) — uncomment and
+edit to turn either on. Unknown keys under either section are rejected with a
+`hint:` naming them.
+
+`[eval]`:
+
+- `holdout_fraction` (default `0.0`) — fraction of the local dataset held out
+  for training-time eval; `0` disables the split entirely.
+- `seed` (default: the run's top-level seed) — RNG seed for the holdout split.
+- `eval_steps` (default `0`) — how often (in training steps) to evaluate the
+  holdout; `0` means "a quarter of `max_steps`, at least 1" once
+  `holdout_fraction > 0`.
+- `perplexity` (default `false`) — also compute held-out perplexity/loss.
+- `tool_call_family` (default `""`, meaning auto-detect) — the tool-call
+  parsing family for toolcall-schema holdout rows.
+
+`[eval.thresholds]` — the baseline `unsloth-cli compare --base` applies:
+
+- `regression_drop_pp` (default `2.0`) — max percentage-point drop allowed on
+  a regression-tagged suite's `exact_match_pct` before the gate fails.
+- `compliance_min_pct` (default `95.0`) — minimum `compliance_pct` the
+  adapter must clear.
+- `latency_max_ratio` (default `1.10`) — max adapter/base median-latency
+  ratio allowed.
+- `min_suite_rows` (default `100`) — minimum rows a suite must have on either
+  side, or the gate refuses to compare it.
 
 ## Exit codes
 
@@ -263,6 +357,32 @@ load time, before any GPU spend). `preset:lfm2` adapts all 92 LoRA-able modules
 of LFM2.5-1.2B (24 attention, 20 short-conv, 48 feed-forward); Unsloth's default
 adapts only q/k/v on the 6 attention layers.
 
+`dataset` may also name an external Hugging Face Hub dataset instead of a
+local JSONL file: `"hf:<org>/<name>[:split]"` (split defaults to `"train"`).
+A `[run.dataset_map]` table then maps its hub columns onto the chat
+(`messages`) or task (`task`/`input`/`expected_output`) schema; it is
+required to resolve an `hf:` dataset's schema. The actual
+`datasets.load_dataset` call happens lazily, inside the NGC container, through
+the same mounted Hugging Face cache used for models — check an `hf:` dataset
+offline first with `sloth validate --dataset hf:<org>/<name> --dataset-map
+...`.
+
+An `[eval]` section with `holdout_fraction > 0` turns on **training-time eval**:
+the local dataset is split with `seed` into `<stem>.train.jsonl` /
+`<stem>.holdout.jsonl` before the model loads, the holdout is passed to the
+trainer as its eval set, and evaluation runs every `eval_steps` (when
+`eval_steps = 0` it defaults to a quarter of `max_steps`, at least 1). The
+resolved split — fraction, seed, both paths, both row counts, and the effective
+`eval_steps` — plus the per-step `loss_history` (`train_loss` / `eval_loss`),
+`final_train_loss` and `final_eval_loss` are written into
+`training_metadata.json`, so the run is reproducible and its loss curve
+inspectable. An `hf:` dataset has no local file to split, so the holdout is
+skipped with a note on stderr and training proceeds without an eval set.
+`[eval]` also accepts `perplexity` (also compute held-out perplexity/loss) and
+`tool_call_family` (the tool-call parsing family for toolcall-schema holdout
+rows; `""` auto-detects) — see `unsloth-cli explain config` for the full
+`[eval]`/`[eval.thresholds]` key reference.
+
 ## Exit codes
 
 - `0` success
@@ -279,22 +399,39 @@ inference is local and offline (`local_files_only=True`); the heavy ML stack is
 imported lazily inside the inference backend, so importing the verb stays
 torch-free.
 
-The suite is one or more JSONL files whose records conform to the **task**
-schema (`{"task", "input", "expected_output"}`). `--suite` accepts a single file
-or a directory — a directory is expanded to its sorted `*.jsonl` children — and
-is repeatable (`--suite a.jsonl --suite dir/`). Every resolved file is validated
-against the task schema **before any container is launched**: a malformed file
-anywhere in a `--suite` directory exits `1` naming the file and line, and costs
-no docker/GPU spend. `--batch-size` is validated on the host too — a value
-below `1` exits `1` before the suite is even checked. Each record's prediction
-is compared to its `expected_output` for an exact match and scored with a
-stdlib token-level F1 (`f1`, no external scoring dependency). The result is an
-aggregate summary (`total`, `exact_match`, `exact_match_pct`, `f1`) at the top
-level, plus a per-file `files` list (the same fields, scoped to each resolved
-suite file) and per-record `results`. `eval.json` (the summary plus
-`suite_paths` / `target` / `written_at`) is written into the directory that
-was evaluated: the adapter directory for `--adapter`, or the export directory
-for `--model` — the parent directory when a single `.gguf` file is passed.
+Each `--suite` flag names one eval suite — its name is the given path's stem
+(sanitised), and `--suite` is repeatable (`--suite a.jsonl --suite b/`) to
+score several named suites in **one invocation**. `--suite` accepts a single
+file or a directory — a directory is expanded to its sorted `*.jsonl`
+children. Each record's schema (chat / task / instruction / structured /
+toolcall) is auto-detected from its keys and validated **before any container
+is launched**: an undetectable or malformed record anywhere in a `--suite`
+directory exits `1` naming the file and line, and costs no docker/GPU spend.
+Two `--suite` entries whose stems sanitise to the same name is a collision and
+exits `1` with a `hint:` before anything else runs. `--batch-size` is
+validated on the host too — a value below `1` exits `1` before the suite is
+even checked.
+
+When a training dataset can be identified — `--train-dataset PATH`, or the
+`dataset.path` recorded in the target's `training_metadata.json` — a
+train/eval overlap check runs on the host, **before any container launch**:
+an overlapping row anywhere in the suites exits `1` naming every duplicated
+`file:line`. When neither is available, the check is skipped with a stderr
+diagnostic, not a failure.
+
+Each record's prediction is compared to its `expected_output` for an exact
+match and scored with a stdlib token-level F1 (`f1`, no external scoring
+dependency). Results are always reported **keyed by suite name**:
+`{"suites": {<name>: {total, exact_match, exact_match_pct, f1, results, ...}}}`
+in `--json` mode, and one text block per suite otherwise. One invocation
+writes `eval/<name>.json` for every named suite (batch size and target
+included) into the directory that was evaluated: the adapter directory for
+`--adapter`, or the export directory for `--model` — the parent directory
+when a single `.gguf` file is passed. `--results-dir DIR` redirects those
+writes: the same records, written flat into `DIR` instead. That is how
+`unsloth-cli compare --base` keeps a base model's scores in
+`<adapter>/eval-base/` and its adapter re-eval in `<adapter>/eval-compare/`
+without disturbing the adapter's own `eval/`.
 
 ## Two targets: `--adapter` or `--model`
 
@@ -306,6 +443,11 @@ Exactly one is required — passing both, or neither, exits `1` with a `hint:`.
   (bf16/4-bit) checkpoint, an AWQ or NVFP4 compressed-tensors checkpoint (both
   auto-detected by transformers from `config.json`), or a GGUF — which is scored
   with llama.cpp's `llama-completion` from the mounted llama.cpp cache.
+  `--model` also accepts a **Hugging Face repo id** (`org/name`) for a base
+  model that was never exported — the base-eval form `compare --base` drives.
+  A repo id owns no directory, so `--results-dir` is required with it; a
+  path-shaped `--model` that does not exist is still an error, never taken for
+  a hub id.
 
 A `--model` run reports the same score fields plus `model_dir`, `quant_method`
 and `quant_format` (read from `config.json`'s `quantization_config`; both `null`
@@ -316,33 +458,145 @@ for a plain bf16 merged directory or a GGUF).
     unsloth-cli eval --adapter adapters/qwen3-4b-qlora --suite data/eval.jsonl
     unsloth-cli eval --model exports/qwen3-4b-awq --suite examples/eval/
     unsloth-cli eval --model exports/qwen3-4b-gguf --suite data/eval.jsonl --quant q4_k_m
+    unsloth-cli eval --adapter adapters/qwen3-4b-qlora \\
+        --suite regression.jsonl --suite toolcalls.jsonl --json
     unsloth-cli eval --adapter adapters/qwen3-4b-qlora --suite examples/eval/ \\
-        --batch-size 16 --json
+        --train-dataset data/train.jsonl --perplexity --tool-call-family qwen
 
 ## Key flags
 
 - `--adapter DIR` — adapter directory produced by `unsloth-cli train`.
 - `--model DIR` — merged / quantized / GGUF directory produced by
   `unsloth-cli export` (mutually exclusive with `--adapter`).
-- `--suite PATH` (required, repeatable) — a task-schema JSONL eval suite file,
-  or a directory of them (every `*.jsonl` child is scored, sorted). Pass
-  `--suite` more than once to combine several files/directories.
+- `--suite PATH` (required, repeatable) — names one eval suite (chat / task /
+  instruction / structured / toolcall schema, auto-detected): a single JSONL
+  file, or a directory of them (every `*.jsonl` child is scored, sorted). Pass
+  `--suite` more than once to score several named suites in one invocation;
+  two entries whose stems collide exit `1`.
 - `--quant NAME` — when `--model` holds several GGUF files, the quant tag to
   score (case-insensitive, e.g. `q4_k_m`); ignored for a single-GGUF or
   non-GGUF `--model` directory, and for `--adapter`.
 - `--batch-size N` — generation batch size for the eval loop (default: `8`);
   must be `>= 1` (`1` is the explicit unbatched mode) or the run exits `1`
-  before any suite validation or container launch.
-- `--json` — emit the scored summary and per-record results as structured JSON.
+  before any suite validation or container launch. Recorded in every written
+  `eval/<name>.json`.
+- `--perplexity` — also compute held-out perplexity/loss during eval;
+  forwarded into the container.
+- `--tool-call-family NAME` — the tool-call parsing family to score
+  toolcall-schema suites against; forwarded into the container.
+- `--train-dataset PATH` — the training dataset to check every `--suite`
+  against for train/eval overlap before any container launch. Defaults to the
+  dataset recorded in the target's `training_metadata.json` when present.
+- `--results-dir DIR` — write the per-suite result files flat into `DIR`
+  instead of into `<target>/eval/`. Only *where* changes, never *what* is
+  written. Required when `--model` names a Hugging Face repo id.
+- `--json` — emit the scored summary, keyed by suite name, as structured JSON.
 
 ## Exit codes
 
 - `0` success
 - `1` user-input error (both/neither target, missing adapter or model dir,
   a `--batch-size` below `1`, a missing `--suite` path, an empty `--suite`
-  directory, or a malformed record anywhere in the suite — named by file and
-  line, before any container launch)
+  directory, a `--suite` name collision, an undetectable/malformed record
+  anywhere in a suite — named by file and line, before any container launch —
+  a train/eval overlap naming every duplicated `file:line`, or a `--model`
+  repo id passed without `--results-dir`)
 - `2` environment / setup error (ML stack not installed, llama.cpp missing, OOM)
+"""
+
+_BENCH = """\
+# unsloth-cli bench
+
+Score a trained adapter — or a merged / exported model directory — on a
+**standard public benchmark**. Where `unsloth-cli eval` scores your own local
+suite, `bench` runs the lm-evaluation-harness (`lm_eval`) so the number is the
+one everyone else quotes. MMLU is the shipped benchmark (`--benchmark mmlu`,
+5-shot by default).
+
+The harness runs **inside the NGC container**, where the benchmark dependency
+layer (`lm_eval`, `sacrebleu`) is installed; the host process imports no
+torch/`lm_eval` at all. The in-container command is, verbatim:
+
+    lm_eval --model hf \\
+        --model_args pretrained=<base>[,peft=<adapter>][,load_in_4bit=True] \\
+        --tasks mmlu --num_fewshot 5 [--limit N] \\
+        --output_path <tmp> --log_samples
+
+## Two targets: `--adapter` or `--model`
+
+Exactly one is required — passing both, or neither, exits `1` with a `hint:`.
+
+- `--adapter DIR` benches a LoRA/QLoRA adapter against the base model recorded
+  in its `training_metadata.json` (`model`), adding `load_in_4bit=True` when
+  that run's `hyperparameters.load_in_4bit` was set. Falls back to
+  `adapter_config.json`'s `base_model_name_or_path`.
+- `--model DIR` benches a merged / exported directory directly
+  (`pretrained=<dir>`).
+
+**If the QLoRA path cannot be loaded** — whether `lm_eval`'s `hf` backend
+accepts a 4-bit base wrapped with a PEFT adapter depends on the installed
+`peft`/`bitsandbytes` pair — the run exits `2` with a `hint:` naming the
+fallback: export the adapter merged to 16-bit
+(`unsloth-cli export --format merged16`) and bench that directory with
+`--model`. Both outcomes are supported by design.
+
+## Result shape
+
+One run writes `<target>/eval/<benchmark>.json` in the **same shape** a suite
+result uses, so `unsloth-cli summarize` and `unsloth-cli compare` fold a
+benchmark in with no special-casing:
+
+- `acc` — overall accuracy, `0..1`.
+- `acc_norm` — length-normalised accuracy when the harness reports one; `null`
+  for MMLU, which reports plain `acc` only (the key is always present, never
+  invented).
+- `exact_match_pct` — `acc * 100`, the flat percentage every suite carries.
+- `total` — samples actually scored (`--limit` aware).
+- `per_subject` — `{subject: {acc, acc_norm, total}}` for each sub-task
+  (MMLU's 57 subjects, with the `mmlu_` prefix stripped).
+- `harness` — `{name, version, tasks, limit, num_fewshot}`: the provenance of
+  the number.
+
+## Usage
+
+    unsloth-cli bench --adapter adapters/qwen3-4b-qlora --benchmark mmlu
+    unsloth-cli bench --model exports/qwen3-4b-merged16 --limit 20 --json
+    unsloth-cli bench --adapter adapters/qwen3-4b-qlora --offline
+
+## Key flags
+
+- `--adapter DIR` / `--model DIR` — the target (exactly one).
+- `--benchmark NAME` — the benchmark to run; also names the result file
+  `eval/<NAME>.json` (default: `mmlu`).
+- `--tasks SPEC` — the `lm_eval` task spec (default: the `--benchmark` name).
+- `--num-fewshot N` — few-shot examples per task (default: `5`, MMLU's
+  standard); `0` is zero-shot, a negative value exits `1`.
+- `--limit N` — score only the first `N` documents per task, for smoke runs;
+  must be `>= 1` or the run exits `1` before any container launch.
+- `--offline` — set `HF_HUB_OFFLINE=1` in the container so the harness cannot
+  reach the network at all. Requires a warm Hugging Face cache; see the
+  warm-cache check in `docs/dgx-spark.md`.
+- `--json` — emit the payload as structured JSON.
+
+## MMLU without the network
+
+`examples/eval/mmlu-subset.jsonl` is a committed, MMLU-**style** letter-choice
+suite (original questions, not MMLU rows) scored through the ordinary suite
+path — `unsloth-cli eval --adapter <dir> --suite examples/eval/mmlu-subset.jsonl`.
+A suite whose every `expected_output` is a single `A`-`D` letter is scored on
+the *letter the model picked* (extracted from `"B"`, `"B."`, `"(B)"`,
+`"Answer: B"`, …) and reports `choice_acc_pct` alongside the usual
+`exact_match_pct`.
+
+## Exit codes
+
+- `0` success
+- `1` user-input error (both/neither target, a missing directory, a `--limit`
+  below `1`, a negative `--num-fewshot`, or an adapter whose base model cannot
+  be determined)
+- `2` environment / setup error (docker/GPU unavailable, `lm_eval` missing, the
+  harness exiting non-zero — including the 4-bit + PEFT load path failing, whose
+  `hint:` names the merged-16-bit fallback)
 """
 
 _EXPORT = """\
@@ -485,6 +739,15 @@ Both halves are optional: a run with no checkpoint yet, or a missing
 `training_metadata.json`, still summarizes — the gap is recorded in a `notes`
 list rather than raised as an error.
 
+When the run has eval results, the `eval` block lists every suite found —
+both the newer `eval/<suite>.json` files (one per named suite, e.g.
+`target`, `holdout`) and, for older run dirs, the flat legacy `eval.json`
+(shown as suite `legacy`) — each carrying its own metrics, file count,
+`batch_size` and base precision (`base_load_in_4bit`). The block also keeps
+top-level `exact_match_pct`/`f1` fields (taken from the `target` suite when
+present, else the first suite) so older readers of `summarize`'s output keep
+working unchanged.
+
 ## Usage
 
     unsloth-cli summarize <run_id>
@@ -508,28 +771,83 @@ list rather than raised as an error.
 _COMPARE = """\
 # unsloth-cli compare
 
-Side-by-side comparison of two past runs: the `training_metadata.json`
+Two comparisons, one verb.
+
+**Run vs. run** — `compare <a> <b>`: the `training_metadata.json`
 hyperparameter/config keys that differ between `<a>` and `<b>`, plus each
 run's full `unsloth-cli summarize` summary. Each of `<a>`/`<b>` resolves the
 same way `summarize`'s `<target>` does (a `run_id` or a literal output
-directory).
+directory). When both sides have eval results, an `eval` delta is added: the
+flat `exact_match_pct`/`f1` projection plus a per-suite, per-metric breakdown.
+
+**Adapter vs. its base model** — `compare --base <hf-id-or-dir> <adapter-dir>`:
+scores the base model on **every suite the adapter already has results for**
+(read from `<adapter>/eval/*.json` and re-run over the same suite files), then
+reports per-suite, per-metric deltas and checks them against the
+`[eval.thresholds]` gate. A raw Hugging Face id needs no export first.
+
+The two models run in **two separate, sequential container invocations** — the
+adapter first, then the base — so they are never resident on the GPU at the
+same time. The base run's per-suite results land under
+`<adapter-dir>/eval-base/<suite>.json`, and the adapter's own re-eval under
+`<adapter-dir>/eval-compare/<suite>.json` (both via `eval --results-dir`) —
+leaving `<adapter-dir>/eval/`, the record the suite list was read from,
+untouched. Each of those two directories is emptied of stale `*.json` right
+before its run, so the report only ever reads this invocation's numbers. When
+the second run fails (an out-of-memory container exit is `2`), the first run's
+results stay on disk.
+
+## The `--base` gate
+
+The comparison exits `1`, naming every failed check in the `hint:`, when:
+
+- a **regression-tagged** suite's `exact_match_pct` drops by more than
+  `regression_drop_pp` percentage points (tagged = a suite named `regression`,
+  or one named by `--regression-suite`);
+- the adapter's `compliance_pct` is below `compliance_min_pct`;
+- the adapter/base median-latency ratio is above `latency_max_ratio`;
+- either side's suite holds fewer rows than `min_suite_rows`;
+- `base_load_in_4bit` differs between the two result sets — the runs used
+  different base precision, so no other number between them is comparable.
+
+A metric a suite does not record is skipped, never read as a failure. The
+thresholds actually applied (and where they came from) are echoed in the
+report under `thresholds`, on the exit-`1` path too: the report goes to stdout
+**before** the error goes to stderr.
 
 ## Usage
 
     unsloth-cli compare <run_id_a> <run_id_b>
     unsloth-cli compare adapters/exp-1 adapters/exp-2 --json
+    unsloth-cli compare --base unsloth/Qwen3-4B adapters/qwen3-4b-qlora
+    unsloth-cli compare --base unsloth/Qwen3-4B adapters/qwen3-4b-qlora \\
+        --config run.toml --regression-suite holdout --json
 
 ## Key flags
 
+- `--base REF` — compare the single positional (an adapter directory) against
+  this base model: a Hugging Face repo id or a local model directory. With
+  `--base`, the second positional must be omitted.
+- `--config PATH` — run config whose `[eval.thresholds]` section gates the
+  `--base` comparison (default: the built-in baseline — 2 pp regression drop,
+  95% compliance, 1.10 latency ratio, 100 rows per suite).
+- `--regression-suite NAME` (repeatable) — also treat this suite as
+  regression-tagged.
 - `--runs-root DIR` — directory containing `runs.jsonl`, used to resolve a
   `run_id` on either side (default: the current directory).
-- `--json` — emit `{a, b, deltas}` as structured JSON.
+- `--json` — emit `{a, b, deltas}` for a run-vs-run compare, or
+  `{a, b, deltas: {suites: {<suite>: {<metric>: {a, b, delta}}}}, thresholds,
+  verdict: {passed, failures}}` for `--base`.
 
 ## Exit codes
 
 - `0` success
-- `1` user-input error — either `<a>` or `<b>` resolves to neither a `run_id`
-  nor an existing directory.
+- `1` user-input error — a target resolves to neither a `run_id` nor an
+  existing directory, `<b>` is missing without `--base`, both `<b>` and
+  `--base` are given, the adapter has no eval results to compare against — or
+  a `--base` threshold check failed.
+- `2` environment error — the container could not run (an out-of-memory eval
+  arrives here, with the memory `hint:`).
 """
 
 
@@ -553,6 +871,7 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("train",): _TRAIN,
     ("eval",): _EVAL,
     ("export",): _EXPORT,
+    ("bench",): _BENCH,
     ("runs",): _RUNS,
     ("runs", "list"): _RUNS,
     ("runs", "show"): _RUNS,

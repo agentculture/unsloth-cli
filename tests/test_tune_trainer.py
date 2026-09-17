@@ -64,7 +64,7 @@ def _write_chat_dataset(path: Path) -> Path:
     return path
 
 
-def _make_fake_backend() -> tuple[SimpleNamespace, dict]:
+def _make_fake_backend(log_history: list | None = None) -> tuple[SimpleNamespace, dict]:
     """Return a fake backend mimicking _load_backend()'s interface + an event log."""
     events: dict = {
         "from_pretrained": [],
@@ -102,6 +102,9 @@ def _make_fake_backend() -> tuple[SimpleNamespace, dict]:
     class FakeTrainer:
         def __init__(self, **kw):
             events["trainer"].append(kw)
+            # Mirrors transformers' ``Trainer.state.log_history`` — the source
+            # _run_real reads loss history from (NOT the TrainOutput return).
+            self.state = SimpleNamespace(log_history=list(log_history or []))
 
         def train(self):
             events["trained"].append(True)
@@ -710,6 +713,7 @@ class _FakeTokenizer:
         self.pad_token = pad_token
         self.eos_token = eos_token
         self.padding_side = "right"
+        self.chat_template_calls: list[dict] = []
         self._ids: dict[str, int] = {}
         self._words: dict[int, str] = {}
 
@@ -743,6 +747,21 @@ class _FakeTokenizer:
             sequences, masks = padded, padded_masks
         return _FakeInputs(input_ids=_FakeBatch(sequences), attention_mask=_FakeBatch(masks))
 
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize: bool = False,
+        add_generation_prompt: bool = False,
+    ) -> str:
+        """Render *messages* the way a real chat template would (recording the call)."""
+        self.chat_template_calls.append(
+            {"messages": messages, "add_generation_prompt": add_generation_prompt}
+        )
+        rendered = " ".join(f"<{m['role']}>{m['content']}" for m in messages)
+        if add_generation_prompt:
+            rendered = f"{rendered} <assistant>"
+        return rendered
+
     def decode(self, tokens, skip_special_tokens: bool = True) -> str:
         words = [self._words[int(t)] for t in tokens]
         if skip_special_tokens:
@@ -757,6 +776,9 @@ class _FakeEvalModel:
         self.tokenizer = tokenizer
         self.answers = answers
         self.batch_widths: list[int] = []
+        self.forward_calls: list[str] = []
+        self.forbid_generate = False
+        self.losses: list[float] = [0.0]
 
     def eval(self):  # noqa: D102 - trivial
         return self
@@ -764,7 +786,16 @@ class _FakeEvalModel:
     def parameters(self):  # noqa: D102 - trivial
         yield SimpleNamespace(device="cpu")
 
+    def __call__(self, input_ids=None, attention_mask=None, labels=None):
+        """A labelled forward pass — what run_perplexity must use (never generate())."""
+        assert labels is not None, "run_perplexity must pass labels= for a scored pass"
+        self.forward_calls.append(self.tokenizer.decode(input_ids[0], skip_special_tokens=False))
+        index = min(len(self.forward_calls) - 1, len(self.losses) - 1)
+        return SimpleNamespace(loss=self.losses[index])
+
     def generate(self, input_ids=None, attention_mask=None, max_new_tokens: int = 16):
+        if self.forbid_generate:
+            raise AssertionError("generate() must not be called on the perplexity path")
         self.batch_widths.append(len(input_ids))
         rows = []
         for i in range(len(input_ids)):
@@ -1237,3 +1268,824 @@ def test_resolve_suite_paths_without_any_suite_is_a_user_error() -> None:
         _trainer.resolve_suite_paths(None, None)
     assert exc_info.value.code == 1
     assert exc_info.value.remediation
+
+
+# ---------------------------------------------------------------------------
+# 11. t6 — eval loop: latency, token counts, chat rendering, per-schema scoring,
+#     perplexity, and the recorded base precision.
+# ---------------------------------------------------------------------------
+
+
+class _Clock:
+    """A deterministic ``perf_counter`` stand-in advancing *step* seconds per call."""
+
+    def __init__(self, step: float = 0.5) -> None:
+        self.now = 0.0
+        self.step = step
+
+    def __call__(self) -> float:
+        value = self.now
+        self.now += self.step
+        return value
+
+
+def _freeze_clock(monkeypatch, step: float = 0.5) -> _Clock:
+    clock = _Clock(step)
+    monkeypatch.setattr(_trainer.time, "perf_counter", clock)
+    return clock
+
+
+def _write_jsonl(path: Path, rows: list[dict]) -> Path:
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    return path
+
+
+def _eval_fakes(monkeypatch, answers: dict[str, str], *, pad_token: str | None = "<pad>"):
+    tokenizer = _FakeTokenizer(pad_token=pad_token)
+    model = _FakeEvalModel(tokenizer, answers)
+    _install_fake_ml(monkeypatch, tokenizer=tokenizer, model=model)
+    return tokenizer, model
+
+
+class TestGenerationTiming:
+    """``_generate_predictions`` reports per-row generated tokens and latency."""
+
+    def test_returns_tokens_and_per_row_latency(self, tmp_path: Path, monkeypatch) -> None:
+        tokenizer = _FakeTokenizer(pad_token="<pad>")
+        model = _FakeEvalModel(tokenizer, {"abc": "cba", "xyz": "z y x"})
+        _freeze_clock(monkeypatch, step=0.5)
+
+        run = _trainer._generate_predictions(
+            SimpleNamespace(no_grad=lambda: _NullContext()),
+            model,
+            tokenizer,
+            ["abc", "xyz"],
+            batch_size=8,
+            max_new_tokens=8,
+            device="cpu",
+        )
+
+        assert run.predictions == ["cba", "z y x"]
+        assert run.generated_tokens == [1, 3]
+        # One batch of two rows taking 0.5s ⇒ 250 ms attributed to each row.
+        assert run.latency_ms == [250.0, 250.0]
+        assert run.generate_seconds == pytest.approx(0.5)
+
+    def test_unbatched_path_also_reports_timing(self, monkeypatch) -> None:
+        tokenizer = _FakeTokenizer(pad_token=None, eos_token=None)
+        model = _FakeEvalModel(tokenizer, {"abc": "cba"})
+        _freeze_clock(monkeypatch, step=0.25)
+
+        run = _trainer._generate_predictions(
+            SimpleNamespace(no_grad=lambda: _NullContext()),
+            model,
+            tokenizer,
+            ["abc"],
+            batch_size=8,
+            max_new_tokens=8,
+            device="cpu",
+        )
+        assert run.predictions == ["cba"]
+        assert run.generated_tokens == [1]
+        assert run.latency_ms == [250.0]
+
+
+class _NullContext:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *exc):
+        return False
+
+
+class TestRunEvalTiming:
+    """run_eval writes the per-row and suite-level timing keys into its result."""
+
+    def test_per_row_and_suite_level_keys(self, tmp_path: Path, monkeypatch) -> None:
+        adapter = _adapter_with_config(tmp_path)
+        suite = _write_task_suite(
+            tmp_path / "s.jsonl", [("reverse", "abc", "cba"), ("reverse", "xyz", "zyx")]
+        )
+        _eval_fakes(monkeypatch, {"abc": "cba", "xyz": "zyx"})
+        _freeze_clock(monkeypatch, step=0.5)
+
+        result = run_eval(str(adapter), suite_paths=[suite], batch_size=4, base_load_in_4bit=True)
+
+        for row in result["results"]:
+            assert row["generated_tokens"] == 1
+            assert row["latency_ms"] == 250.0
+        assert result["median_latency_ms"] == 250.0
+        # 2 generated tokens over 0.5 s of generate wall time.
+        assert result["tokens_per_s"] == pytest.approx(4.0)
+        assert result["batch_size"] == 4
+        assert result["base_load_in_4bit"] is True
+        assert result["files"][0]["median_latency_ms"] == 250.0
+        assert result["files"][0]["tokens_per_s"] == pytest.approx(4.0)
+
+    def test_base_load_in_4bit_defaults_to_none(self, tmp_path: Path, monkeypatch) -> None:
+        adapter = _adapter_with_config(tmp_path)
+        suite = _write_task_suite(tmp_path / "s.jsonl", [("reverse", "abc", "cba")])
+        _eval_fakes(monkeypatch, {"abc": "cba"})
+        result = run_eval(str(adapter), suite_paths=[suite])
+        assert result["base_load_in_4bit"] is None
+
+    def test_suite_keyed_eval_json_records_batch_and_precision(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        adapter = _adapter_with_config(tmp_path)
+        suite = _write_task_suite(tmp_path / "my_suite.jsonl", [("reverse", "abc", "cba")])
+        _eval_fakes(monkeypatch, {"abc": "cba"})
+
+        run_eval(str(adapter), suite_paths=[suite], batch_size=3, base_load_in_4bit=False)
+
+        written = json.loads((adapter / "eval" / "my-suite.json").read_text(encoding="utf-8"))
+        assert written["schema_version"] == metrics.SCHEMA_VERSION
+        assert written["suite"] == "my-suite"
+        assert written["batch_size"] == 3
+        assert written["base_load_in_4bit"] is False
+        assert written["target"] == "adapter"
+        assert written["median_latency_ms"] >= 0.0
+        # The legacy flat eval.json is still written (sloth summarize reads it).
+        assert (adapter / "eval.json").is_file()
+
+
+class TestChatSuiteEval:
+    """A chat-schema suite is rendered through the tokenizer's chat template."""
+
+    def test_chat_rows_use_add_generation_prompt(self, tmp_path: Path, monkeypatch) -> None:
+        suite = _write_jsonl(
+            tmp_path / "chat.jsonl",
+            [
+                {
+                    "messages": [
+                        {"role": "user", "content": "ping"},
+                        {"role": "assistant", "content": "pong"},
+                    ]
+                }
+            ],
+        )
+        adapter = _adapter_with_config(tmp_path)
+        tokenizer, _model = _eval_fakes(monkeypatch, {"<user>ping": "pong"})
+
+        result = run_eval(str(adapter), suite_paths=[suite])
+
+        assert tokenizer.chat_template_calls, "the tokenizer chat template must be used"
+        call = tokenizer.chat_template_calls[0]
+        assert call["add_generation_prompt"] is True
+        assert [m["role"] for m in call["messages"]] == [
+            "user"
+        ], "the final assistant turn is the expected output, not part of the prompt"
+        assert result["results"][0]["prediction"] == "pong"
+        assert result["results"][0]["expected_output"] == "pong"
+        assert result["exact_match"] == 1
+
+    def test_scorable_row_tolerates_an_empty_message_list(self) -> None:
+        """An empty ``messages`` list must not IndexError -- it scores as no expectation."""
+        row = _trainer._scorable_row({"messages": []}, "chat")
+        assert row["task"] == "chat"
+        assert row["expected_output"] == ""
+        assert row["input"] == _trainer.render_chat_prompt([])
+
+    def test_scorable_row_tolerates_a_missing_message_list(self) -> None:
+        row = _trainer._scorable_row({}, "chat")
+        assert row["expected_output"] == ""
+
+    def test_eval_prompt_falls_back_without_a_tokenizer(self) -> None:
+        record = {
+            "messages": [
+                {"role": "user", "content": "ping"},
+                {"role": "assistant", "content": "pong"},
+            ]
+        }
+        rendered = _trainer.eval_prompt(record)
+        assert "user: ping" in rendered
+        assert "pong" not in rendered
+
+
+class TestPerSchemaScoring:
+    """instruction / structured / toolcall suites get their own per-row flag + compliance."""
+
+    def test_instruction_constraints(self, tmp_path: Path, monkeypatch) -> None:
+        suite = _write_jsonl(
+            tmp_path / "instr.jsonl",
+            [
+                {
+                    "task": "short",
+                    "input": "aaa",
+                    "expected_output": "ok",
+                    "constraints": [{"max_words": 1}],
+                },
+                {
+                    "task": "short",
+                    "input": "bbb",
+                    "expected_output": "ok",
+                    "constraints": [{"max_words": 1}],
+                },
+            ],
+        )
+        adapter = _adapter_with_config(tmp_path)
+        _eval_fakes(monkeypatch, {"aaa": "ok", "bbb": "way too long"})
+
+        result = run_eval(str(adapter), suite_paths=[suite])
+
+        assert [r["constraints_passed"] for r in result["results"]] == [True, False]
+        assert result["compliance_pct"] == 50.0
+        assert result["files"][0]["compliance_pct"] == 50.0
+
+    def test_structured_json_validity(self, tmp_path: Path, monkeypatch) -> None:
+        schema = {"type": "object", "required": ["a"], "properties": {"a": {"type": "string"}}}
+        suite = _write_jsonl(
+            tmp_path / "struct.jsonl",
+            [
+                {"task": "emit", "input": "good", "json_schema": schema},
+                {"task": "emit", "input": "bad", "json_schema": schema},
+            ],
+        )
+        adapter = _adapter_with_config(tmp_path)
+        _eval_fakes(monkeypatch, {"good": '{"a": "x"}', "bad": "not json"})
+
+        result = run_eval(str(adapter), suite_paths=[suite])
+
+        assert [r["json_valid"] for r in result["results"]] == [True, False]
+        assert result["compliance_pct"] == 50.0
+
+    def test_toolcall_matching(self, tmp_path: Path, monkeypatch) -> None:
+        expected = {"name": "get_weather", "arguments": {"city": "Paris"}}
+        suite = _write_jsonl(
+            tmp_path / "tools.jsonl",
+            [
+                {"task": "call", "input": "paris", "expected_tool_call": expected},
+                {"task": "call", "input": "berlin", "expected_tool_call": expected},
+            ],
+        )
+        adapter = _adapter_with_config(tmp_path)
+        good = '<tool_call> {"name": "get_weather", "arguments": {"city": "Paris"}} </tool_call>'
+        _eval_fakes(monkeypatch, {"paris": good, "berlin": "no call at all"})
+
+        result = run_eval(str(adapter), suite_paths=[suite])
+
+        assert [r["tool_call_matched"] for r in result["results"]] == [True, False]
+        assert result["compliance_pct"] == 50.0
+
+    def test_undetectable_tool_call_family_is_a_user_error(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        expected = {"name": "t", "arguments": {}}
+        suite = _write_jsonl(
+            tmp_path / "tools.jsonl",
+            [{"task": "call", "input": "x", "expected_tool_call": expected}],
+        )
+        adapter = tmp_path / "adapter"
+        adapter.mkdir()
+        (adapter / "adapter_config.json").write_text(
+            json.dumps({"base_model_name_or_path": "some/unknown-model"}), encoding="utf-8"
+        )
+        _eval_fakes(monkeypatch, {})
+
+        with pytest.raises(CliError) as exc_info:
+            run_eval(str(adapter), suite_paths=[suite])
+        assert exc_info.value.code == 1
+        assert "tool_call_family" in exc_info.value.remediation
+
+    def test_explicit_tool_call_family_overrides_detection(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        expected = {"name": "t", "arguments": {}}
+        suite = _write_jsonl(
+            tmp_path / "tools.jsonl",
+            [{"task": "call", "input": "x", "expected_tool_call": expected}],
+        )
+        adapter = tmp_path / "adapter"
+        adapter.mkdir()
+        (adapter / "adapter_config.json").write_text(
+            json.dumps({"base_model_name_or_path": "some/unknown-model"}), encoding="utf-8"
+        )
+        _eval_fakes(monkeypatch, {"x": '<tool_call> {"name": "t", "arguments": {}} </tool_call>'})
+
+        result = run_eval(str(adapter), suite_paths=[suite], tool_call_family="qwen3")
+        assert result["results"][0]["tool_call_matched"] is True
+        assert result["compliance_pct"] == 100.0
+
+
+class TestPerplexity:
+    """``run_perplexity`` scores a labelled forward pass — never ``generate()``."""
+
+    def test_returns_exp_of_mean_token_nll(self, tmp_path: Path, monkeypatch) -> None:
+        import math
+
+        suite = _write_task_suite(tmp_path / "s.jsonl", [("reverse", "abc", "cba")])
+        tokenizer = _FakeTokenizer(pad_token="<pad>")
+        model = _FakeEvalModel(tokenizer, {})
+        model.forbid_generate = True
+        model.losses = [2.0]
+        monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(no_grad=_NullContext))
+
+        value = _trainer.run_perplexity(
+            model, tokenizer, [json.loads(line) for line in suite.read_text().splitlines()]
+        )
+
+        assert value == pytest.approx(math.exp(2.0))
+        assert model.forward_calls, "a labelled forward pass must have happened"
+        assert (
+            "cba" in model.forward_calls[0]
+        ), "the expected output must be part of the scored text"
+
+    def test_accepts_a_suite_path(self, tmp_path: Path, monkeypatch) -> None:
+        import math
+
+        suite = _write_task_suite(tmp_path / "s.jsonl", [("reverse", "abc", "cba")])
+        tokenizer = _FakeTokenizer(pad_token="<pad>")
+        model = _FakeEvalModel(tokenizer, {})
+        model.forbid_generate = True
+        model.losses = [1.0]
+        monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(no_grad=_NullContext))
+
+        assert _trainer.run_perplexity(model, tokenizer, suite) == pytest.approx(math.exp(1.0))
+
+    def test_run_eval_records_perplexity_when_asked(self, tmp_path: Path, monkeypatch) -> None:
+        adapter = _adapter_with_config(tmp_path)
+        suite = _write_task_suite(tmp_path / "s.jsonl", [("reverse", "abc", "cba")])
+        _tokenizer, model = _eval_fakes(monkeypatch, {"abc": "cba"})
+        model.losses = [0.0]
+
+        result = run_eval(str(adapter), suite_paths=[suite], perplexity=True)
+
+        assert result["perplexity"] == pytest.approx(1.0)
+        assert result["files"][0]["perplexity"] == pytest.approx(1.0)
+
+    def test_perplexity_is_absent_by_default(self, tmp_path: Path, monkeypatch) -> None:
+        adapter = _adapter_with_config(tmp_path)
+        suite = _write_task_suite(tmp_path / "s.jsonl", [("reverse", "abc", "cba")])
+        _eval_fakes(monkeypatch, {"abc": "cba"})
+        result = run_eval(str(adapter), suite_paths=[suite])
+        assert "perplexity" not in result
+
+
+def test_run_eval_signature_keeps_backward_compatible_keywords() -> None:
+    params = inspect.signature(run_eval).parameters
+    for name in ("perplexity", "tool_call_family", "base_load_in_4bit"):
+        assert params[name].default is None or params[name].default is False
+
+
+# ---------------------------------------------------------------------------
+# Training-time eval: holdout split -> eval_dataset + loss history (t7)
+# ---------------------------------------------------------------------------
+
+
+def _write_task_dataset(path: Path, count: int = 10) -> Path:
+    """Write *count* task-schema rows — enough for a non-degenerate holdout split."""
+    path.write_text(
+        "".join(
+            json.dumps({"task": "echo", "input": f"in-{i}", "expected_output": f"out-{i}"}) + "\n"
+            for i in range(count)
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+class TestTrainingTimeEval:
+    """``[eval] holdout_fraction > 0`` wires an eval_dataset into SFTTrainer."""
+
+    def _config_with_eval(
+        self, tmp_path: Path, *, fraction: float = 0.2, seed: int = 7, eval_steps: int = 5
+    ) -> RunConfig:
+        from sloth.tune.config import EvalConfig
+
+        config = _config(tmp_path, method="lora")
+        config.eval = EvalConfig(holdout_fraction=fraction, seed=seed, eval_steps=eval_steps)
+        return config
+
+    def _run(self, tmp_path, monkeypatch, config, log_history=None):
+        backend, events = _make_fake_backend(log_history)
+        monkeypatch.setattr(_trainer, "_load_backend", lambda: backend)
+        fake_module, _, from_list_calls = _fake_datasets_module()
+        monkeypatch.setitem(sys.modules, "datasets", fake_module)
+        result = run_training(config, dry_run=False)
+        return result, events, from_list_calls
+
+    def test_sft_config_and_trainer_receive_eval_kwargs(self, tmp_path: Path, monkeypatch) -> None:
+        config = self._config_with_eval(tmp_path)
+        _write_task_dataset(Path(config.dataset))
+
+        _, events, from_list_calls = self._run(tmp_path, monkeypatch, config)
+
+        sft_kwargs = events["sft_config"][0]
+        assert sft_kwargs["eval_strategy"] == "steps"
+        assert sft_kwargs["eval_steps"] == 5
+        trainer_kwargs = events["trainer"][0]
+        assert "eval_dataset" in trainer_kwargs
+        assert trainer_kwargs["eval_dataset"] is not None
+        # train rows + holdout rows were each wrapped via Dataset.from_list
+        assert len(from_list_calls) == 2
+        assert len(from_list_calls[0]) == 8
+        assert len(from_list_calls[1]) == 2
+
+    def test_no_eval_kwargs_when_holdout_fraction_zero(self, tmp_path: Path, monkeypatch) -> None:
+        config = self._config_with_eval(tmp_path, fraction=0.0)
+        _write_task_dataset(Path(config.dataset))
+
+        _, events, from_list_calls = self._run(tmp_path, monkeypatch, config)
+
+        assert "eval_strategy" not in events["sft_config"][0]
+        assert "eval_steps" not in events["sft_config"][0]
+        assert "eval_dataset" not in events["trainer"][0]
+        assert len(from_list_calls) == 1
+
+    def test_no_eval_kwargs_when_eval_section_absent(self, tmp_path: Path, monkeypatch) -> None:
+        config = _config(tmp_path, method="lora")
+        assert config.eval is None
+        _write_task_dataset(Path(config.dataset))
+
+        _, events, _ = self._run(tmp_path, monkeypatch, config)
+
+        assert "eval_strategy" not in events["sft_config"][0]
+        assert "eval_dataset" not in events["trainer"][0]
+
+    def test_eval_steps_zero_defaults_to_quarter_of_max_steps(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        config = self._config_with_eval(tmp_path, eval_steps=0)
+        config.max_steps = 40
+        _write_task_dataset(Path(config.dataset))
+
+        result, events, _ = self._run(tmp_path, monkeypatch, config)
+
+        assert events["sft_config"][0]["eval_steps"] == 10
+        data = json.loads(Path(result["metadata_path"]).read_text(encoding="utf-8"))
+        assert data["holdout"]["eval_steps"] == 10
+
+    def test_eval_steps_defaults_to_at_least_one(self, tmp_path: Path, monkeypatch) -> None:
+        config = self._config_with_eval(tmp_path, eval_steps=0)
+        config.max_steps = 2
+        _write_task_dataset(Path(config.dataset))
+
+        _, events, _ = self._run(tmp_path, monkeypatch, config)
+
+        assert events["sft_config"][0]["eval_steps"] == 1
+
+    def test_metadata_records_holdout_and_loss_history(self, tmp_path: Path, monkeypatch) -> None:
+        config = self._config_with_eval(tmp_path)
+        _write_task_dataset(Path(config.dataset))
+        log_history = [
+            {"loss": 2.0, "step": 1},
+            {"loss": 1.5, "step": 5},
+            {"eval_loss": 1.7, "step": 5},
+        ]
+
+        result, _, _ = self._run(tmp_path, monkeypatch, config, log_history=log_history)
+
+        data = json.loads(Path(result["metadata_path"]).read_text(encoding="utf-8"))
+        holdout = data["holdout"]
+        assert holdout["fraction"] == 0.2
+        assert holdout["seed"] == 7
+        assert holdout["eval_steps"] == 5
+        assert holdout["train_count"] == 8
+        assert holdout["holdout_count"] == 2
+        assert holdout["train_path"].endswith("train.train.jsonl")
+        assert holdout["holdout_path"].endswith("train.holdout.jsonl")
+        assert data["loss_history"] == [
+            {"step": 1, "train_loss": 2.0, "eval_loss": None},
+            {"step": 5, "train_loss": 1.5, "eval_loss": 1.7},
+        ]
+        assert data["final_train_loss"] == 1.5
+        assert data["final_eval_loss"] == 1.7
+        # the recorded dataset stays the ORIGINAL path, not the split train file
+        assert data["dataset"]["path"] == config.dataset
+
+    def test_loss_history_recorded_without_a_holdout(self, tmp_path: Path, monkeypatch) -> None:
+        """No ``[eval]`` section still records the training loss curve."""
+        config = _config(tmp_path, method="lora")
+        _write_task_dataset(Path(config.dataset))
+
+        result, _, _ = self._run(
+            tmp_path, monkeypatch, config, log_history=[{"loss": 0.5, "step": 1}]
+        )
+
+        data = json.loads(Path(result["metadata_path"]).read_text(encoding="utf-8"))
+        assert data["loss_history"] == [{"step": 1, "train_loss": 0.5, "eval_loss": None}]
+        assert data["final_train_loss"] == 0.5
+        assert "holdout" not in data
+
+    def test_chat_dataset_split_is_reproducible(self, tmp_path: Path, monkeypatch) -> None:
+        """A chat source splits too (rows are rendered to task rows by split_holdout)."""
+        config = self._config_with_eval(tmp_path)
+        Path(config.dataset).write_text(
+            "".join(
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": f"q-{i}"},
+                            {"role": "assistant", "content": f"a-{i}"},
+                        ]
+                    }
+                )
+                + "\n"
+                for i in range(10)
+            ),
+            encoding="utf-8",
+        )
+
+        result, _, from_list_calls = self._run(tmp_path, monkeypatch, config)
+
+        assert len(from_list_calls) == 2
+        data = json.loads(Path(result["metadata_path"]).read_text(encoding="utf-8"))
+        assert data["holdout"]["train_count"] == 8
+        assert data["holdout"]["holdout_count"] == 2
+
+    def test_hf_dataset_skips_split_with_diagnostic(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        """An ``hf:`` dataset has no local file to split — skip it, loudly."""
+        config = self._config_with_eval(tmp_path)
+        config.dataset = "hf:acme/demo:train"
+        config.dataset_map = {"task": "task", "input": "input", "expected_output": "output"}
+        monkeypatch.setattr(
+            _trainer,
+            "load_external_records",
+            lambda spec, mapping: [
+                {"task": "echo", "input": "a", "expected_output": "b"},
+            ],
+        )
+
+        result, events, from_list_calls = self._run(tmp_path, monkeypatch, config)
+
+        assert len(from_list_calls) == 1
+        assert "eval_dataset" not in events["trainer"][0]
+        captured = capsys.readouterr()
+        assert "holdout" in captured.err.lower()
+        data = json.loads(Path(result["metadata_path"]).read_text(encoding="utf-8"))
+        assert "holdout" not in data
+
+
+# ---------------------------------------------------------------------------
+# qodo PR #29 findings 3, 5, 6, 7
+# ---------------------------------------------------------------------------
+
+
+class TestPerplexityWeighting:
+    """The combined perplexity is token-weighted, never a mean of per-file values.
+
+    ``exp(total_nll / total_tokens)`` over every scored token is the only
+    aggregate that stays correct when suites differ in length; averaging the
+    per-file perplexities silently reweights the run by file count.
+    """
+
+    def test_run_perplexity_stats_returns_total_nll_and_token_count(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        suite = _write_task_suite(
+            tmp_path / "s.jsonl", [("reverse", "abc", "cba"), ("reverse", "de", "ed")]
+        )
+        tokenizer = _FakeTokenizer(pad_token="<pad>")
+        model = _FakeEvalModel(tokenizer, {})
+        model.forbid_generate = True
+        model.losses = [2.0, 2.0]
+        monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(no_grad=_NullContext))
+
+        nll, tokens = _trainer.run_perplexity_stats(model, tokenizer, suite)
+
+        assert tokens > 0
+        assert nll == pytest.approx(2.0 * tokens)
+
+    def test_run_perplexity_still_returns_a_float(self, tmp_path: Path, monkeypatch) -> None:
+        import math
+
+        suite = _write_task_suite(tmp_path / "s.jsonl", [("reverse", "abc", "cba")])
+        tokenizer = _FakeTokenizer(pad_token="<pad>")
+        model = _FakeEvalModel(tokenizer, {})
+        model.forbid_generate = True
+        model.losses = [2.0]
+        monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(no_grad=_NullContext))
+
+        value = _trainer.run_perplexity(model, tokenizer, suite)
+        assert isinstance(value, float)
+        assert value == pytest.approx(math.exp(2.0))
+
+    def test_file_entry_carries_the_nll_and_token_count(self) -> None:
+        stats = _trainer.PerplexityResult(7.389, nll_sum=20.0, tokens=10)
+        entry = _trainer.build_file_entry("s.jsonl", [], perplexity=stats)
+        assert entry["perplexity_nll"] == pytest.approx(20.0)
+        assert entry["perplexity_tokens"] == 10
+
+    def test_file_entry_accepts_explicit_keyword_stats(self) -> None:
+        entry = _trainer.build_file_entry(
+            "s.jsonl", [], perplexity=2.0, perplexity_nll=4.0, perplexity_tokens=8
+        )
+        assert entry["perplexity_nll"] == pytest.approx(4.0)
+        assert entry["perplexity_tokens"] == 8
+
+    def test_summary_weights_by_token_count(self) -> None:
+        import math
+
+        files = [
+            {
+                "total": 1,
+                "exact_match": 0,
+                "f1": 0.0,
+                "results": [],
+                "perplexity": math.exp(1.0),
+                "perplexity_nll": 1.0,
+                "perplexity_tokens": 1,
+            },
+            {
+                "total": 1,
+                "exact_match": 0,
+                "f1": 0.0,
+                "results": [],
+                "perplexity": math.exp(3.0),
+                "perplexity_nll": 99.0,
+                "perplexity_tokens": 33,
+            },
+        ]
+        summary = _trainer.build_summary(files, batch_size=1, base_load_in_4bit=None)
+
+        # Token-weighted: exp((1 + 99) / (1 + 33)) — NOT the mean of the two.
+        assert summary["perplexity"] == pytest.approx(round(math.exp(100 / 34), 4))
+        assert summary["perplexity"] != pytest.approx(round((math.exp(1.0) + math.exp(3.0)) / 2, 4))
+        assert summary["perplexity_tokens"] == 34
+
+    def test_summary_falls_back_to_the_mean_without_token_counts(self) -> None:
+        files = [
+            {"total": 1, "exact_match": 0, "f1": 0.0, "results": [], "perplexity": 2.0},
+            {"total": 1, "exact_match": 0, "f1": 0.0, "results": [], "perplexity": 4.0},
+        ]
+        summary = _trainer.build_summary(files, batch_size=1, base_load_in_4bit=None)
+        assert summary["perplexity"] == pytest.approx(3.0)
+
+    def test_run_eval_reports_a_token_weighted_aggregate(self, tmp_path: Path, monkeypatch) -> None:
+        import math
+
+        adapter = _adapter_with_config(tmp_path)
+        short = _write_task_suite(tmp_path / "short.jsonl", [("reverse", "abc", "cba")])
+        long = _write_task_suite(
+            tmp_path / "long.jsonl",
+            [("reverse", f"in{i} x y z", f"out{i} x y z") for i in range(4)],
+        )
+        _tokenizer, model = _eval_fakes(monkeypatch, {"abc": "cba"})
+        model.losses = [1.0] + [3.0] * 4
+
+        result = run_eval(str(adapter), suite_paths=[short, long], perplexity=True)
+
+        files = result["files"]
+        total_nll = sum(f["perplexity_nll"] for f in files)
+        total_tokens = sum(f["perplexity_tokens"] for f in files)
+        assert result["perplexity"] == pytest.approx(round(math.exp(total_nll / total_tokens), 4))
+        assert files[0]["perplexity"] == pytest.approx(math.exp(1.0))
+
+
+class TestMissingToolImports:
+    """A missing tool is an environment error with a hint — never a raw ImportError."""
+
+    def test_load_external_records_without_datasets_is_exit_2(self, monkeypatch) -> None:
+        monkeypatch.setitem(sys.modules, "datasets", None)  # None -> ImportError
+        with pytest.raises(CliError) as exc_info:
+            _trainer.load_external_records("hf:org/name:train", {"messages": "conversations"})
+        assert exc_info.value.code == 2
+        assert exc_info.value.remediation
+
+    def test_run_perplexity_without_torch_is_exit_2(self, tmp_path: Path, monkeypatch) -> None:
+        suite = _write_task_suite(tmp_path / "s.jsonl", [("reverse", "abc", "cba")])
+        monkeypatch.setitem(sys.modules, "torch", None)  # None -> ImportError
+        model, tokenizer = object(), _FakeTokenizer()
+        with pytest.raises(CliError) as exc_info:
+            _trainer.run_perplexity(model, tokenizer, suite)
+        assert exc_info.value.code == 2
+        assert exc_info.value.remediation
+
+
+def _write_schema_dataset(path: Path, record: dict) -> Path:
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    return path
+
+
+_EVAL_ONLY_RECORDS = {
+    "instruction": {
+        "instruction": "write a haiku",
+        "constraints": [{"type": "max_words", "value": 17}],
+    },
+    "structured": {
+        "task": "extract",
+        "input": "x",
+        "json_schema": {"type": "object"},
+    },
+    "toolcall": {
+        "task": "call",
+        "input": "weather in Paris",
+        "expected_tool_call": {"name": "get_weather", "arguments": {}},
+    },
+}
+
+
+class TestTrainingRejectsEvalOnlySchemas:
+    """Training accepts ``chat`` and ``task`` only — the eval-only suites are refused.
+
+    They were previously detected, then crashed inside ``_format_records`` (or
+    produced a nonsense holdout), so the refusal happens before any model load.
+    """
+
+    @pytest.mark.parametrize("schema", sorted(_EVAL_ONLY_RECORDS))
+    def test_detect_dataset_schema_refuses_eval_only_schema(
+        self, tmp_path: Path, schema: str
+    ) -> None:
+        dataset = _write_schema_dataset(tmp_path / "d.jsonl", _EVAL_ONLY_RECORDS[schema])
+        with pytest.raises(CliError) as exc_info:
+            _trainer._detect_dataset_schema(dataset)
+        assert exc_info.value.code == 1
+        assert schema in exc_info.value.message
+        assert "eval-only" in exc_info.value.remediation
+
+    def test_format_records_refuses_an_eval_only_schema(self) -> None:
+        records, tokenizer = [{"instruction": "x"}], _FakeTokenizer()
+        with pytest.raises(CliError) as exc_info:
+            _trainer._format_records(records, "instruction", tokenizer)
+        assert exc_info.value.code == 1
+        assert "eval-only" in exc_info.value.remediation
+
+    def test_training_refuses_before_loading_the_model(self, tmp_path: Path, monkeypatch) -> None:
+        config = _config(tmp_path)
+        _write_schema_dataset(Path(config.dataset), _EVAL_ONLY_RECORDS["toolcall"])
+        backend, events = _make_fake_backend()
+        monkeypatch.setattr(_trainer, "_load_backend", lambda: backend)
+        fake_module, _, _ = _fake_datasets_module()
+        monkeypatch.setitem(sys.modules, "datasets", fake_module)
+
+        with pytest.raises(CliError) as exc_info:
+            run_training(config, dry_run=False)
+        assert exc_info.value.code == 1
+        assert not events["from_pretrained"], "the model must not be loaded for a refused dataset"
+
+
+class TestDatasetMapColumnValidation:
+    """Every mapped source column must exist in the loaded hub dataset."""
+
+    def _fake_datasets(self, monkeypatch, rows: list[dict]) -> None:
+        module = type(
+            "FakeDatasetsModule", (), {"load_dataset": staticmethod(lambda *a, **k: rows)}
+        )
+        monkeypatch.setitem(sys.modules, "datasets", module)
+
+    def test_missing_chat_column_names_the_column_and_the_key(self, monkeypatch) -> None:
+        self._fake_datasets(monkeypatch, [{"dialogue": [{"role": "user", "content": "hi"}]}])
+        with pytest.raises(CliError) as exc_info:
+            _trainer.load_external_records("hf:org/name:train", {"messages": "conversations"})
+        assert exc_info.value.code == 1
+        assert "conversations" in exc_info.value.message
+        assert "messages" in exc_info.value.message
+        assert "[run.dataset_map]" in exc_info.value.remediation
+
+    def test_missing_task_column_names_the_column(self, monkeypatch) -> None:
+        self._fake_datasets(monkeypatch, [{"instruction": "x", "context": "y"}])
+        with pytest.raises(CliError) as exc_info:
+            _trainer.load_external_records(
+                "hf:org/name:train",
+                {"task": "instruction", "input": "context", "expected_output": "response"},
+            )
+        assert exc_info.value.code == 1
+        assert "response" in exc_info.value.message
+
+    def test_column_names_attribute_is_used_when_present(self, monkeypatch) -> None:
+        class _FakeHubDataset(list):
+            column_names = ["conversations"]
+
+        self._fake_datasets(
+            monkeypatch,
+            _FakeHubDataset([{"conversations": [{"role": "user", "content": "hi"}]}]),
+        )
+        records = _trainer.load_external_records("hf:org/name:train", {"messages": "conversations"})
+        assert records == [{"messages": [{"role": "user", "content": "hi"}]}]
+
+    def test_render_hf_row_refuses_a_missing_column(self) -> None:
+        with pytest.raises(CliError) as exc_info:
+            _trainer._render_hf_row({"dialogue": []}, {"messages": "conversations"}, "chat")
+        assert exc_info.value.code == 1
+
+
+class TestPartialDatasetMapIsRefused:
+    """A partial/mixed ``[run.dataset_map]`` never reaches ``_render_hf_row``."""
+
+    def test_partial_task_map_is_a_user_error(self) -> None:
+        with pytest.raises(CliError) as exc_info:
+            _trainer.infer_hf_dataset_schema({"task": "instruction", "input": "context"})
+        assert exc_info.value.code == 1
+        assert "expected_output" in exc_info.value.message
+
+    def test_mixed_map_is_a_user_error(self) -> None:
+        with pytest.raises(CliError) as exc_info:
+            _trainer.infer_hf_dataset_schema(
+                {
+                    "messages": "conversations",
+                    "task": "instruction",
+                    "input": "context",
+                    "expected_output": "response",
+                }
+            )
+        assert exc_info.value.code == 1
+
+    def test_complete_task_map_infers_the_task_schema(self) -> None:
+        assert (
+            _trainer.infer_hf_dataset_schema(
+                {"task": "instruction", "input": "context", "expected_output": "response"}
+            )
+            == "task"
+        )

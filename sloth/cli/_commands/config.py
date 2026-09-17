@@ -5,6 +5,13 @@ output, method) and a ``[hyperparameters]`` section populated with the
 documented defaults from :mod:`sloth.tune.config`.  The generated file always
 passes :func:`~sloth.tune.config.load_config` validation.
 
+The template also documents (as commented-out TOML) the optional ``[eval]``
+section and its nested ``[eval.thresholds]`` baseline — both sections are
+left commented so a freshly generated config keeps ``eval``/``thresholds``
+unset (``None``), matching the same "absent means off" default that
+:func:`~sloth.tune.config.load_config` applies to a config that omits
+``[eval]`` entirely.
+
 Usage::
 
     sloth config init --model unsloth/Qwen3-4B --dataset data/train.jsonl \\
@@ -30,7 +37,14 @@ from sloth.cli._errors import EXIT_USER_ERROR, CliError
 from sloth.cli._output import emit_diagnostic, emit_result
 from sloth.tune.config import (
     DEFAULT_BATCH_SIZE,
+    DEFAULT_COMPLIANCE_MIN_PCT,
+    DEFAULT_EVAL_HOLDOUT_FRACTION,
+    DEFAULT_EVAL_PERPLEXITY,
+    DEFAULT_EVAL_SEED,
+    DEFAULT_EVAL_STEPS,
+    DEFAULT_EVAL_TOOL_CALL_FAMILY,
     DEFAULT_GRAD_ACCUM,
+    DEFAULT_LATENCY_MAX_RATIO,
     DEFAULT_LEARNING_RATE,
     DEFAULT_LOAD_IN_4BIT,
     DEFAULT_LORA_ALPHA,
@@ -39,6 +53,8 @@ from sloth.tune.config import (
     DEFAULT_MAX_SEQ_LEN,
     DEFAULT_MAX_STEPS,
     DEFAULT_METHOD,
+    DEFAULT_MIN_SUITE_ROWS,
+    DEFAULT_REGRESSION_DROP_PP,
     DEFAULT_SEED,
     load_config,
 )
@@ -116,6 +132,17 @@ def cmd_config_init(args: argparse.Namespace) -> int | None:
         f"dataset = {_toml_str(dataset)}",
         f"output  = {_toml_str(output)}",
         "",
+        "# dataset may also name a Hugging Face Hub dataset instead of a local",
+        '# JSONL file: dataset = "hf:<org>/<name>[:split]" (split defaults to',
+        '# "train"). [run.dataset_map] then maps its hub columns onto the chat',
+        "# or task schema — uncomment and edit ONE of the two shapes below.",
+        "# [run.dataset_map]",
+        '# messages = "conversations"          # chat schema',
+        "# -- or, for the task schema --",
+        '# task             = "instruction"',
+        '# input            = "context"',
+        '# expected_output  = "response"',
+        "",
         "[hyperparameters]",
         f"lora_r         = {DEFAULT_LORA_R}",
         f"lora_alpha     = {DEFAULT_LORA_ALPHA}",
@@ -127,6 +154,23 @@ def cmd_config_init(args: argparse.Namespace) -> int | None:
         f"max_steps      = {DEFAULT_MAX_STEPS}",
         f"seed           = {DEFAULT_SEED}",
         f"load_in_4bit   = {str(DEFAULT_LOAD_IN_4BIT).lower()}",
+        "",
+        "# [eval] is optional — omit it entirely to leave eval/thresholds unset",
+        "# (matches the defaults below). Uncomment and edit to enable a",
+        "# held-out eval split, periodic in-training eval, or perplexity.",
+        "# [eval]",
+        f"# holdout_fraction  = {DEFAULT_EVAL_HOLDOUT_FRACTION}",
+        f"# seed              = {DEFAULT_EVAL_SEED}",
+        f"# eval_steps        = {DEFAULT_EVAL_STEPS}   # 0 = disabled",
+        f"# perplexity        = {str(DEFAULT_EVAL_PERPLEXITY).lower()}",
+        f'# tool_call_family  = "{DEFAULT_EVAL_TOOL_CALL_FAMILY}"   # "" = auto-detect',
+        "#",
+        "# [eval.thresholds] — the c36 baseline `sloth compare` applies when",
+        "# no override is given; only meaningful once [eval] is uncommented.",
+        f"# regression_drop_pp = {DEFAULT_REGRESSION_DROP_PP}",
+        f"# compliance_min_pct = {DEFAULT_COMPLIANCE_MIN_PCT}",
+        f"# latency_max_ratio  = {DEFAULT_LATENCY_MAX_RATIO}",
+        f"# min_suite_rows     = {DEFAULT_MIN_SUITE_ROWS}",
     ]
     toml_text = "\n".join(toml_lines) + "\n"
 

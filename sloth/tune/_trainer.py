@@ -34,15 +34,25 @@ GPU.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import math
+import re
+import statistics
+import tempfile
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
 from sloth.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 from sloth.cli._output import emit_diagnostic
-from sloth.tune import metrics
-from sloth.tune.config import RunConfig
-from sloth.tune.datasets import detect_schema, validate_dataset
+from sloth.tune import metrics, scorers
+from sloth.tune.config import RunConfig, validate_dataset_map
+from sloth.tune.datasets import (
+    detect_schema,
+    render_chat_prompt,
+    split_holdout,
+    validate_dataset,
+)
 from sloth.tune.metadata import write_metadata
 from sloth.tune.presets import resolve_target_modules
 from sloth.tune.scope import check_scope
@@ -178,20 +188,230 @@ def _load_backend() -> _Backend:
 
 
 # ---------------------------------------------------------------------------
+# External (hf:) dataset loading (t11 / c34) — the `datasets` import here is
+# lazy, same seam discipline as `_load_backend`; sloth/tune/datasets.py stays
+# stdlib-only and untouched, since rendered rows are validated by writing them
+# to a temp JSONL and re-using its `validate_dataset`.
+# ---------------------------------------------------------------------------
+
+#: Prefix marking a ``RunConfig.dataset`` value as a Hugging Face Hub dataset id
+#: rather than a local JSONL path, e.g. ``"hf:my-org/my-dataset:train"``.
+HF_DATASET_PREFIX = "hf:"
+
+#: Split used when a ``hf:<org>/<name>`` spec omits an explicit ``:<split>``.
+DEFAULT_HF_SPLIT = "train"
+
+
+def is_hf_dataset_spec(dataset: str) -> bool:
+    """True when *dataset* names a Hugging Face Hub dataset (``"hf:..."``)."""
+    return isinstance(dataset, str) and dataset.startswith(HF_DATASET_PREFIX)
+
+
+def parse_hf_dataset_spec(spec: str) -> tuple[str, str]:
+    """Return ``(dataset_id, split)`` parsed from ``"hf:<org>/<name>[:split]"``.
+
+    ``split`` defaults to :data:`DEFAULT_HF_SPLIT` when omitted. Raises
+    ``CliError(code=1)`` if *spec* has no dataset id after the prefix.
+    """
+    body = spec[len(HF_DATASET_PREFIX) :]
+    dataset_id, _, split = body.partition(":")
+    if not dataset_id:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"invalid hf dataset spec: {spec!r}",
+            remediation=(
+                'Use the form "hf:<org>/<name>" or "hf:<org>/<name>:<split>", '
+                'e.g. "hf:my-org/my-dataset:train".'
+            ),
+        )
+    return dataset_id, split or DEFAULT_HF_SPLIT
+
+
+_DATASET_MAP_REQUIRED_HINT = (
+    "hf: datasets need a [run.dataset_map] table naming the hub columns: "
+    '`messages = "<col>"` for the chat schema, or `task`/`input`/'
+    '`expected_output` = "<col>" for the task schema.'
+)
+
+
+def infer_hf_dataset_schema(dataset_map: "dict[str, str] | None") -> str:
+    """Return ``"chat"`` or ``"task"`` inferred from *dataset_map*'s keys.
+
+    The mapping must describe **one** schema completely — ``messages`` for chat,
+    or all three of ``task``/``input``/``expected_output`` for task. A partial
+    task map used to infer ``"task"`` here and then crash in
+    :func:`_render_hf_row`, which indexes all three columns; an absent, empty,
+    partial, or mixed map is now ``CliError(code=1)`` naming the missing keys.
+
+    This is the *defensive* half of the check — :mod:`sloth.tune.config` runs
+    the same validator at config-load time, but a ``dataset_map`` can also be
+    built from CLI flags, so the trainer never trusts it unchecked.
+    """
+    return validate_dataset_map(dataset_map, remediation=_DATASET_MAP_REQUIRED_HINT)
+
+
+#: The schema fields each mapping must resolve to a source column.
+_SCHEMA_FIELDS: dict[str, tuple[str, ...]] = {
+    "chat": ("messages",),
+    "task": ("task", "input", "expected_output"),
+}
+
+
+def _mapped_columns(dataset_map: "dict[str, str] | None", schema: str) -> dict[str, str]:
+    """Return ``{schema field: source column}`` for *schema*.
+
+    An unmapped field falls back to a column of its own name.
+    """
+    mapping = dataset_map or {}
+    return {name: mapping.get(name, name) for name in _SCHEMA_FIELDS[schema]}
+
+
+def _missing_column_error(name: str, column: str, available: Sequence[str]) -> CliError:
+    """Return the ``CliError`` for a mapped column that the hub dataset does not have."""
+    return CliError(
+        code=EXIT_USER_ERROR,
+        message=(
+            f"column {column!r} (mapped from the [run.dataset_map] key {name!r}) "
+            f"is not a column of the loaded dataset"
+        ),
+        remediation=(
+            f"Point the [run.dataset_map] key '{name}' at one of the dataset's actual "
+            f"columns: {sorted(available)}."
+        ),
+    )
+
+
+def _check_dataset_columns(
+    hub_dataset: Any, dataset_map: "dict[str, str] | None", schema: str
+) -> None:
+    """Verify every mapped source column exists in *hub_dataset* before rendering.
+
+    A typo in ``[run.dataset_map]`` otherwise surfaced as a bare ``KeyError`` on
+    the first row — after the dataset had already been downloaded. The column
+    list comes from ``column_names`` when the object exposes one (a real
+    ``datasets.Dataset``) and from the first row's keys otherwise; when neither
+    is available the check is skipped rather than guessed at.
+    """
+    columns = getattr(hub_dataset, "column_names", None)
+    if columns is None:
+        first = next(iter(hub_dataset), None)
+        columns = list(first.keys()) if isinstance(first, dict) else None
+    if columns is None:
+        return
+    for name, column in _mapped_columns(dataset_map, schema).items():
+        if column not in columns:
+            raise _missing_column_error(name, column, columns)
+
+
+def _render_hf_row(row: dict, dataset_map: "dict[str, str]", schema: str) -> dict:
+    """Render one hub *row* into a chat/task-schema dict via *dataset_map*.
+
+    A mapped column the row does not carry raises ``CliError(code=1)`` naming it
+    (rows are normally pre-checked by :func:`_check_dataset_columns`; this keeps
+    a direct caller, or a ragged row, off the raw-``KeyError`` path).
+    """
+    rendered: dict[str, Any] = {}
+    for name, column in _mapped_columns(dataset_map, schema).items():
+        if column not in row:
+            raise _missing_column_error(name, column, list(row))
+        rendered[name] = row[column]
+    return rendered
+
+
+def load_external_records(
+    spec: str,
+    dataset_map: "dict[str, str] | None",
+    limit: int | None = None,
+) -> list[dict]:
+    """Load, render, and validate rows from an ``hf:`` dataset spec.
+
+    Parameters
+    ----------
+    spec:
+        A ``"hf:<org>/<name>[:split]"`` string (see :func:`parse_hf_dataset_spec`).
+    dataset_map:
+        The ``[run.dataset_map]`` column mapping (see
+        :func:`infer_hf_dataset_schema`); required to resolve a schema.
+    limit:
+        When given, only the first *limit* rows of the split are loaded
+        (``datasets.load_dataset``'s slicing syntax, e.g. ``"train[:50]"``) —
+        used by ``sloth validate`` to check a sample without pulling the whole
+        dataset.
+
+    Returns
+    -------
+    list[dict]
+        The rendered rows, validated by :func:`sloth.tune.datasets.validate_dataset`
+        against the inferred schema (rendered to a temp JSONL file so
+        ``datasets.py`` itself never needs to know about hub datasets).
+
+    Raises
+    ------
+    CliError(code=1)
+        Invalid *spec*, a schema that cannot be inferred from *dataset_map*, or
+        a mapped column the loaded dataset does not have.
+    CliError(code=2)
+        The ``datasets`` library is not installed (``sloth train`` runs inside
+        the container where it always is; elsewhere this is the install hint).
+    """
+    dataset_id, split = parse_hf_dataset_spec(spec)
+    schema = infer_hf_dataset_schema(dataset_map)
+    resolved_map: dict[str, str] = dict(dataset_map or {})
+
+    # Lazy-imported so importing this module (or calling it without the
+    # `datasets` library present) never requires the ML stack at import time.
+    try:
+        from datasets import load_dataset  # noqa: PLC0415 — intentional lazy import
+    except ImportError as exc:
+        raise CliError(
+            code=EXIT_ENV_ERROR,
+            message=f"the `datasets` library is not installed: {exc}",
+            remediation=_INSTALL_HINT,
+        ) from exc
+
+    load_split = f"{split}[:{limit}]" if limit is not None else split
+    # No revision pin: `hf:<org>/<name>[:split]` intentionally has no revision
+    # segment (see parse_hf_dataset_spec) — the run-config surface for pinning
+    # one is future work; `training_metadata.json` records whatever revision
+    # the caller supplies (default "main") for reproducibility after the fact.
+    hub_dataset = load_dataset(dataset_id, split=load_split)  # nosec B615
+
+    # Check the mapping against the dataset's real columns BEFORE rendering, so a
+    # mistyped [run.dataset_map] value is a named user error, not a KeyError.
+    _check_dataset_columns(hub_dataset, resolved_map, schema)
+    rendered = [_render_hf_row(dict(row), resolved_map, schema) for row in hub_dataset]
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".jsonl", delete=False, encoding="utf-8"
+    ) as tmp:
+        for record in rendered:
+            tmp.write(json.dumps(record) + "\n")
+        tmp_path = Path(tmp.name)
+    try:
+        return validate_dataset(tmp_path, schema=schema)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # Dataset loading for the real path (pure — no torch)
 # ---------------------------------------------------------------------------
 
 
-def _detect_dataset_schema(path: Path) -> str:
-    """Sniff the schema (``"chat"``/``"task"``) from the first record of *path*."""
+def _first_json_record(path: Path) -> dict | None:
+    """Return the first non-blank JSON record of *path* (``None`` for an empty file).
+
+    Shared by the training-side schema sniff (:func:`_detect_dataset_schema`) and
+    the eval-side one (:func:`_detect_suite_schema`) so both surface the identical
+    ``CliError`` for an unopenable file or a non-JSON first line.
+    """
     try:
         with path.open(encoding="utf-8") as fh:
-            first_record = None
             for line in fh:
                 stripped = line.strip()
                 if stripped:
-                    first_record = json.loads(stripped)
-                    break
+                    return json.loads(stripped)
+            return None
     except OSError as exc:
         raise CliError(
             code=EXIT_ENV_ERROR,
@@ -205,6 +425,42 @@ def _detect_dataset_schema(path: Path) -> str:
             remediation="Each line of the dataset must be a JSON object.",
         ) from exc
 
+
+#: The only schemas a *training* dataset may use. ``instruction``/``structured``/
+#: ``toolcall`` are **eval-only** suite schemas: they carry a judgement target
+#: (constraints, a JSON schema, an expected tool call), not a target completion,
+#: so there is nothing for SFT to learn to emit — and the training-time eval's
+#: holdout split (which writes task-schema rows on both sides) cannot represent
+#: them either.
+TRAINING_SCHEMAS: frozenset[str] = frozenset({"chat", "task"})
+
+_EVAL_ONLY_SCHEMA_HINT = (
+    "This is an eval-only suite schema; train on chat or task rows. Chat rows are "
+    '{"messages": [...]}; task rows are {"task", "input", "expected_output"}. The '
+    "same restriction applies to the [eval] holdout split, which renders task-schema "
+    "rows on both sides. Use this file with `sloth eval --suite` instead."
+)
+
+
+def _require_training_schema(schema: str, source: Any) -> str:
+    """Return *schema* when a training dataset may use it, else ``CliError(code=1)``."""
+    if schema not in TRAINING_SCHEMAS:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=(f"dataset {source} uses the {schema!r} schema, which cannot be trained on"),
+            remediation=_EVAL_ONLY_SCHEMA_HINT,
+        )
+    return schema
+
+
+def _detect_dataset_schema(path: Path) -> str:
+    """Sniff the schema (``"chat"``/``"task"``) from the first record of *path*.
+
+    An eval-only schema (``instruction``/``structured``/``toolcall``) is refused
+    here — before any model load — rather than being accepted and then crashing
+    inside :func:`_format_records`.
+    """
+    first_record = _first_json_record(path)
     schema = detect_schema(first_record) if first_record is not None else None
     if schema is None:
         raise CliError(
@@ -215,7 +471,7 @@ def _detect_dataset_schema(path: Path) -> str:
                 '({"task", "input", "expected_output"}).'
             ),
         )
-    return schema
+    return _require_training_schema(schema, path)
 
 
 def _format_records(records: list[dict], schema: str, tokenizer: Any) -> list[dict]:
@@ -226,7 +482,12 @@ def _format_records(records: list[dict], schema: str, tokenizer: Any) -> list[di
     the tokenizer's EOS so the model learns to stop. Pre-rendering an explicit
     ``text`` column avoids trl/unsloth conversational auto-detection, which would
     otherwise raise ``"Unsloth: You must specify a `formatting_func`"``.
+
+    Only :data:`TRAINING_SCHEMAS` are renderable; an eval-only schema raises
+    ``CliError(code=1)`` (it would otherwise be treated as ``task`` and die on a
+    ``KeyError``).
     """
+    _require_training_schema(schema, "records")
     if schema == "chat":
         return [
             {"text": tokenizer.apply_chat_template(record["messages"], tokenize=False)}
@@ -244,6 +505,20 @@ def _format_records(records: list[dict], schema: str, tokenizer: Any) -> list[di
     ]
 
 
+def _resolve_eval_steps(config: RunConfig, configured: int) -> int:
+    """Return the effective ``eval_steps`` for a training-time eval.
+
+    ``0`` means "unset" in the ``[eval]`` section, so fall back to a quarter of
+    the run's ``max_steps`` (at least 1) — roughly four eval points across the
+    run, which is informative without dominating the step budget. The resolved
+    value is what both ``SFTConfig`` and ``training_metadata.json`` record, so
+    the default is never left implicit.
+    """
+    if configured > 0:
+        return configured
+    return max(1, config.max_steps // 4)
+
+
 # ---------------------------------------------------------------------------
 # Real training path (uses the lazily-loaded backend; not GPU-tested in CI)
 # ---------------------------------------------------------------------------
@@ -255,10 +530,53 @@ def _run_real(config: RunConfig, plan: dict[str, Any], backend: _Backend) -> dic
 
     # Validate + load the dataset BEFORE the expensive model load, so a schema or
     # empty-dataset failure surfaces a CliError without spending any GPU/model-load
-    # time ("validate before spending GPU").
-    dataset_path = Path(config.dataset)
-    schema = _detect_dataset_schema(dataset_path)
-    train_records = validate_dataset(dataset_path, schema=schema)
+    # time ("validate before spending GPU"). An `hf:` dataset is loaded via the
+    # mounted HF cache and rendered through [run.dataset_map] instead of being
+    # read as a local JSONL path.
+    eval_config = config.eval
+    wants_holdout = eval_config is not None and eval_config.holdout_fraction > 0
+    eval_records: list[dict] | None = None
+    holdout_record: dict[str, Any] | None = None
+
+    if is_hf_dataset_spec(config.dataset):
+        schema = infer_hf_dataset_schema(config.dataset_map)
+        train_records = load_external_records(config.dataset, config.dataset_map)
+        if wants_holdout:
+            # An ``hf:`` dataset is materialised in memory, not as a local JSONL
+            # file, and ``split_holdout`` splits a *file*. Rather than round-trip
+            # the rendered rows through a temp file, skip the split and say so —
+            # the run still trains, it just has no training-time eval curve.
+            emit_diagnostic(
+                "note: skipping the [eval] holdout split — an hf: dataset has no local "
+                "file to split; training proceeds without a training-time eval set."
+            )
+            wants_holdout = False
+    else:
+        dataset_path = Path(config.dataset)
+        if wants_holdout:
+            # Split BEFORE the model load so a split failure costs no GPU time.
+            # split_holdout writes task-schema rows on both sides (chat rows are
+            # rendered down), so the split outputs always read back as "task".
+            split = split_holdout(
+                dataset_path,
+                eval_config.holdout_fraction,
+                eval_config.seed,
+            )
+            schema = "task"
+            train_records = validate_dataset(Path(split["train_path"]), schema=schema)
+            eval_records = validate_dataset(Path(split["holdout_path"]), schema=schema)
+            holdout_record = {
+                "fraction": eval_config.holdout_fraction,
+                "seed": eval_config.seed,
+                "train_path": str(split["train_path"]),
+                "holdout_path": str(split["holdout_path"]),
+                "train_count": split["train_count"],
+                "holdout_count": split["holdout_count"],
+                "eval_steps": _resolve_eval_steps(config, eval_config.eval_steps),
+            }
+        else:
+            schema = _detect_dataset_schema(dataset_path)
+            train_records = validate_dataset(dataset_path, schema=schema)
 
     # Lazy-imported here (not at module top) so the module stays importable without
     # ``datasets`` installed and tests can inject a fake via sys.modules.
@@ -290,15 +608,23 @@ def _run_real(config: RunConfig, plan: dict[str, Any], backend: _Backend) -> dic
         # on it).
         train_dataset = Dataset.from_list(_format_records(train_records, schema, tokenizer))
 
-        sft_config = backend.sft_config(
-            output_dir=config.output,
-            per_device_train_batch_size=config.batch_size,
-            gradient_accumulation_steps=config.grad_accum,
-            learning_rate=config.learning_rate,
-            max_steps=config.max_steps,
-            seed=config.seed,
-            dataset_text_field="text",
-        )
+        sft_kwargs: dict[str, Any] = {
+            "output_dir": config.output,
+            "per_device_train_batch_size": config.batch_size,
+            "gradient_accumulation_steps": config.grad_accum,
+            "learning_rate": config.learning_rate,
+            "max_steps": config.max_steps,
+            "seed": config.seed,
+            "dataset_text_field": "text",
+        }
+        trainer_kwargs: dict[str, Any] = {}
+        if holdout_record is not None and eval_records is not None:
+            sft_kwargs["eval_strategy"] = "steps"
+            sft_kwargs["eval_steps"] = holdout_record["eval_steps"]
+            trainer_kwargs["eval_dataset"] = Dataset.from_list(
+                _format_records(eval_records, schema, tokenizer)
+            )
+        sft_config = backend.sft_config(**sft_kwargs)
         # trl >= 0.12 renamed the ``tokenizer`` kwarg to ``processing_class``;
         # trl 0.24 (the pinned in-container version) removed ``tokenizer`` entirely.
         trainer = backend.sft_trainer(
@@ -306,8 +632,13 @@ def _run_real(config: RunConfig, plan: dict[str, Any], backend: _Backend) -> dic
             processing_class=tokenizer,
             train_dataset=train_dataset,
             args=sft_config,
+            **trainer_kwargs,
         )
         trainer.train()
+        # Read the loss curve from trainer.state, NOT from train()'s TrainOutput:
+        # TrainOutput carries only the final training loss, while state.log_history
+        # holds every logged train AND eval entry.
+        log_history = list(getattr(getattr(trainer, "state", None), "log_history", []) or [])
     except NotImplementedError as exc:
         # Unsloth raises NotImplementedError (message: "cannot find any torch
         # accelerator") when no GPU is available. Map it to a user-actionable
@@ -328,8 +659,10 @@ def _run_real(config: RunConfig, plan: dict[str, Any], backend: _Backend) -> dic
         output_dir,
         model=config.model,
         method=config.method,
-        dataset_path=Path(config.dataset),
+        dataset_path=config.dataset,
         hyperparameters=plan["hyperparameters"],
+        log_history=log_history,
+        holdout=holdout_record,
     )
 
     result = dict(plan)
@@ -444,6 +777,54 @@ def _padded_prompt_width(inputs: Any, row: int) -> int:
     return pad_len + real_len
 
 
+@dataclass
+class GenerationRun:
+    """One generation pass: the predictions plus what the pass *cost*.
+
+    ``generated_tokens[i]`` is how many new tokens row *i* produced (the decoded
+    continuation's token count: the generated row length minus the padded prompt
+    width — see :func:`_padded_prompt_width`). ``latency_ms[i]`` is that row's
+    share of its batch's wall time — ``time.perf_counter`` measured strictly
+    around ``model.generate`` and divided by the number of rows in the batch, so
+    a batch of eight rows taking 800 ms attributes 100 ms to each. Summing
+    ``latency_ms`` over any subset of rows therefore reconstructs the wall time
+    those rows cost, which is what makes the per-file ``tokens_per_s`` rollup in
+    :func:`timing_summary` exact even when one flat generation pass is split
+    back across several suite files.
+
+    ``generate_seconds`` is the total wall time spent inside ``generate`` across
+    every batch of this pass (model load and tokenisation are deliberately
+    excluded — this measures generation, not setup).
+    """
+
+    predictions: list[str] = field(default_factory=list)
+    generated_tokens: list[int] = field(default_factory=list)
+    latency_ms: list[float] = field(default_factory=list)
+    generate_seconds: float = 0.0
+
+    def extend(self, other: "GenerationRun") -> "GenerationRun":
+        """Append *other*'s rows onto this run (used to concatenate batches)."""
+        self.predictions.extend(other.predictions)
+        self.generated_tokens.extend(other.generated_tokens)
+        self.latency_ms.extend(other.latency_ms)
+        self.generate_seconds += other.generate_seconds
+        return self
+
+
+def _sequence_length(sequence: Any) -> int:
+    """Return the token count of a 1-D sequence (tensor row, list, or string)."""
+    shape = getattr(sequence, "shape", None)
+    if shape is not None:
+        try:
+            return int(shape[-1])
+        except (IndexError, TypeError):
+            pass
+    try:
+        return len(sequence)
+    except TypeError:
+        return 0
+
+
 def _generate_predictions(
     torch_mod: Any,
     model: Any,
@@ -453,7 +834,7 @@ def _generate_predictions(
     batch_size: int,
     max_new_tokens: int,
     device: Any,
-) -> list[str]:
+) -> GenerationRun:
     """Generate one continuation per prompt, in batches of *batch_size*.
 
     Batched generation pads with ``padding_side="left"`` so every row's
@@ -463,34 +844,583 @@ def _generate_predictions(
     (no pad and no EOS token) or the caller asked for ``batch_size <= 1``, this
     degrades to the historical one-prompt-at-a-time path, which needs no padding
     at all.
+
+    Returns a :class:`GenerationRun` — the predictions plus the per-row generated
+    token counts and latencies measured with ``time.perf_counter`` around the
+    ``generate`` call itself (nothing else is inside the timed region).
     """
     effective = _resolve_eval_batch_size(tokenizer, batch_size)
-    predictions: list[str] = []
+    run = GenerationRun()
 
     if effective == 1:
         for prompt in prompts:
             inputs = tokenizer(prompt, return_tensors="pt").to(device)
+            started = time.perf_counter()
             with torch_mod.no_grad():
                 outputs = model.generate(**inputs, max_new_tokens=max_new_tokens)
+            elapsed = time.perf_counter() - started
             start = _padded_prompt_width(inputs, 0)
-            predictions.append(tokenizer.decode(outputs[0][start:], skip_special_tokens=True))
-        return predictions
+            run.predictions.append(tokenizer.decode(outputs[0][start:], skip_special_tokens=True))
+            run.generated_tokens.append(max(_sequence_length(outputs[0]) - start, 0))
+            run.latency_ms.append(elapsed * 1000.0)
+            run.generate_seconds += elapsed
+        return run
 
     tokenizer.padding_side = "left"
     for offset in range(0, len(prompts), effective):
         chunk = list(prompts[offset : offset + effective])
         inputs = tokenizer(chunk, return_tensors="pt", padding=True).to(device)
+        started = time.perf_counter()
         with torch_mod.no_grad():
             outputs = model.generate(**inputs, max_new_tokens=max_new_tokens)
+        elapsed = time.perf_counter() - started
+        # A batch is one wall-clock event; each row is billed its equal share.
+        per_row_ms = elapsed * 1000.0 / len(chunk) if chunk else 0.0
+        run.generate_seconds += elapsed
         for row in range(len(chunk)):
             start = _padded_prompt_width(inputs, row)
-            predictions.append(tokenizer.decode(outputs[row][start:], skip_special_tokens=True))
-    return predictions
+            run.predictions.append(tokenizer.decode(outputs[row][start:], skip_special_tokens=True))
+            run.generated_tokens.append(max(_sequence_length(outputs[row]) - start, 0))
+            run.latency_ms.append(per_row_ms)
+    return run
 
 
-def eval_prompt(record: dict[str, Any]) -> str:
-    """Render one task-schema record into the shared eval prompt shape."""
+def timing_summary(rows: Sequence[dict[str, Any]]) -> dict[str, float]:
+    """Return ``{median_latency_ms, tokens_per_s}`` over scored *rows*.
+
+    ``median_latency_ms`` is the median of the per-row ``latency_ms`` (the
+    median, not the mean, because one slow row — a cold first batch — should not
+    move the number readers compare across runs). ``tokens_per_s`` is
+    ``sum(generated_tokens) / total generate wall time``, where the wall time is
+    the sum of the rows' ``latency_ms``: since each row carries its equal share
+    of its batch's wall time, that sum is exactly the time those rows cost.
+    """
+    latencies = [float(r["latency_ms"]) for r in rows if "latency_ms" in r]
+    tokens = [int(r["generated_tokens"]) for r in rows if "generated_tokens" in r]
+    seconds = sum(latencies) / 1000.0
+    return {
+        "median_latency_ms": round(statistics.median(latencies), 4) if latencies else 0.0,
+        "tokens_per_s": round(sum(tokens) / seconds, 4) if seconds > 0 else 0.0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Suite schema resolution + per-schema scoring (pure stdlib)
+# ---------------------------------------------------------------------------
+
+#: Per-row boolean key each non-``task`` suite schema contributes, and the source
+#: of the suite-level ``compliance_pct``.
+COMPLIANCE_KEYS: dict[str, str] = {
+    "instruction": "constraints_passed",
+    "structured": "json_valid",
+    "toolcall": "tool_call_matched",
+}
+
+
+def detect_suite_schema(record: dict[str, Any]) -> str:
+    """Return the eval-suite schema of a single *record*.
+
+    Delegates to :func:`sloth.tune.datasets.detect_schema`, the single five-way
+    detector (deviation d1); a record that matches nothing falls back to
+    ``"task"``, so ``validate_dataset`` — not this sniff — produces the error
+    message.
+    """
+    return detect_schema(record) or "task"
+
+
+def _detect_suite_schema(path: Path) -> str:
+    """Sniff the suite schema of the JSONL file at *path* from its first record."""
+    record = _first_json_record(path)
+    return detect_suite_schema(record) if record is not None else "task"
+
+
+def _scorable_row(record: dict[str, Any], schema: str) -> dict[str, Any]:
+    """Return *record* with the ``task``/``input``/``expected_output`` trio filled in.
+
+    :func:`sloth.tune.metrics.score_records` scores a task-shaped row, so every
+    schema is normalised to one. The original keys are **kept** on the row (the
+    scorer's ``extra_metrics`` callback needs ``constraints`` / ``json_schema`` /
+    ``expected_tool_call``); ``score_records`` copies only the task trio into the
+    result entry, so nothing leaks into the output.
+
+    ``structured`` and ``toolcall`` suites carry no reference *text*, so their
+    ``expected_output`` is ``""`` and their ``exact_match``/``f1`` are not
+    meaningful — ``compliance_pct`` is the metric for those suites.
+    """
+    row = dict(record)
+    if schema == "chat":
+        messages = list(record.get("messages") or [])
+        last = next(reversed(messages), None)
+        if last is not None and last.get("role") == "assistant":
+            expected = last["content"]
+            prompt_messages = messages[:-1]
+        else:
+            expected = ""
+            prompt_messages = messages
+        row.update(
+            {
+                "task": "chat",
+                "input": render_chat_prompt(prompt_messages),
+                "expected_output": expected,
+            }
+        )
+        return row
+    row.setdefault("task", schema)
+    row.setdefault("input", "")
+    row.setdefault("expected_output", "")
+    return row
+
+
+def _constraint_dicts(record: dict[str, Any]) -> list[dict[str, Any]]:
+    """Convert a dataset row's ``constraints`` into :mod:`sloth.tune.scorers` shape.
+
+    The dataset schema spells a constraint as a single-key object
+    (``{"max_words": 12}``); the scorer takes ``{"kind": ..., "value": ...}``.
+    The two flag kinds (``must_refuse``, ``json_only``) carry no value and are
+    dropped entirely when set to ``false``, so "not required" never scores as a
+    failure.
+    """
+    converted: list[dict[str, Any]] = []
+    for constraint in record.get("constraints") or []:
+        for kind, value in constraint.items():
+            if kind in ("must_refuse", "json_only"):
+                if value:
+                    converted.append({"kind": kind})
+            else:
+                converted.append({"kind": kind, "value": value})
+    return converted
+
+
+def _resolve_tool_call_family(model_id: str | None, override: str | None) -> str:
+    """Resolve the tool-call family, turning the scorer's ValueError into a CliError."""
+    try:
+        return scorers.family_for_model(model_id or "", override)
+    except ValueError as exc:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=str(exc),
+            remediation=(
+                "Name the model's tool-call format explicitly — set [eval] "
+                "tool_call_family in the run config (supported families: lfm2, qwen3)."
+            ),
+        ) from exc
+
+
+#: Per-row key set by the letter-choice scorer (see :func:`_choice_metrics`) and
+#: folded into ``choice_acc_pct`` by :func:`choice_acc_pct`.
+CHOICE_KEY = "choice_match"
+
+_CHOICE_EXPECTED_RE = re.compile(r"^[A-Da-d]$")
+
+
+def _is_choice_record(record: dict[str, Any]) -> bool:
+    """True when *record*'s ``expected_output`` is a single ``A``-``D`` letter."""
+    expected = record.get("expected_output")
+    return isinstance(expected, str) and bool(_CHOICE_EXPECTED_RE.match(expected.strip()))
+
+
+def is_choice_suite(records: Sequence[dict[str, Any]]) -> bool:
+    """True when *every* record in the suite answers with a single ``A``-``D`` letter.
+
+    This is what switches a suite into letter-choice scoring (MMLU-style, e.g.
+    ``examples/eval/mmlu-subset.jsonl``). It is deliberately all-or-nothing: one
+    prose row means the file is a normal task suite that happens to contain a
+    one-letter answer, and scoring it on extracted letters would be wrong.
+    An empty suite is not a choice suite.
+    """
+    return bool(records) and all(_is_choice_record(record) for record in records)
+
+
+def _choice_metrics(record: dict[str, Any], prediction: str) -> dict[str, Any]:
+    """Score one letter-choice row: did *prediction* pick the expected letter?"""
+    expected = str(record.get("expected_output") or "").strip().upper()
+    chosen = scorers.extract_choice_letter(prediction)
+    return {CHOICE_KEY: bool(expected) and chosen == expected}
+
+
+def choice_acc_pct(rows: Sequence[dict[str, Any]]) -> float | None:
+    """Return the percentage of *rows* whose extracted answer letter was correct.
+
+    ``None`` when no row carries :data:`CHOICE_KEY` (an ordinary task/chat suite
+    has no letter to extract), so the caller leaves the key off the payload
+    entirely rather than reporting a misleading ``0``. Mirrors
+    :func:`compliance_pct` exactly.
+    """
+    flags = [bool(row[CHOICE_KEY]) for row in rows if CHOICE_KEY in row]
+    if not flags:
+        return None
+    return round(sum(flags) / len(flags) * 100, 2)
+
+
+def _with_choice_metrics(base):
+    """Compose *base* (possibly ``None``) with the letter-choice scorer."""
+    if base is None:
+        return _choice_metrics
+
+    def scored(record: dict[str, Any], prediction: str) -> dict[str, Any]:
+        merged = dict(base(record, prediction))
+        merged.update(_choice_metrics(record, prediction))
+        return merged
+
+    return scored
+
+
+def _extra_metrics_for(
+    schema: str,
+    *,
+    model_id: str | None = None,
+    tool_call_family: str | None = None,
+    records: Sequence[dict[str, Any]] | None = None,
+):
+    """Return the per-row ``extra_metrics`` callable for *schema* (``None`` if any).
+
+    ``chat``/``task`` suites are scored by exact match and token F1 alone. The
+    three richer schemas each add one boolean key — see :data:`COMPLIANCE_KEYS`
+    — which :func:`compliance_pct` folds into the suite-level percentage.
+
+    When *records* is supplied and every one of them answers with a single
+    ``A``-``D`` letter (:func:`is_choice_suite`), a :data:`CHOICE_KEY` boolean is
+    added on top of whatever the schema already scores: the prediction's answer
+    letter is extracted with
+    :func:`sloth.tune.scorers.extract_choice_letter` and compared to the
+    expected one. ``exact_match`` keeps its whole-string meaning — the letter
+    comparison lives in its own key, rolled up as ``choice_acc_pct``.
+    """
+    base = _extra_metrics_for_schema(schema, model_id=model_id, tool_call_family=tool_call_family)
+    if records is not None and is_choice_suite(records):
+        return _with_choice_metrics(base)
+    return base
+
+
+def _extra_metrics_for_schema(
+    schema: str, *, model_id: str | None = None, tool_call_family: str | None = None
+):
+    """The schema-driven half of :func:`_extra_metrics_for` (no choice scoring)."""
+    if schema == "instruction":
+
+        def score_instruction(record: dict[str, Any], prediction: str) -> dict[str, Any]:
+            outcome = scorers.score_constraints(prediction, _constraint_dicts(record))
+            return {"constraints_passed": bool(outcome["passed"])}
+
+        return score_instruction
+
+    if schema == "structured":
+
+        def score_structured(record: dict[str, Any], prediction: str) -> dict[str, Any]:
+            outcome = scorers.check_json_subset(prediction, record.get("json_schema") or {})
+            return {"json_valid": bool(outcome["valid"])}
+
+        return score_structured
+
+    if schema == "toolcall":
+        # Resolved once, before any generation, so an unknown family costs no GPU.
+        family = _resolve_tool_call_family(model_id, tool_call_family)
+
+        def score_toolcall(record: dict[str, Any], prediction: str) -> dict[str, Any]:
+            outcome = scorers.score_tool_call(
+                prediction, record.get("expected_tool_call") or {}, family
+            )
+            return {"tool_call_matched": bool(outcome["matched"])}
+
+        return score_toolcall
+
+    return None
+
+
+def compliance_pct(rows: Sequence[dict[str, Any]]) -> float | None:
+    """Return the percentage of *rows* whose schema compliance flag is true.
+
+    ``None`` when no row carries one of :data:`COMPLIANCE_KEYS` (a plain
+    ``task``/``chat`` suite has nothing to comply with), so the caller can leave
+    the key off the payload entirely rather than reporting a misleading ``0``.
+    """
+    flags = [bool(row[key]) for row in rows for key in COMPLIANCE_KEYS.values() if key in row]
+    if not flags:
+        return None
+    return round(sum(flags) / len(flags) * 100, 2)
+
+
+def score_suite(
+    records: Sequence[dict[str, Any]],
+    schema: str,
+    generation: GenerationRun,
+    *,
+    start_index: int = 0,
+    source: str | None = None,
+    extra_metrics: Any = None,
+) -> list[dict[str, Any]]:
+    """Score one suite's *generation* and stamp each row with its timing."""
+    rows = [_scorable_row(record, schema) for record in records]
+    scored = metrics.score_records(
+        rows,
+        generation.predictions,
+        start_index=start_index,
+        source=source,
+        extra_metrics=extra_metrics,
+    )
+    for entry, tokens, latency in zip(scored, generation.generated_tokens, generation.latency_ms):
+        entry["generated_tokens"] = tokens
+        entry["latency_ms"] = round(latency, 4)
+    return scored
+
+
+def build_file_entry(
+    suite_file: Any,
+    scored: Sequence[dict[str, Any]],
+    *,
+    perplexity: float | None = None,
+    perplexity_nll: float | None = None,
+    perplexity_tokens: int | None = None,
+) -> dict[str, Any]:
+    """Build one ``files`` entry: metrics, the timing rollups, compliance, perplexity.
+
+    ``perplexity_nll``/``perplexity_tokens`` are the un-reduced totals behind the
+    per-file perplexity; they are what :func:`build_summary` weights the
+    aggregate by. They may be passed explicitly, but a *perplexity* produced by
+    :func:`run_perplexity` (a :class:`PerplexityResult`) already carries them, so
+    both eval seams get the weighted aggregate without changing their call.
+    """
+    entry = metrics.file_entry(suite_file, scored)
+    entry.update(timing_summary(scored))
+    pct = compliance_pct(scored)
+    if pct is not None:
+        entry["compliance_pct"] = pct
+    choice_pct = choice_acc_pct(scored)
+    if choice_pct is not None:
+        entry["choice_acc_pct"] = choice_pct
+    if perplexity is not None:
+        entry["perplexity"] = float(perplexity)
+        nll = perplexity_nll if perplexity_nll is not None else getattr(perplexity, "nll_sum", None)
+        tokens = (
+            perplexity_tokens
+            if perplexity_tokens is not None
+            else getattr(perplexity, "tokens", None)
+        )
+        if nll is not None and tokens:
+            entry["perplexity_nll"] = float(nll)
+            entry["perplexity_tokens"] = int(tokens)
+    return entry
+
+
+def _aggregate_perplexity(files: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Return the suite-level perplexity keys for *files* (empty when none scored).
+
+    The combined perplexity is ``exp(total_nll / total_tokens)`` over every
+    scored token — averaging the per-file values would weight a one-row suite the
+    same as a thousand-row one. Entries written before the totals existed fall
+    back to that mean, which is why the key can still be reported for them.
+    """
+    scored = [entry for entry in files if entry.get("perplexity") is not None]
+    if not scored:
+        return {}
+    weighted = [entry for entry in scored if entry.get("perplexity_tokens")]
+    if len(weighted) == len(scored):
+        total_nll = sum(float(entry["perplexity_nll"]) for entry in weighted)
+        total_tokens = sum(int(entry["perplexity_tokens"]) for entry in weighted)
+        return {
+            "perplexity": round(_exp_or_inf(total_nll / total_tokens), 4),
+            "perplexity_nll": total_nll,
+            "perplexity_tokens": total_tokens,
+        }
+    return {"perplexity": round(sum(e["perplexity"] for e in scored) / len(scored), 4)}
+
+
+def build_summary(
+    files: Sequence[dict[str, Any]],
+    *,
+    batch_size: int,
+    base_load_in_4bit: bool | None,
+) -> dict[str, Any]:
+    """Aggregate per-file entries and add the suite-level rollups both seams report."""
+    summary = metrics.aggregate(files)
+    summary.update(timing_summary(summary["results"]))
+    pct = compliance_pct(summary["results"])
+    if pct is not None:
+        summary["compliance_pct"] = pct
+    choice_pct = choice_acc_pct(summary["results"])
+    if choice_pct is not None:
+        summary["choice_acc_pct"] = choice_pct
+    summary.update(_aggregate_perplexity(files))
+    summary["batch_size"] = batch_size
+    summary["base_load_in_4bit"] = base_load_in_4bit
+    return summary
+
+
+#: Diagnostic keys already emitted this process (see :func:`_warn_once`).
+_WARNED: set[str] = set()
+
+
+def _warn_once(key: str, message: str) -> None:
+    """Emit *message* on stderr the first time *key* is seen in this process.
+
+    A per-row fallback notice would otherwise repeat once per suite record and
+    bury the rest of the run's diagnostics; the condition is a property of the
+    tokenizer, not of the row, so saying it once is saying it fully.
+    """
+    if key in _WARNED:
+        return
+    _WARNED.add(key)
+    emit_diagnostic(message)
+
+
+def eval_prompt(record: dict[str, Any], tokenizer: Any = None) -> str:
+    """Render one suite record into the prompt the model is asked to continue.
+
+    Task-shaped records (``task``/``instruction``/``structured``/``toolcall``)
+    use the shared ``Task:/Input:/Output:`` shape — the same rendering
+    ``_format_records`` trains on, so eval matches training.
+
+    **Chat records** are rendered with the *model's own* chat template
+    (``tokenizer.apply_chat_template(..., add_generation_prompt=True)``): the
+    final assistant turn is the expected output, so only the turns before it are
+    rendered, and ``add_generation_prompt`` appends the template's
+    assistant-turn header so the model continues rather than re-opening the
+    conversation. Without a tokenizer (or with one carrying no chat template)
+    this falls back to :func:`sloth.tune.datasets.render_chat_prompt`, the
+    stdlib core's documented plain-text rendering.
+    """
+    if isinstance(record, dict) and "messages" in record:
+        messages = list(record.get("messages") or [])
+        if messages and messages[-1].get("role") == "assistant":
+            messages = messages[:-1]
+        apply_template = getattr(tokenizer, "apply_chat_template", None)
+        if apply_template is not None:
+            try:
+                return apply_template(messages, tokenize=False, add_generation_prompt=True)
+            except (AttributeError, KeyError, TypeError, ValueError):
+                _warn_once(
+                    "chat-template",
+                    "note: the tokenizer has no usable chat template — falling back to "
+                    "the plain-text chat rendering for this suite.",
+                )
+        return render_chat_prompt(messages) + "\nassistant:"
     return f"Task: {record['task']}\nInput: {record['input']}\nOutput:"
+
+
+def _model_device(model: Any) -> Any:
+    """Return the model's device, or ``None`` when it does not expose parameters."""
+    try:
+        return next(model.parameters()).device
+    except (AttributeError, StopIteration, TypeError):
+        return None
+
+
+def _suite_records(suite: Any) -> list[dict[str, Any]]:
+    """Normalise *suite* (a JSONL path or an already-parsed record list) to records."""
+    if isinstance(suite, (str, Path)):
+        path = Path(suite)
+        return validate_dataset(path, schema=_detect_suite_schema(path))
+    return list(suite)
+
+
+class PerplexityResult(float):
+    """A perplexity value that also carries the totals it was computed from.
+
+    ``run_perplexity`` must keep returning a ``float`` (both eval seams, and any
+    direct caller, treat it as one), but the *aggregate* over several suites can
+    only be computed correctly from the summed NLL and token count — averaging
+    per-file perplexities reweights the run by file count. Subclassing ``float``
+    carries those totals along the existing call path, so
+    :func:`build_file_entry` picks them up without either seam changing.
+    """
+
+    __slots__ = ("nll_sum", "tokens")
+
+    def __new__(cls, value: float, *, nll_sum: float, tokens: int) -> "PerplexityResult":
+        result = super().__new__(cls, value)
+        result.nll_sum = float(nll_sum)
+        result.tokens = int(tokens)
+        return result
+
+
+def _exp_or_inf(value: float) -> float:
+    """``math.exp(value)``, reporting an astronomically bad model as ``inf``."""
+    try:
+        return math.exp(value)
+    except OverflowError:
+        return math.inf
+
+
+def run_perplexity_stats(
+    model: Any, tokenizer: Any, suite: Any, *, torch_mod: Any = None
+) -> tuple[float, int]:
+    """Return ``(total_nll, scored_token_count)`` for *suite* under *model*.
+
+    The un-reduced totals behind :func:`run_perplexity`: each record's mean
+    cross-entropy times its label count, summed, alongside the total label
+    count. Callers that combine several suites must aggregate *these* and
+    exponentiate once — see :func:`build_summary`.
+    """
+    if torch_mod is None:
+        try:
+            import torch  # noqa: PLC0415 — intentional lazy import
+
+            torch_mod = torch
+        except ImportError as exc:
+            raise CliError(
+                code=EXIT_ENV_ERROR,
+                message=f"torch is not installed: {exc}",
+                remediation=_INSTALL_HINT,
+            ) from exc
+
+    records = _suite_records(suite)
+    device = _model_device(model)
+    total_nll = 0.0
+    total_tokens = 0
+    for record in records:
+        schema = detect_suite_schema(record)
+        row = _scorable_row(record, schema)
+        prompt = eval_prompt(record, tokenizer)
+        expected = row["expected_output"]
+        text = f"{prompt} {expected}" if expected else prompt
+        inputs = tokenizer(text, return_tensors="pt")
+        if device is not None and hasattr(inputs, "to"):
+            inputs = inputs.to(device)
+        with torch_mod.no_grad():
+            outputs = model(**inputs, labels=inputs["input_ids"])
+        loss = outputs["loss"] if isinstance(outputs, dict) else outputs.loss
+        # A causal LM predicts token i+1 from token i, so an n-token sequence
+        # contributes n-1 scored labels.
+        labels = max(_sequence_length(inputs["input_ids"]) - 1, 1)
+        total_nll += float(loss) * labels
+        total_tokens += labels
+    return total_nll, total_tokens
+
+
+def run_perplexity(model: Any, tokenizer: Any, suite: Any, *, torch_mod: Any = None) -> float:
+    """Return ``exp(mean per-token NLL)`` of *suite* under *model*.
+
+    This is a **labelled forward pass**, never a ``generate`` call: each record is
+    rendered to ``prompt + expected_output``, tokenized, and run through
+    ``model(**inputs, labels=input_ids)``, whose ``loss`` is the mean
+    cross-entropy over that sequence's predicted tokens. The losses are combined
+    *token-weighted* (each row's loss times its label count, divided by the total
+    label count), so a long row counts for more than a short one — a plain mean
+    of per-row losses would silently reweight the suite by row count.
+
+    *suite* is either a JSONL path (validated and parsed here) or an
+    already-parsed list of records. *torch_mod* lets a caller that has already
+    imported torch (both eval seams have) hand it in; when omitted torch is
+    imported lazily inside the function, exactly like this module's other heavy
+    seams — so the documented ``run_perplexity(model, tokenizer, suite)`` call
+    works on its own.
+
+    An astronomically bad model can overflow ``math.exp``; that is reported as
+    ``inf`` rather than raising.
+
+    The returned value is a :class:`PerplexityResult` — a ``float`` that also
+    carries ``nll_sum``/``tokens``, so a caller combining several suites can
+    weight them correctly. Use :func:`run_perplexity_stats` to get the totals
+    directly.
+
+    Raises
+    ------
+    CliError(code=2)
+        When *torch_mod* is omitted and torch is not installed.
+    """
+    total_nll, total_tokens = run_perplexity_stats(model, tokenizer, suite, torch_mod=torch_mod)
+    value = 0.0 if not total_tokens else _exp_or_inf(total_nll / total_tokens)
+    return PerplexityResult(value, nll_sum=total_nll, tokens=total_tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +1436,9 @@ def run_eval(
     quant: str | None = None,
     batch_size: int = DEFAULT_EVAL_BATCH_SIZE,
     max_new_tokens: int = EVAL_MAX_NEW_TOKENS,
+    perplexity: bool = False,
+    tool_call_family: str | None = None,
+    base_load_in_4bit: bool | None = None,
 ) -> dict[str, Any]:
     """Load a LoRA adapter and evaluate against a task-schema JSONL suite.
 
@@ -534,15 +1467,30 @@ def run_eval(
         tokenizer cannot pad — see :func:`_resolve_eval_batch_size`.
     max_new_tokens:
         Generation budget per suite item.
+    perplexity:
+        Also score each suite with :func:`run_perplexity` (a labelled forward
+        pass, on top of generation) and report it per file and in the aggregate.
+    tool_call_family:
+        Overrides tool-call family detection for a ``toolcall`` suite (what a run
+        config's ``[eval] tool_call_family`` supplies); otherwise the family is
+        detected from the adapter's base model id.
+    base_load_in_4bit:
+        The base model's load precision, recorded verbatim into the result and
+        the written eval files so a score is never read without knowing the
+        precision it was measured at. ``None`` means "not stated".
 
     Returns
     -------
     dict
         The **aggregate** over every suite file — ``total``, ``exact_match``,
         ``exact_match_pct``, ``f1``, ``results`` — plus ``files``, one entry per
-        scored file (``{path, total, exact_match, exact_match_pct, f1,
-        results}``). The same payload, plus ``suite_paths`` / ``target`` /
-        ``written_at``, is written to ``<adapter_path>/eval.json``.
+        scored file, ``median_latency_ms`` / ``tokens_per_s``, ``batch_size``,
+        ``base_load_in_4bit``, and (when the suite schema or *perplexity* asks
+        for them) ``compliance_pct`` / ``perplexity``. Each row of ``results``
+        additionally carries ``generated_tokens`` and ``latency_ms``. The same
+        payload is written to ``<adapter_path>/eval.json`` (the legacy flat file
+        ``sloth summarize`` reads) and, per suite, to
+        ``<adapter_path>/eval/<suite>.json``.
 
     Raises
     ------
@@ -620,24 +1568,55 @@ def run_eval(
     next_index = 0
     for suite_file in resolved_suites:
         # Re-validate inside the container (eval.py already validated on the host).
-        records = validate_dataset(Path(suite_file), schema="task")
-        predictions = _generate_predictions(
+        schema = _detect_suite_schema(Path(suite_file))
+        records = validate_dataset(Path(suite_file), schema=schema)
+        # Resolved BEFORE generation so an unknown tool-call family costs no GPU.
+        extra_metrics = _extra_metrics_for(
+            schema,
+            model_id=base_model_name,
+            tool_call_family=tool_call_family,
+            records=records,
+        )
+        generation = _generate_predictions(
             torch,
             model,
             tokenizer,
-            [eval_prompt(record) for record in records],
+            [eval_prompt(record, tokenizer) for record in records],
             batch_size=batch_size,
             max_new_tokens=max_new_tokens,
             device=device,
         )
-        scored = metrics.score_records(
-            records, predictions, start_index=next_index, source=str(suite_file)
+        scored = score_suite(
+            records,
+            schema,
+            generation,
+            start_index=next_index,
+            source=str(suite_file),
+            extra_metrics=extra_metrics,
         )
         next_index += len(scored)
-        files.append(metrics.file_entry(suite_file, scored))
+        files.append(
+            build_file_entry(
+                suite_file,
+                scored,
+                perplexity=(
+                    run_perplexity(model, tokenizer, records, torch_mod=torch)
+                    if perplexity
+                    else None
+                ),
+            )
+        )
 
-    summary = metrics.aggregate(files)
-    write_eval_json(Path(adapter_path), summary, resolved_suites, target="adapter")
+    summary = build_summary(files, batch_size=batch_size, base_load_in_4bit=base_load_in_4bit)
+    write_eval_artifacts(
+        Path(adapter_path),
+        files,
+        resolved_suites,
+        summary,
+        target="adapter",
+        batch_size=batch_size,
+        base_load_in_4bit=base_load_in_4bit,
+    )
     return summary
 
 
@@ -659,6 +1638,59 @@ def write_eval_json(
     except OSError as exc:
         emit_diagnostic(f"note: could not write {directory / metrics.EVAL_JSON_NAME}: {exc}")
         return None
+
+
+def write_suite_eval_json(
+    directory: Path,
+    suite: str | Path,
+    payload: dict[str, Any],
+    *,
+    target: str,
+    batch_size: int | None = None,
+    base_load_in_4bit: bool | None = None,
+) -> Path | None:
+    """Write ``<directory>/eval/<suite>.json``; warn (never fail) on a read-only dir."""
+    try:
+        return metrics.write_eval_json(
+            directory,
+            suite,
+            payload,
+            target=target,
+            batch_size=batch_size,
+            base_load_in_4bit=base_load_in_4bit,
+        )
+    except OSError as exc:
+        emit_diagnostic(f"note: could not write the {metrics.EVAL_JSON_DIR}/ result file: {exc}")
+        return None
+
+
+def write_eval_artifacts(
+    directory: Path,
+    files: Sequence[dict[str, Any]],
+    suite_paths: Sequence[str | Path],
+    summary: dict[str, Any],
+    *,
+    target: str,
+    batch_size: int,
+    base_load_in_4bit: bool | None,
+) -> None:
+    """Write both eval layouts: one file per suite, plus the legacy flat ``eval.json``.
+
+    The per-suite files (schema_version 2, carrying ``batch_size`` and
+    ``base_load_in_4bit``) are the layout comparisons read; the flat
+    ``eval.json`` is kept because :mod:`sloth.tune.summary` — and therefore
+    ``sloth summarize``/``sloth compare`` — still reads it.
+    """
+    for entry, suite_file in zip(files, suite_paths):
+        write_suite_eval_json(
+            directory,
+            suite_file,
+            entry,
+            target=target,
+            batch_size=batch_size,
+            base_load_in_4bit=base_load_in_4bit,
+        )
+    write_eval_json(directory, summary, suite_paths, target=target)
 
 
 def run_training(config: RunConfig, *, dry_run: bool = False) -> dict[str, Any]:

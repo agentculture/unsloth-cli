@@ -1,0 +1,25 @@
+{
+  "plan_slug": "full-benchmark-suite",
+  "schema_version": 2,
+  "created": "2026-09-17T04:47:49Z",
+  "updated": "2026-09-17T05:49:25Z",
+  "deviations": [
+    {
+      "id": "d1",
+      "what": "sloth validate --suite must detect each suite file's schema (task/chat/instruction/structured/toolcall) instead of forcing task, so the documented 'sloth validate --suite examples/eval/' works again with the four new suites present; small edit to sloth/cli/_commands/validate.py + tests, done by the main agent after t11 (which also edits validate.py) merges",
+      "task_ref": "t10",
+      "reason": "plan put the new-schema suites under examples/eval/ (t10 acceptance) but no task updated validate.py's SUITE_SCHEMA=task; without it a documented command regresses on the integration branch",
+      "affects": [
+        "t8",
+        "t14"
+      ],
+      "origin": "llm",
+      "status": "approved",
+      "classification": "needs-follow-up",
+      "seq": 1
+    }
+  ],
+  "evidence": [],
+  "deltas": [],
+  "supersessions": []
+}

@@ -72,7 +72,7 @@ import sloth.tune.container as container_mod
 from sloth.cli._errors import EXIT_USER_ERROR, CliError
 from sloth.cli._output import emit_diagnostic, emit_result
 from sloth.tune import registry as registry_mod
-from sloth.tune._trainer import run_training
+from sloth.tune._trainer import infer_hf_dataset_schema, is_hf_dataset_spec, run_training
 from sloth.tune.config import RunConfig, load_config
 from sloth.tune.datasets import detect_schema, validate_dataset
 from sloth.tune.scope import check_scope
@@ -313,12 +313,21 @@ def _resolve_container_invocation(
     # double-resolved to ``examples/examples/data.jsonl`` inside the container.
     base_dir = Path.cwd()
 
-    dataset_path = Path(config.dataset)
-    if not dataset_path.is_absolute():
-        dataset_path = (base_dir / dataset_path).resolve()
+    # An `hf:` dataset is not a filesystem path — it resolves inside the
+    # container through the mounted Hugging Face cache
+    # (sloth.tune.container.build_command's default hf_cache mount), not a
+    # bind-mounted local path, so it contributes no mount of its own here.
+    mount_parents = {config_path.parent}
+    if not is_hf_dataset_spec(config.dataset):
+        dataset_path = Path(config.dataset)
+        if not dataset_path.is_absolute():
+            dataset_path = (base_dir / dataset_path).resolve()
+        mount_parents.add(dataset_path.parent)
+
     output_path = Path(config.output)
     if not output_path.is_absolute():
         output_path = (base_dir / output_path).resolve()
+    mount_parents.add(output_path.parent)
 
     # Identity mounts so host-absolute paths (the forwarded config, the dataset, and
     # the output dir) resolve unchanged inside the container (host_path == container_path).
@@ -327,7 +336,6 @@ def _resolve_container_invocation(
     # redundant — and when ``sloth train`` runs from ``/`` it would emit a dangerous
     # ``-v /:/`` overlaying the container root with the host root filesystem. ``sorted``
     # makes the docker argv deterministic (a set has no stable iteration order).
-    mount_parents = {config_path.parent, dataset_path.parent, output_path.parent}
     extra_mounts: list[tuple[str, str]] = [(str(p), str(p)) for p in sorted(mount_parents)]
 
     # Forward the ABSOLUTE config path; identity mounts make it resolve inside
@@ -374,8 +382,16 @@ def cmd_train(args: argparse.Namespace) -> int | None:
     config = load_config(args.config)
 
     # 2) Validate the dataset BEFORE any GPU work ("validate before spending GPU").
-    schema = _resolve_schema(config.dataset)
-    validate_dataset(config.dataset, schema)
+    # An `hf:` dataset cannot be validated on the host without a network/cache
+    # round-trip (use `sloth validate` for that, offline-only); its schema is
+    # inferred from [run.dataset_map] instead, and the actual load + validation
+    # of the rendered rows happens inside the container (see
+    # sloth.tune._trainer.load_external_records, called from run_training).
+    if is_hf_dataset_spec(config.dataset):
+        schema = infer_hf_dataset_schema(config.dataset_map)
+    else:
+        schema = _resolve_schema(config.dataset)
+        validate_dataset(config.dataset, schema)
 
     # 2b) Host model preflight (stdlib only): LFM2 target_modules hint, lobes'
     # hand-lane rank cap, and the chat-template check. Skipped under

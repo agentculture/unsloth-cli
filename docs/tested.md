@@ -124,6 +124,49 @@ home. Fixed by forwarding `SLOTH_ALLOWED_ROOTS` (the identity-mounted parents) i
 the container env (deviation d2). Every real `sloth export` on `main` between #20 and
 this fix was broken.
 
+## ✅ Tested — passed (2026-09-17, benchmark dep layer: lm_eval + sacrebleu)
+
+Same box and container as above, on the `feat/full-benchmark-suite` branch (plan
+`full-benchmark-suite`, task t12). The dep layer gains a third tuple,
+`DEP_LAYER_BENCH_PACKAGES = ("lm_eval==0.4.13", "sacrebleu==2.6.0")`, installed with a
+plain `uv pip install` **after** the `--no-deps` layer. Measured by mounting the
+already-built dep-layer venv (`~/.cache/unsloth-cli/home/.unsloth-cli-venv`) and
+installing the two packages into it, then diffing `uv pip list`.
+
+| Step | Invocation | Result |
+|------|------------|--------|
+| before | `uv pip list` in the built venv | transformers 4.57.1, peft 0.18.0, trl 0.24.0, datasets 4.8.5, accelerate 1.13.0, numpy 2.3.5, unsloth 2026.9.4, bitsandbytes 0.50.2 |
+| install | `uv pip install lm_eval==0.4.13 sacrebleu==2.6.0` (dry-run, then real) | ✅ **45 packages added, 0 changed, 0 removed** — evaluate 0.4.6, scikit-learn 1.9.1, scipy 1.18.1, sqlitedict 2.1.0, rouge-score 0.1.2, portalocker 4.3.2, tabulate 0.10.0, … ; no torch / torchvision / transformers / peft / trl / datasets / numpy line in the diff |
+| after | `uv pip list` | transformers 4.57.1, peft 0.18.0, trl 0.24.0, datasets 4.8.5, accelerate 1.13.0, numpy 2.3.5 unchanged; lm-eval 0.4.13, sacrebleu 2.6.0 present |
+| import | `python -c "import torch; …"` / transformers, peft, trl, datasets / lm_eval, sacrebleu / unsloth | ✅ `torch 2.10.0a0+b558c986e8.nv25.11 cuda 13.0 True`; `tf 4.57.1 peft 0.18.0 trl 0.24.0 ds 4.8.5`; `lm_eval 0.4.13 sacrebleu 2.6.0`; `import unsloth` still patches (🦥 banner) |
+
+Not exercised here: an actual `lm_eval` MMLU run (task t13) and the sacrebleu scorer
+(task t4) — this row only proves the pins coexist with the validated window.
+
+## ✅ Tested — passed (2026-09-17, full benchmark suite: fixture adapter, every suite family, bench, compare, exports)
+
+Same box and container as above, on the `feat/full-benchmark-suite` branch (plan
+`full-benchmark-suite`, task t16). lobes' vLLM resident (~94 GB of the 121 GB UMA)
+throughout; page cache reclaimed (touch a 16–20 GiB anonymous mmap) before every
+GPU step. Every `--json` invocation below produced exactly one stdout line
+(`json.loads` ok). Numbers and their reading are in
+[`docs/benchmarks.md`](benchmarks.md#full-benchmark-suite--fixture-adapter-2026-09-17-plan-full-benchmark-suite).
+
+| Verb | Mode | Model | Invocation | Result |
+|------|------|-------|------------|--------|
+| `train --json` | LoRA `preset:lfm2`, 300 steps, `[eval] holdout_fraction=0.1` | LFM2.5-1.2B-Base | `uv run sloth train --config examples/demo-lora.toml --json` | ✅ 3 min 43 s wall (`train_runtime` 91.3 s); first attempt ❌ CUDA OOM at backend init (exit 2 with the memory hint) until the page cache was reclaimed; `training_metadata.json` carries `loss_history` (300 entries), `final_eval_loss` 2.11, `holdout` (532/59 rows, `eval_steps` 50) |
+| `eval --adapter --json` (9 suites, batch 8) | `--perplexity --tool-call-family lfm2 --train-dataset …train.jsonl` | same + `runs/demo-lora` | `uv run sloth eval --adapter runs/demo-lora --suite <9 files> --batch-size 8 --perplexity --tool-call-family lfm2 --train-dataset examples/demo-corpus.train.jsonl --json` | ✅ 31 min 13 s; nine `eval/<suite>.json` files; but **batch 8 output is degenerate on LFM2** (0/46 exact everywhere; see r13). First attempt ❌ exit 1: the overlap check flagged the run's own holdout against the full corpus (r12) — passing the train split fixed it |
+| `eval --adapter --json` (9 suites, batch 1) | same flags, `--batch-size 1` | same | same with `--batch-size 1` | ✅ 27 min 37 s; target suites 14/46 exact, holdout 6/59, structured compliance 76 %, MMLU-style 61.7 % letters — the valid LFM2 numbers |
+| `eval --adapter --results-dir` (4 suites, batch 1) | `--results-dir runs/demo-lora/eval-batch1` | same | `… --suite <3 target> --suite examples/demo-corpus.holdout.jsonl --batch-size 1 --results-dir runs/demo-lora/eval-batch1 --json` | ✅ 5 min 8 s; flat `<results-dir>/<suite>.json` files, batch-8 files untouched |
+| `bench --json` | `--benchmark mmlu --limit 5` (5-shot, 285 docs) | same | `uv run sloth bench --adapter runs/demo-lora --benchmark mmlu --limit 5 --json` | ✅ 5 min 22 s incl. first-run download of 57 subject splits; `lm_eval --model hf --model_args pretrained=…,peft=<adapter>` loaded the LoRA directly (park v4 resolved for bf16 LoRA); `eval/mmlu.json` acc 0.5789 |
+| `bench --offline --json` | same, warm cache | same | `… --offline --json` | ✅ 2 min 23 s; no split generation, lm_eval logs "Using the latest cached version … (offline mode is enabled)" per subject; identical acc 0.5789 |
+| `compare --base --json` (1st) | adapter re-eval + base eval, batch 1 | LFM2.5-1.2B-Base vs `runs/demo-lora` | `uv run sloth compare --base LiquidAI/LFM2.5-1.2B-Base runs/demo-lora --config examples/demo-lora.toml --json` | ❌ exit 1 after 21 min: in-container `eval --model <hf-id>` rejected the repo id ("model directory not found") — the host accepted it, the seam did not. **Fixed** (`run_eval_model` remote-id path) |
+| `compare --base --json` (2nd) | same | same | same | ⚠ exit 0 after 1 h 12 min but **vacuous**: docker created the bind-mounted `eval-base/` as root, the container's writer got EACCES on every suite, the base side came back empty and the verdict passed with one-sided deltas (r15). Base numbers recovered from the run's captured stdout JSON. **Fixed** (compare pre-creates the dir and exits 1 on an empty base side) |
+| `compare --base --json` (3rd) | same, with the fix, stale root-owned `eval-base/` still present | same | same | ✅ **failed closed** as designed after 1 h 17 min: exit 1 "the base evaluation … produced no results under runs/demo-lora/eval-base" (10 `could not write` notes on stderr) — no vacuous pass. Follow-through: compare now checks the directory is writable *before* the adapter run, so this costs seconds, not an hour |
+| `compare --base --json` (4th) | same, after `rmdir eval-base` | same | same | ✅ 1 h 16 min; both sides on disk (`eval-base/*.json` owned by the host user); one stdout line; **verdict `passed: false`, 17 failed checks** (14 × `min_suite_rows`, 3 × `compliance`) — the tool's own exit 1, matching the hand-computed verdict; per-suite deltas in `docs/benchmarks.md` |
+| `export` ×4 + `eval --model` ×4 | merged-16bit / gguf q4_k_m / awq / nvfp4, 3 target suites, batch 1 | `runs/demo-lora` | `uv run sloth export --adapter runs/demo-lora --format <fmt> [--quant q4_k_m] [--calib examples/chat-smoke.jsonl] --output runs/demo-lora-exports/<fmt> --json` then `uv run sloth eval --model runs/demo-lora-exports/<fmt> --suite <3 target> --batch-size 1 --json` | ✅ exports 42 / 55 / 81 / 64 s (2.34 GB / 0.73 GB / 1.08 GB / 1.12 GB); evals 192 / 71 / 188 / 217 s; exact 14 / **0** / 12 / 9 of 46 — the first per-format table with non-zero rows (#28 item 1); the GGUF 0/46 is a follow-up (r14) |
+| `validate --suite examples/eval/` | per-file schema detection (deviation d1) | — | `uv run sloth validate --suite examples/eval/` | ✅ 305 records across 7 files, each reported with its detected schema (task / instruction / structured / toolcall) |
+
 ## ❌ Not tested (explicit gaps)
 
 Do not assume these work just because the 1.7B path does. The code path is often

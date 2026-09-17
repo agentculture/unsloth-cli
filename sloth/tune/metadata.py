@@ -66,14 +66,119 @@ def dataset_digest(path: Path) -> tuple[str, int]:
     return h.hexdigest(), line_count
 
 
+#: Prefix marking a dataset value as a Hugging Face Hub dataset id rather than a
+#: local JSONL path — mirrors ``sloth.tune._trainer.HF_DATASET_PREFIX`` (kept as
+#: a separate literal so this module stays free of any import from ``_trainer``).
+_HF_DATASET_PREFIX = "hf:"
+
+#: Split recorded when a ``hf:<org>/<name>`` spec omits an explicit ``:<split>``.
+_DEFAULT_HF_SPLIT = "train"
+
+#: Revision recorded for a hub dataset when the caller does not pin one — the
+#: implicit ref ``datasets.load_dataset`` resolves to when no revision is given.
+_DEFAULT_HF_REVISION = "main"
+
+
+#: ``dataset.source`` values. A hub dataset carries no ``dataset.path``, so a
+#: consumer keying off the path alone (the eval-side train/eval overlap check)
+#: silently skipped hub runs; the field states the dataset's kind outright.
+HF_DATASET_SOURCE = "hf"
+FILE_DATASET_SOURCE = "file"
+
+
+def _hf_dataset_record(dataset_spec: str, *, hf_revision: str | None) -> dict[str, Any]:
+    """Return the ``{"hf_id", "split", "revision", "source"}`` record for a ``hf:`` spec."""
+    body = dataset_spec[len(_HF_DATASET_PREFIX) :]
+    hf_id, _, split = body.partition(":")
+    return {
+        "hf_id": hf_id,
+        "split": split or _DEFAULT_HF_SPLIT,
+        "revision": hf_revision or _DEFAULT_HF_REVISION,
+        "source": HF_DATASET_SOURCE,
+    }
+
+
+def resolve_load_in_4bit(method: str, hyperparameters: dict[str, Any] | None) -> bool:
+    """Return the *effective* 4-bit flag for a run.
+
+    ``hyperparameters["load_in_4bit"]`` is the raw config value; training forces
+    4-bit whenever ``method == "qlora"``, so the raw value alone understates the
+    precision a QLoRA adapter was trained at (and a downstream benchmark reading
+    it would load the adapter at the wrong precision).
+    """
+    if str(method).lower() == "qlora":
+        return True
+    if isinstance(hyperparameters, dict):
+        return bool(hyperparameters.get("load_in_4bit"))
+    return False
+
+
+#: Keys a ``log_history`` entry may use for the *training* loss. ``"loss"`` is
+#: what transformers logs per ``logging_steps``; ``"train_loss"`` is the single
+#: summary entry appended when training finishes.
+_TRAIN_LOSS_KEYS: tuple[str, ...] = ("loss", "train_loss")
+
+
+def fold_log_history(log_history: list[dict[str, Any]]) -> dict[str, Any]:
+    """Fold a ``trainer.state.log_history`` list into the metadata loss record.
+
+    transformers logs training and evaluation separately — ``{"loss", "step"}``
+    entries every ``logging_steps`` and ``{"eval_loss", "step"}`` entries every
+    ``eval_steps`` — so the same step can appear twice. They are merged here by
+    ``step`` (first-seen order preserved) into
+    ``[{"step", "train_loss", "eval_loss"}]``, with a missing side recorded as
+    ``None``. Entries carrying no ``step`` or neither loss (e.g. the
+    ``train_runtime`` summary) are ignored.
+
+    Returns
+    -------
+    dict
+        ``{"loss_history": [...], "final_train_loss": float|None,
+        "final_eval_loss": float|None}`` — the finals being the last non-``None``
+        value of each series.
+    """
+    merged: dict[Any, dict[str, Any]] = {}
+    for entry in log_history:
+        if not isinstance(entry, dict) or "step" not in entry:
+            continue
+        train_loss = next((entry[k] for k in _TRAIN_LOSS_KEYS if k in entry), None)
+        eval_loss = entry.get("eval_loss")
+        if train_loss is None and eval_loss is None:
+            continue
+        step = entry["step"]
+        row = merged.setdefault(step, {"step": step, "train_loss": None, "eval_loss": None})
+        if train_loss is not None:
+            row["train_loss"] = train_loss
+        if eval_loss is not None:
+            row["eval_loss"] = eval_loss
+
+    loss_history = list(merged.values())
+    final_train_loss = next(
+        (row["train_loss"] for row in reversed(loss_history) if row["train_loss"] is not None),
+        None,
+    )
+    final_eval_loss = next(
+        (row["eval_loss"] for row in reversed(loss_history) if row["eval_loss"] is not None),
+        None,
+    )
+    return {
+        "loss_history": loss_history,
+        "final_train_loss": final_train_loss,
+        "final_eval_loss": final_eval_loss,
+    }
+
+
 def write_metadata(
     adapter_dir: Path,
     *,
     model: str,
     method: str,
-    dataset_path: Path,
+    dataset_path: "Path | str",
     hyperparameters: dict[str, Any],
     timestamp: str | None = None,
+    hf_revision: str | None = None,
+    log_history: list[dict[str, Any]] | None = None,
+    holdout: dict[str, Any] | None = None,
 ) -> Path:
     """Write ``adapter_dir/training_metadata.json`` and return the path.
 
@@ -87,14 +192,35 @@ def write_metadata(
     method:
         Adapter method: ``"lora"`` or ``"qlora"``.
     dataset_path:
-        Path to the JSONL training dataset.  Its sha256 and line count are
-        computed and embedded in the metadata.
+        Either a path to the local JSONL training dataset (its sha256 and line
+        count are computed and embedded in the metadata), or a
+        ``"hf:<org>/<name>[:split]"`` string naming a Hugging Face Hub dataset
+        — recorded instead as ``{"hf_id", "split", "revision"}`` (no sha256:
+        the dataset is not a fixed local file). Either record also carries
+        ``source`` (``"file"`` or ``"hf"``) so a reader can tell the two apart
+        without inferring it from which keys are present.
     hyperparameters:
-        Mapping of training hyperparameters (rank, lora_alpha, epochs, …).
+        Mapping of training hyperparameters (rank, lora_alpha, epochs, …). The
+        record additionally carries ``resolved.load_in_4bit`` — the *effective*
+        precision (see :func:`resolve_load_in_4bit`), which a ``qlora`` run
+        forces on regardless of the configured flag.
     timestamp:
         ISO-8601 string to stamp the record.  When ``None`` (the default) the
         current UTC time is used.  Pass an explicit value in tests for a
         deterministic round-trip.
+    hf_revision:
+        Revision/ref to record for a ``hf:`` *dataset_path*. Ignored for a
+        local dataset path. Defaults to ``"main"`` when not given.
+    log_history:
+        ``trainer.state.log_history`` from the finished run. When given it is
+        folded by :func:`fold_log_history` into the ``loss_history``,
+        ``final_train_loss`` and ``final_eval_loss`` keys. ``None`` (the
+        default) omits all three.
+    holdout:
+        Provenance of the training-time eval split — ``{"fraction", "seed",
+        "train_path", "holdout_path", "train_count", "holdout_count",
+        "eval_steps"}`` — recorded verbatim so the split is reproducible.
+        ``None`` (the default) omits the key entirely.
 
     Returns
     -------
@@ -104,9 +230,19 @@ def write_metadata(
     Raises
     ------
     CliError
-        code=2 when *dataset_path* cannot be read.
+        code=2 when a local *dataset_path* cannot be read.
     """
-    sha256, line_count = dataset_digest(dataset_path)
+    dataset_str = str(dataset_path)
+    if dataset_str.startswith(_HF_DATASET_PREFIX):
+        dataset_record: dict[str, Any] = _hf_dataset_record(dataset_str, hf_revision=hf_revision)
+    else:
+        sha256, line_count = dataset_digest(Path(dataset_path))
+        dataset_record = {
+            "path": dataset_str,
+            "sha256": sha256,
+            "line_count": line_count,
+            "source": FILE_DATASET_SOURCE,
+        }
 
     if timestamp is None:
         timestamp = datetime.now(timezone.utc).isoformat()
@@ -114,14 +250,15 @@ def write_metadata(
     record: dict[str, Any] = {
         "model": model,
         "method": method,
-        "dataset": {
-            "path": str(dataset_path),
-            "sha256": sha256,
-            "line_count": line_count,
-        },
+        "dataset": dataset_record,
         "hyperparameters": hyperparameters,
+        "resolved": {"load_in_4bit": resolve_load_in_4bit(method, hyperparameters)},
         "timestamp": timestamp,
     }
+    if log_history is not None:
+        record.update(fold_log_history(log_history))
+    if holdout is not None:
+        record["holdout"] = holdout
 
     out_path = adapter_dir / _METADATA_FILENAME
     out_path.write_text(json.dumps(record, indent=2), encoding="utf-8")

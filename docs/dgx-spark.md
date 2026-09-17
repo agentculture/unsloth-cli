@@ -85,6 +85,38 @@ is cheaper than a broken AWQ path, so **0.11.0 / 0.16.0** are the pins.
 with **transformers 4.57.1** and **trl 0.24.0**, and leave torchao alone. These
 are the values in `sloth/tune/container.py::DEP_LAYER_PACKAGES`.
 
+## Bumping the benchmark-layer pins (lm_eval / sacrebleu)
+
+`sloth/tune/container.py::DEP_LAYER_BENCH_PACKAGES` pins the
+lm-evaluation-harness (`lm_eval`, used by `sloth bench` for MMLU) and `sacrebleu`
+(the lazy GLEU/BLEU scorer). They are installed with a plain `uv pip install`
+**after** the two layers above, so a bump is validated the same way: measure
+inside the container, never guess from PyPI. Because the harness resolves its
+own dependency tree, the thing to check is that the install stays **additive** —
+no line for torch, torchvision, transformers, peft, trl, datasets or numpy in the
+`uv pip install` diff. The 2026-09-17 measurement (docs/tested.md) was: 45
+packages added, 0 changed.
+
+```bash
+docker run --rm -e HOME=/opt/sloth-home \
+  -v ~/.cache/unsloth-cli/home:/opt/sloth-home \
+  nvcr.io/nvidia/pytorch:25.11-py3 bash -lc '
+  export PATH="$HOME/.local/bin:$PATH"
+  . "$HOME/.unsloth-cli-venv/bin/activate"        # the venv the CLI already built
+  uv pip install --dry-run lm_eval==<new> sacrebleu==<new> | grep -E "^ [+-] (torch|transformers|peft|trl|datasets|numpy)"
+  # empty output = additive; anything printed = the window moved, stop here
+  uv pip install lm_eval==<new> sacrebleu==<new>
+  uv pip list | grep -iE "lm.eval|sacrebleu|transformers|peft|trl|datasets|torch "
+'
+```
+
+If the dry-run prints a torch/transformers/peft line, do **not** bump: the harness
+would move the pinned window (see the torchao deadlock above). Either hold the old
+pin or install the harness `--no-deps` and list its runtime deps explicitly, the
+way the `--no-deps` layer does for unsloth. Then edit the tuple, re-run
+`uv run pytest tests/test_tune_container.py`, and record the row in
+[`docs/tested.md`](tested.md).
+
 ## Bumping the unsloth / unsloth_zoo / bitsandbytes pins
 
 `sloth/tune/container.py::DEP_LAYER_NODEPS_PACKAGES` pins `unsloth`,
@@ -240,6 +272,37 @@ uv run sloth export --adapter runs/qlora-smoke --output runs/qlora-smoke-export
 
 The first real run creates the in-container venv and installs the dep layer
 (a few minutes); the HF cache and the venv make subsequent runs faster.
+
+## Warm-cache check for `sloth bench`
+
+`sloth bench` downloads the benchmark's dataset and the model weights **once**,
+into the host Hugging Face cache that `build_command` bind-mounts at
+`/opt/hf-cache` (with `HF_HOME` pointed at it). A second run must not download
+anything. The check:
+
+```bash
+# 1st run — populates ~/.cache/huggingface (dataset + weights)
+uv run sloth bench --adapter runs/qlora-smoke --limit 20 2> bench-1.log
+
+# 2nd run — identical command, warm cache
+uv run sloth bench --adapter runs/qlora-smoke --limit 20 2> bench-2.log
+
+grep -ciE 'downloading|resolving data files|%\|' bench-1.log   # > 0 on the cold run
+grep -ciE 'downloading|resolving data files|%\|' bench-2.log   # 0 on the warm run
+```
+
+The second log carrying **no** download/progress lines is the pass condition.
+To make it an enforced property rather than an observation, add `--offline`:
+that sets `HF_HUB_OFFLINE=1` in the container, so any attempted fetch fails
+loudly instead of silently re-downloading.
+
+```bash
+uv run sloth bench --adapter runs/qlora-smoke --limit 20 --offline
+```
+
+If the cache is not being reused, check that `~/.cache/huggingface` exists and
+is readable — `build_command` adds the mount only when the directory is present
+(see "Model re-downloads every run" in Troubleshooting below).
 
 ## Troubleshooting
 

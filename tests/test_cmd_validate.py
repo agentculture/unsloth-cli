@@ -47,11 +47,13 @@ _VALID_TASK = '{"task": "reverse", "input": "abc", "expected_output": "cba"}\n'
 
 
 def _make_args(
-    dataset: Path | None = None,
+    dataset: Path | str | None = None,
     *,
     suite: Path | str | None = None,
     schema: str | None = None,
     json_mode: bool = False,
+    dataset_map: list[str] | None = None,
+    config: Path | str | None = None,
 ) -> argparse.Namespace:
     """Build the Namespace argparse would produce for ``sloth validate``."""
     return argparse.Namespace(
@@ -59,6 +61,8 @@ def _make_args(
         suite=str(suite) if suite is not None else None,
         schema=schema,
         json=json_mode,
+        dataset_map=dataset_map,
+        config=str(config) if config is not None else None,
     )
 
 
@@ -163,8 +167,9 @@ def test_invalid_role_rejected_same_as_train(
     bad = _write_dataset(
         tmp_path, '{"messages": [{"role": "wizard", "content": "x"}]}\n', name="bad.jsonl"
     )
+    args = _make_args(bad, schema="chat")
     with pytest.raises(CliError) as exc_info:
-        cmd_validate(_make_args(bad, schema="chat"))
+        cmd_validate(args)
     assert exc_info.value.code == 1
     assert "wizard" in exc_info.value.message
     assert exc_info.value.remediation
@@ -174,9 +179,10 @@ def test_invalid_dataset_matches_validate_dataset_directly(tmp_path: Path) -> No
     """The CliError raised by the verb is identical in shape to calling
     validate_dataset() directly — proving no rules are duplicated."""
     bad = _write_dataset(tmp_path, '{"messages": []}\n', name="bad.jsonl")
+    args = _make_args(bad, schema="chat")
 
     with pytest.raises(CliError) as from_verb:
-        cmd_validate(_make_args(bad, schema="chat"))
+        cmd_validate(args)
 
     with pytest.raises(CliError) as from_lib:
         validate_dataset(bad, "chat")
@@ -188,24 +194,27 @@ def test_invalid_dataset_matches_validate_dataset_directly(tmp_path: Path) -> No
 def test_invalid_json_line_rejected(tmp_path: Path) -> None:
     """Malformed JSON on a line raises CliError(code=1)."""
     bad = _write_dataset(tmp_path, "not valid json\n", name="bad.jsonl")
+    args = _make_args(bad, schema="chat")
     with pytest.raises(CliError) as exc_info:
-        cmd_validate(_make_args(bad, schema="chat"))
+        cmd_validate(args)
     assert exc_info.value.code == 1
 
 
 def test_empty_dataset_rejected(tmp_path: Path) -> None:
     """A dataset with no records (empty file) raises CliError(code=1)."""
     empty = _write_dataset(tmp_path, "", name="empty.jsonl")
+    args = _make_args(empty, schema="chat")
     with pytest.raises(CliError) as exc_info:
-        cmd_validate(_make_args(empty, schema="chat"))
+        cmd_validate(args)
     assert exc_info.value.code == 1
 
 
 def test_invalid_dataset_error_hint_contract(tmp_path: Path) -> None:
     """The invalid-dataset CliError renders as ``error:``/``hint:`` lines."""
     bad = _write_dataset(tmp_path, "not valid json\n", name="bad.jsonl")
+    args = _make_args(bad, schema="chat")
     with pytest.raises(CliError) as exc_info:
-        cmd_validate(_make_args(bad, schema="chat"))
+        cmd_validate(args)
     buf = io.StringIO()
     emit_error(exc_info.value, json_mode=False, stream=buf)
     text = buf.getvalue()
@@ -216,8 +225,9 @@ def test_invalid_dataset_error_hint_contract(tmp_path: Path) -> None:
 def test_invalid_dataset_json_error(tmp_path: Path) -> None:
     """The invalid-dataset CliError renders as structured JSON when requested."""
     bad = _write_dataset(tmp_path, "not valid json\n", name="bad.jsonl")
+    args = _make_args(bad, schema="chat", json_mode=True)
     with pytest.raises(CliError) as exc_info:
-        cmd_validate(_make_args(bad, schema="chat", json_mode=True))
+        cmd_validate(args)
     buf = io.StringIO()
     emit_error(exc_info.value, json_mode=True, stream=buf)
     payload = json.loads(buf.getvalue())
@@ -229,8 +239,9 @@ def test_invalid_dataset_json_error(tmp_path: Path) -> None:
 def test_task_schema_mismatch_rejected(tmp_path: Path) -> None:
     """A record missing a required task key is rejected against --schema task."""
     bad = _write_dataset(tmp_path, '{"task": "x", "input": "y"}\n', name="bad_task.jsonl")
+    args = _make_args(bad, schema="task")
     with pytest.raises(CliError) as exc_info:
-        cmd_validate(_make_args(bad, schema="task"))
+        cmd_validate(args)
     assert exc_info.value.code == 1
     assert "expected_output" in exc_info.value.message
 
@@ -243,8 +254,9 @@ def test_task_schema_mismatch_rejected(tmp_path: Path) -> None:
 
 def test_missing_file_raises_cli_error_1(tmp_path: Path) -> None:
     """A dataset path that does not exist raises CliError(code=1)."""
+    args = _make_args(tmp_path / "nope.jsonl")
     with pytest.raises(CliError) as exc_info:
-        cmd_validate(_make_args(tmp_path / "nope.jsonl"))
+        cmd_validate(args)
     assert exc_info.value.code == 1
     assert "not found" in exc_info.value.message
     assert exc_info.value.remediation
@@ -256,15 +268,17 @@ def test_missing_file_does_not_call_validate_dataset(
     """A missing file is caught before validate_dataset is ever invoked."""
     mock_validate = Mock()
     monkeypatch.setattr(validate_mod, "validate_dataset", mock_validate)
+    args = _make_args(tmp_path / "nope.jsonl")
     with pytest.raises(CliError):
-        cmd_validate(_make_args(tmp_path / "nope.jsonl"))
+        cmd_validate(args)
     mock_validate.assert_not_called()
 
 
 def test_missing_file_error_hint_contract(tmp_path: Path) -> None:
     """The missing-file CliError renders as ``error:``/``hint:`` lines."""
+    args = _make_args(tmp_path / "nope.jsonl")
     with pytest.raises(CliError) as exc_info:
-        cmd_validate(_make_args(tmp_path / "nope.jsonl"))
+        cmd_validate(args)
     buf = io.StringIO()
     emit_error(exc_info.value, json_mode=False, stream=buf)
     text = buf.getvalue()
@@ -440,9 +454,9 @@ def test_suite_single_file_valid_json_shape(
     assert rc in (None, 0)
     payload = json.loads(capsys.readouterr().out)
     assert payload["valid"] is True
-    assert payload["schema"] == "task"
+    assert payload["schema"] == "auto"
     assert payload["total_records"] == 2
-    assert payload["files"] == [{"path": str(suite_file), "line_count": 2}]
+    assert payload["files"] == [{"path": str(suite_file), "line_count": 2, "schema": "task"}]
 
 
 def test_suite_directory_reports_per_file_counts(
@@ -522,23 +536,70 @@ def test_suite_uses_same_validate_suite_function_as_eval(
     monkeypatch.setattr(validate_mod, "validate_suite", _spy)
     rc = cmd_validate(_make_args(suite=suite_dir))
     assert rc in (None, 0)
-    assert calls == [(str(suite_dir), "task")]
+    assert calls == [(str(suite_dir), "auto")]
 
 
-def test_suite_with_non_task_schema_raises_cli_error(tmp_path: Path) -> None:
-    """qodo: a --suite validated against a non-task --schema must NOT be
-    reported valid — sloth eval always enforces the task schema for suites,
-    so a chat-schema file that "passes" here with --schema chat would fail
-    sloth eval anyway. --suite always validates against task; an explicit
-    non-task --schema is a user error."""
+def test_suite_accepts_every_known_schema_and_rejects_unknown(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Deviation d1 (plan full-benchmark-suite): eval suites are no longer
+    task-only — chat, instruction, structured and toolcall suites are scored by
+    ``sloth eval`` — so ``--suite --schema chat`` on a chat file is valid, and
+    a directory mixing schemas validates file by file. An unknown --schema is
+    still a user error."""
     chat_suite = tmp_path / "chat_suite.jsonl"
     chat_suite.write_text('{"messages": [{"role": "user", "content": "hi"}]}\n', encoding="utf-8")
-    args = _make_args(suite=chat_suite, schema="chat", json_mode=True)
+    rc = cmd_validate(_make_args(suite=chat_suite, schema="chat", json_mode=True))
+    assert rc in (None, 0)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema"] == "chat"
+    assert payload["files"][0]["schema"] == "chat"
+
+    mixed = tmp_path / "mixed"
+    mixed.mkdir()
+    (mixed / "a-task.jsonl").write_text(
+        '{"task": "t", "input": "i", "expected_output": "o"}\n', encoding="utf-8"
+    )
+    (mixed / "b-instruction.jsonl").write_text(
+        '{"task": "t", "input": "i", "expected_output": "o", '
+        '"constraints": [{"max_words": 5}]}\n',
+        encoding="utf-8",
+    )
+    (mixed / "c-structured.jsonl").write_text(
+        '{"task": "t", "input": "i", "json_schema": {"type": "object"}}\n', encoding="utf-8"
+    )
+    (mixed / "d-toolcall.jsonl").write_text(
+        '{"task": "t", "input": "i", "expected_tool_call": {"name": "f", "arguments": {}}}\n',
+        encoding="utf-8",
+    )
+    rc = cmd_validate(_make_args(suite=mixed, json_mode=True))
+    assert rc in (None, 0)
+    payload = json.loads(capsys.readouterr().out)
+    assert [f["schema"] for f in payload["files"]] == [
+        "task",
+        "instruction",
+        "structured",
+        "toolcall",
+    ]
+
+    args = _make_args(suite=chat_suite, schema="bogus", json_mode=True)
     with pytest.raises(CliError) as exc_info:
         cmd_validate(args)
-    err = exc_info.value
-    assert err.code == 1
-    assert err.remediation
+    assert exc_info.value.code == 1
+    assert "bogus" in exc_info.value.message
+
+
+def test_documented_examples_eval_directory_validates() -> None:
+    """The documented ``sloth validate --suite examples/eval/`` (catalog, validate
+    docstring) must keep working with the four new-schema suites present."""
+    root = Path(__file__).resolve().parents[1]
+    report = validate_suite(root / "examples" / "eval", schema="auto")
+    schemas = {Path(f["path"]).name: f["schema"] for f in report["files"]}
+    assert schemas["instruction-following.jsonl"] == "instruction"
+    assert schemas["structured-output.jsonl"] == "structured"
+    assert schemas["tool-call.jsonl"] == "toolcall"
+    assert schemas["regression.jsonl"] == "task"
+    assert report["total_records"] > 250
 
 
 def test_suite_with_explicit_task_schema_is_accepted(
@@ -568,3 +629,319 @@ def test_register_suite_flag(tmp_path: Path) -> None:
 
     args2 = parser.parse_args(["validate", "--suite", suite_path, "--json"])
     assert args2.json is True
+
+
+# ---------------------------------------------------------------------------
+# External (hf:) dataset support — t11 / c34
+# ---------------------------------------------------------------------------
+
+
+def _fake_datasets_module(rows: list[dict]):
+    return type("FakeDatasetsModule", (), {"load_dataset": staticmethod(lambda *a, **k: rows)})
+
+
+class TestValidateHfDataset:
+    def test_valid_cached_hf_dataset_reports_ok(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rows = [{"conversations": [{"role": "user", "content": "hi"}]}]
+        monkeypatch.setitem(__import__("sys").modules, "datasets", _fake_datasets_module(rows))
+
+        args = _make_args(
+            "hf:my-org/my-dataset:train",
+            dataset_map=["messages=conversations"],
+            json_mode=True,
+        )
+        rc = cmd_validate(args)
+        assert rc in (None, 0)
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["valid"] is True
+        assert payload["schema"] == "chat"
+        assert payload["line_count"] == 1
+        assert payload["source"] == "hf:my-org/my-dataset:train"
+
+    def test_valid_cached_hf_dataset_text_mode(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rows = [{"instruction": "x", "context": "y", "response": "z"}]
+        monkeypatch.setitem(__import__("sys").modules, "datasets", _fake_datasets_module(rows))
+
+        args = _make_args(
+            "hf:my-org/my-dataset",
+            dataset_map=[
+                "task=instruction",
+                "input=context",
+                "expected_output=response",
+            ],
+        )
+        rc = cmd_validate(args)
+        assert rc in (None, 0)
+        out = capsys.readouterr().out
+        assert "valid" in out.lower()
+
+    def test_not_cached_exits_2_with_container_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def _boom(*_a: object, **_k: object) -> None:
+            raise RuntimeError("offline mode is enabled, but dataset was not found in cache")
+
+        fake_module = type("FakeDatasetsModule", (), {"load_dataset": staticmethod(_boom)})
+        monkeypatch.setitem(__import__("sys").modules, "datasets", fake_module)
+
+        args = _make_args("hf:my-org/my-dataset:train", dataset_map=["messages=conversations"])
+        with pytest.raises(CliError) as exc_info:
+            cmd_validate(args)
+        assert exc_info.value.code == 2
+        assert exc_info.value.remediation
+        assert "sloth train" in exc_info.value.remediation
+
+    def test_missing_datasets_library_exits_2(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setitem(__import__("sys").modules, "datasets", None)  # None -> ImportError
+
+        args = _make_args("hf:my-org/my-dataset:train", dataset_map=["messages=conversations"])
+        with pytest.raises(CliError) as exc_info:
+            cmd_validate(args)
+        assert exc_info.value.code == 2
+
+    def test_missing_dataset_map_raises_cli_error_code_1(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rows = [{"conversations": []}]
+        monkeypatch.setitem(__import__("sys").modules, "datasets", _fake_datasets_module(rows))
+
+        args = _make_args("hf:my-org/my-dataset:train", dataset_map=None)
+        with pytest.raises(CliError) as exc_info:
+            cmd_validate(args)
+        assert exc_info.value.code == 1
+
+    def test_invalid_dataset_map_entry_raises_cli_error(self) -> None:
+        args = _make_args("hf:my-org/my-dataset:train", dataset_map=["no-equals-sign"])
+        with pytest.raises(CliError) as exc_info:
+            cmd_validate(args)
+        assert exc_info.value.code == 1
+
+    def test_sets_and_restores_hf_hub_offline_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The offline probe must not leak HF_HUB_OFFLINE into the environment."""
+        seen: dict[str, str | None] = {}
+
+        def _fake_load_dataset(*_a: object, **_k: object) -> list[dict]:
+            import os
+
+            seen["value"] = os.environ.get("HF_HUB_OFFLINE")
+            return [{"conversations": [{"role": "user", "content": "hi"}]}]
+
+        fake_module = type(
+            "FakeDatasetsModule", (), {"load_dataset": staticmethod(_fake_load_dataset)}
+        )
+        monkeypatch.setitem(__import__("sys").modules, "datasets", fake_module)
+        monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+
+        args = _make_args("hf:my-org/my-dataset:train", dataset_map=["messages=conversations"])
+        cmd_validate(args)
+
+        assert seen["value"] == "1"
+        import os
+
+        assert "HF_HUB_OFFLINE" not in os.environ
+
+    def test_register_wires_dataset_map_flag(self) -> None:
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="command")
+        register(sub)
+        args = parser.parse_args(
+            [
+                "validate",
+                "--dataset",
+                "hf:org/name",
+                "--dataset-map",
+                "messages=conversations",
+            ]
+        )
+        assert args.dataset_map == ["messages=conversations"]
+
+
+class TestValidateHfPinnedSchema:
+    """A pinned --schema must drive an ``hf:`` validation, not be ignored (Qodo r3)."""
+
+    def test_pinned_schema_matching_mapping_is_used(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rows = [{"conversations": [{"role": "user", "content": "hi"}]}]
+        monkeypatch.setitem(__import__("sys").modules, "datasets", _fake_datasets_module(rows))
+
+        args = _make_args(
+            "hf:my-org/my-dataset:train",
+            dataset_map=["messages=conversations"],
+            schema="chat",
+            json_mode=True,
+        )
+        assert cmd_validate(args) in (None, 0)
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["schema"] == "chat"
+        assert payload["schema_source"] == "pinned"
+
+    def test_pinned_schema_reported_in_text_mode(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rows = [{"instruction": "x", "context": "y", "response": "z"}]
+        monkeypatch.setitem(__import__("sys").modules, "datasets", _fake_datasets_module(rows))
+
+        args = _make_args(
+            "hf:my-org/my-dataset",
+            dataset_map=[
+                "task=instruction",
+                "input=context",
+                "expected_output=response",
+            ],
+            schema="task",
+        )
+        assert cmd_validate(args) in (None, 0)
+        out = capsys.readouterr().out
+        assert "task" in out
+        assert "--schema" in out
+
+    def test_inferred_schema_reported_when_not_pinned(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rows = [{"conversations": [{"role": "user", "content": "hi"}]}]
+        monkeypatch.setitem(__import__("sys").modules, "datasets", _fake_datasets_module(rows))
+
+        args = _make_args(
+            "hf:my-org/my-dataset",
+            dataset_map=["messages=conversations"],
+            json_mode=True,
+        )
+        cmd_validate(args)
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["schema_source"] == "inferred"
+
+    def test_chat_mapping_with_schema_task_is_user_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rows = [{"conversations": [{"role": "user", "content": "hi"}]}]
+        monkeypatch.setitem(__import__("sys").modules, "datasets", _fake_datasets_module(rows))
+
+        args = _make_args(
+            "hf:my-org/my-dataset",
+            dataset_map=["messages=conversations"],
+            schema="task",
+        )
+        with pytest.raises(CliError) as exc_info:
+            cmd_validate(args)
+        assert exc_info.value.code == 1
+        assert "chat" in exc_info.value.message
+        assert exc_info.value.remediation
+
+    def test_task_mapping_with_schema_chat_is_user_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rows = [{"instruction": "x", "context": "y", "response": "z"}]
+        monkeypatch.setitem(__import__("sys").modules, "datasets", _fake_datasets_module(rows))
+
+        args = _make_args(
+            "hf:my-org/my-dataset",
+            dataset_map=["task=instruction", "input=context", "expected_output=response"],
+            schema="chat",
+        )
+        with pytest.raises(CliError) as exc_info:
+            cmd_validate(args)
+        assert exc_info.value.code == 1
+        assert exc_info.value.remediation
+
+
+# ---------------------------------------------------------------------------
+# --config: read dataset / dataset_map from a run.toml (Qodo r5)
+# ---------------------------------------------------------------------------
+
+
+def _write_run_toml(
+    tmp_path: Path, dataset: str, dataset_map: dict[str, str] | None = None
+) -> Path:
+    lines = [
+        "[run]",
+        'model = "unsloth/Qwen3-1.7B"',
+        f'dataset = "{dataset}"',
+        'output = "out/adapter"',
+    ]
+    if dataset_map:
+        lines.append("")
+        lines.append("[run.dataset_map]")
+        lines.extend(f'{key} = "{value}"' for key, value in dataset_map.items())
+    path = tmp_path / "run.toml"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+class TestValidateFromConfig:
+    def test_local_dataset_from_config(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        dataset = _write_dataset(tmp_path, _VALID_TASK, name="task.jsonl")
+        config = _write_run_toml(tmp_path, str(dataset))
+
+        args = _make_args(config=config, json_mode=True)
+        assert cmd_validate(args) in (None, 0)
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["valid"] is True
+        assert payload["schema"] == "task"
+        assert payload["line_count"] == 1
+
+    def test_hf_dataset_map_forwarded_from_config(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rows = [{"conversations": [{"role": "user", "content": "hi"}]}]
+        monkeypatch.setitem(__import__("sys").modules, "datasets", _fake_datasets_module(rows))
+        config = _write_run_toml(
+            tmp_path,
+            "hf:my-org/my-dataset:train",
+            dataset_map={"messages": "conversations"},
+        )
+
+        args = _make_args(config=config, json_mode=True)
+        assert cmd_validate(args) in (None, 0)
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["valid"] is True
+        assert payload["schema"] == "chat"
+        assert payload["source"] == "hf:my-org/my-dataset:train"
+
+    def test_explicit_dataset_overrides_config(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        chat = _write_dataset(tmp_path, _VALID_CHAT, name="chat.jsonl")
+        config = _write_run_toml(tmp_path, str(tmp_path / "does-not-exist.jsonl"))
+
+        args = _make_args(chat, config=config, json_mode=True)
+        assert cmd_validate(args) in (None, 0)
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["schema"] == "chat"
+
+    def test_explicit_dataset_map_overrides_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rows = [{"turns": [{"role": "user", "content": "hi"}]}]
+        monkeypatch.setitem(__import__("sys").modules, "datasets", _fake_datasets_module(rows))
+        config = _write_run_toml(
+            tmp_path,
+            "hf:my-org/my-dataset",
+            dataset_map={"messages": "conversations"},
+        )
+
+        args = _make_args(config=config, dataset_map=["messages=turns"], json_mode=True)
+        assert cmd_validate(args) in (None, 0)
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["line_count"] == 1
+
+    def test_missing_config_file_exits_2(self, tmp_path: Path) -> None:
+        args = _make_args(config=tmp_path / "nope.toml")
+        with pytest.raises(CliError) as exc_info:
+            cmd_validate(args)
+        assert exc_info.value.code == 2
+
+    def test_register_wires_config_flag(self, tmp_path: Path) -> None:
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="command")
+        register(sub)
+        args = parser.parse_args(["validate", "--config", str(tmp_path / "run.toml")])
+        assert args.config == str(tmp_path / "run.toml")
+        assert args.dataset is None

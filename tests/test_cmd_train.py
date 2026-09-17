@@ -358,8 +358,9 @@ def test_h1_anchor_bad_dataset_and_out_of_scope_never_invoke_container(
     # --- H1a: invalid dataset (empty messages list) ---
     bad = _write_dataset(tmp_path, body='{"messages": []}\n', name="bad_ds.jsonl")
     toml_bad = _write_toml(tmp_path, dataset=bad, name="bad_run.toml")
+    args_bad = _make_args(toml_bad, dry_run=False)
     with pytest.raises(CliError) as exc_info_a:
-        cmd_train(_make_args(toml_bad, dry_run=False))
+        cmd_train(args_bad)
     assert exc_info_a.value.code == 1, "h1a: expected CliError code=1 for invalid dataset"
     mock_launch.assert_not_called()
 
@@ -923,7 +924,8 @@ def test_train_help_states_scope_warning() -> None:
     help_text = train_parser.format_help().lower()
     assert "full fine-tuning" in help_text
     assert "out of scope" in help_text
-    assert "lora" in help_text and "qlora" in help_text
+    assert "lora" in help_text
+    assert "qlora" in help_text
 
 
 def test_in_container_flag_suppressed_from_help() -> None:
@@ -1280,3 +1282,299 @@ def test_preflight_imports_no_transformers(tmp_path: Path, monkeypatch: pytest.M
     cmd_train(_make_args(cfg, dry_run=True))
     assert "transformers" not in sys.modules
     assert "huggingface_hub" not in sys.modules
+
+
+# ---------------------------------------------------------------------------
+# External (hf:) dataset support — t11 / c34
+# ---------------------------------------------------------------------------
+
+
+def _hf_config(tmp_path: Path, *, dataset_map: dict[str, str] | None) -> RunConfig:
+    return RunConfig(
+        model="unsloth/Qwen3-4B",
+        dataset="hf:my-org/my-dataset:train",
+        output=str(tmp_path / "adapters" / "out"),
+        method="qlora",
+        dataset_map=dataset_map,
+    )
+
+
+class TestLoadExternalRecords:
+    """Unit coverage for sloth.tune._trainer.load_external_records + helpers."""
+
+    def test_is_hf_dataset_spec(self) -> None:
+        import sloth.tune._trainer as trainer_mod
+
+        assert trainer_mod.is_hf_dataset_spec("hf:org/name") is True
+        assert trainer_mod.is_hf_dataset_spec("data/train.jsonl") is False
+
+    def test_parse_hf_dataset_spec_default_split(self) -> None:
+        import sloth.tune._trainer as trainer_mod
+
+        assert trainer_mod.parse_hf_dataset_spec("hf:org/name") == ("org/name", "train")
+
+    def test_parse_hf_dataset_spec_explicit_split(self) -> None:
+        import sloth.tune._trainer as trainer_mod
+
+        assert trainer_mod.parse_hf_dataset_spec("hf:org/name:validation") == (
+            "org/name",
+            "validation",
+        )
+
+    def test_parse_hf_dataset_spec_missing_id_raises_cli_error(self) -> None:
+        import sloth.tune._trainer as trainer_mod
+
+        with pytest.raises(CliError) as exc_info:
+            trainer_mod.parse_hf_dataset_spec("hf:")
+        assert exc_info.value.code == 1
+
+    def test_infer_schema_from_messages_key(self) -> None:
+        import sloth.tune._trainer as trainer_mod
+
+        assert trainer_mod.infer_hf_dataset_schema({"messages": "conversations"}) == "chat"
+
+    def test_infer_schema_from_task_keys(self) -> None:
+        import sloth.tune._trainer as trainer_mod
+
+        assert (
+            trainer_mod.infer_hf_dataset_schema(
+                {"task": "instruction", "input": "context", "expected_output": "response"}
+            )
+            == "task"
+        )
+
+    def test_infer_schema_refuses_a_partial_task_map(self) -> None:
+        """A one- or two-key task map used to infer "task", then crash on render."""
+        import sloth.tune._trainer as trainer_mod
+
+        with pytest.raises(CliError) as exc_info:
+            trainer_mod.infer_hf_dataset_schema({"task": "instruction", "input": "context"})
+        assert exc_info.value.code == 1
+        assert "expected_output" in exc_info.value.message
+        assert exc_info.value.remediation
+
+    def test_infer_schema_missing_map_raises_cli_error(self) -> None:
+        import sloth.tune._trainer as trainer_mod
+
+        with pytest.raises(CliError) as exc_info:
+            trainer_mod.infer_hf_dataset_schema(None)
+        assert exc_info.value.code == 1
+        assert exc_info.value.remediation
+
+    def test_load_external_records_renders_chat_rows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import sloth.tune._trainer as trainer_mod
+
+        rows = [
+            {"conversations": [{"role": "user", "content": "hi"}]},
+            {"conversations": [{"role": "user", "content": "yo"}]},
+        ]
+        fake_datasets = type(
+            "FakeDatasetsModule", (), {"load_dataset": staticmethod(lambda *a, **k: rows)}
+        )
+        monkeypatch.setitem(sys.modules, "datasets", fake_datasets)
+
+        records = trainer_mod.load_external_records(
+            "hf:org/name:train", {"messages": "conversations"}
+        )
+        assert records == [
+            {"messages": [{"role": "user", "content": "hi"}]},
+            {"messages": [{"role": "user", "content": "yo"}]},
+        ]
+
+    def test_load_external_records_renders_task_rows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import sloth.tune._trainer as trainer_mod
+
+        rows = [{"instruction": "do X", "context": "ctx", "response": "done"}]
+        fake_datasets = type(
+            "FakeDatasetsModule", (), {"load_dataset": staticmethod(lambda *a, **k: rows)}
+        )
+        monkeypatch.setitem(sys.modules, "datasets", fake_datasets)
+
+        records = trainer_mod.load_external_records(
+            "hf:org/name:train",
+            {"task": "instruction", "input": "context", "expected_output": "response"},
+        )
+        assert records == [{"task": "do X", "input": "ctx", "expected_output": "done"}]
+
+    def test_load_external_records_passes_limit_as_slice(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import sloth.tune._trainer as trainer_mod
+
+        captured: dict[str, Any] = {}
+
+        def _fake_load_dataset(dataset_id: str, *, split: str) -> list[dict]:
+            captured["dataset_id"] = dataset_id
+            captured["split"] = split
+            return [{"conversations": [{"role": "user", "content": "hi"}]}]
+
+        fake_datasets = type(
+            "FakeDatasetsModule", (), {"load_dataset": staticmethod(_fake_load_dataset)}
+        )
+        monkeypatch.setitem(sys.modules, "datasets", fake_datasets)
+
+        trainer_mod.load_external_records(
+            "hf:org/name:train", {"messages": "conversations"}, limit=50
+        )
+        assert captured["dataset_id"] == "org/name"
+        assert captured["split"] == "train[:50]"
+
+    def test_load_external_records_invalid_rendered_row_raises_cli_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Rendered rows are validated through datasets.py's validate_dataset."""
+        import sloth.tune._trainer as trainer_mod
+
+        rows = [{"instruction": "x", "context": "y", "response": 5}]
+        fake_datasets = type(
+            "FakeDatasetsModule", (), {"load_dataset": staticmethod(lambda *a, **k: rows)}
+        )
+        monkeypatch.setitem(sys.modules, "datasets", fake_datasets)
+
+        with pytest.raises(CliError) as exc_info:
+            trainer_mod.load_external_records(
+                "hf:org/name:train",
+                {"task": "instruction", "input": "context", "expected_output": "response"},
+            )
+        assert exc_info.value.code == 1
+
+
+class TestTrainHfDatasetIntegration:
+    """cmd_train's host-side handling of an hf: dataset."""
+
+    def test_dry_run_skips_local_dataset_validation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg = _hf_config(tmp_path, dataset_map={"messages": "conversations"})
+        monkeypatch.setattr(train_mod, "load_config", lambda _path: cfg)
+        monkeypatch.setattr(
+            train_mod,
+            "validate_dataset",
+            lambda *_a, **_k: pytest.fail("validate_dataset must not be called for hf: datasets"),
+        )
+        rc = cmd_train(_make_args(tmp_path / "ignored.toml", dry_run=True))
+        assert rc in (None, 0)
+
+    def test_dry_run_missing_dataset_map_raises_cli_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg = _hf_config(tmp_path, dataset_map=None)
+        monkeypatch.setattr(train_mod, "load_config", lambda _path: cfg)
+        args = _make_args(tmp_path / "ignored.toml", dry_run=True)
+        with pytest.raises(CliError) as exc_info:
+            cmd_train(args)
+        assert exc_info.value.code == 1
+
+    def test_host_real_run_extra_mounts_omit_hf_dataset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An hf: dataset contributes no local mount of its own."""
+        cfg = _hf_config(tmp_path, dataset_map={"messages": "conversations"})
+        monkeypatch.setattr(train_mod, "load_config", lambda _path: cfg)
+
+        captured: dict[str, Any] = {}
+
+        def _capture_launch(sloth_args: list[str], **kwargs: Any) -> dict:
+            captured.update(kwargs)
+            return {}
+
+        monkeypatch.setattr(container_mod, "launch", _capture_launch)
+        rc = cmd_train(_make_args(tmp_path / "ignored.toml", dry_run=False))
+        assert rc in (None, 0)
+
+        extra_mounts = captured.get("extra_mounts") or []
+        mounted_container_paths = {ct for _, ct in extra_mounts}
+        output_dir = Path(cfg.output)
+        assert str(output_dir.parent) in mounted_container_paths
+        # No mount target contains the literal "hf:" spec.
+        assert not any("hf:" in ct for ct in mounted_container_paths)
+
+
+class TestRunTrainingHfDataset:
+    """Full run_training flow for an hf: dataset, with a fake ML backend + datasets lib."""
+
+    def test_run_training_uses_external_loader_and_records_hf_metadata(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import sloth.tune._trainer as trainer_mod
+
+        rows = [
+            {
+                "conversations": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "yo"},
+                ]
+            }
+        ]
+        fake_datasets_module = type(
+            "FakeDatasetsModule",
+            (),
+            {
+                "load_dataset": staticmethod(lambda *a, **k: rows),
+                "Dataset": type(
+                    "FakeDataset",
+                    (),
+                    {"from_list": staticmethod(lambda records: records)},
+                ),
+            },
+        )
+        monkeypatch.setitem(sys.modules, "datasets", fake_datasets_module)
+
+        class _FakeTokenizer:
+            eos_token = "<eos>"
+
+            def apply_chat_template(self, messages: Any, tokenize: bool) -> str:
+                return "rendered"
+
+            def save_pretrained(self, path: str) -> None:
+                pass
+
+        class _FakeModel:
+            def save_pretrained(self, path: str) -> None:
+                pass
+
+        class _FakeFastLanguageModel:
+            @staticmethod
+            def from_pretrained(**kwargs: Any) -> tuple[Any, Any]:
+                return _FakeModel(), _FakeTokenizer()
+
+            @staticmethod
+            def get_peft_model(model: Any, **kwargs: Any) -> Any:
+                return model
+
+        class _FakeTrainer:
+            def __init__(self, **kwargs: Any) -> None:
+                pass
+
+            def train(self) -> None:
+                pass
+
+        backend = trainer_mod._Backend(
+            fast_language_model=_FakeFastLanguageModel(),
+            sft_trainer=_FakeTrainer,
+            sft_config=lambda **kwargs: kwargs,
+            torch=None,
+        )
+        monkeypatch.setattr(trainer_mod, "_load_backend", lambda: backend)
+
+        output_dir = tmp_path / "adapters" / "out"
+        cfg = RunConfig(
+            model="unsloth/Qwen3-4B",
+            dataset="hf:my-org/my-dataset:train",
+            output=str(output_dir),
+            method="qlora",
+            dataset_map={"messages": "conversations"},
+        )
+
+        result = trainer_mod.run_training(cfg, dry_run=False)
+        assert result["status"] == "trained"
+
+        from sloth.tune.metadata import read_metadata
+
+        meta = read_metadata(output_dir)
+        assert meta["dataset"] == {
+            "hf_id": "my-org/my-dataset",
+            "split": "train",
+            "revision": "main",
+            "source": "hf",
+        }

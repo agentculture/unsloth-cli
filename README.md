@@ -218,6 +218,28 @@ or deployment and would become stale if baked into weights:
 now on any deployment of the mesh?"* If yes, consider fine-tuning. If it changes
 over time or is per-user, use memory / RAG.
 
+### Which suite catches which regression
+
+Each eval suite (see [`examples/README.md`](examples/README.md)) and benchmark
+step catches a different failure mode — running only one gives a false sense
+of coverage:
+
+| Suite / step | What a failure there means |
+|--------------|------------------------------|
+| target-task (`examples/eval/*.jsonl` task rows the adapter was trained on) | The trained behaviour itself did not improve |
+| holdout (rows split out of the training data) | The adapter memorized rather than generalized beyond training rows |
+| `regression.jsonl` | Base capabilities degraded — general ability the adapter should not have touched |
+| `instruction-following.jsonl` | Format/constraint/refusal behaviour broke (`must_refuse`, `max_words`, `json_only`, …) |
+| `structured-output.jsonl` + `tool-call.jsonl` | JSON/schema compliance or tool-call emission broke |
+| perplexity (`sloth eval --perplexity` / training-time `[eval]`) | Low-level sanity — held-out loss moved the wrong way |
+| latency/tok-s, batch 1 and batch 8 (`lobes benchmark`, see [`docs/benchmarks.md`](docs/benchmarks.md#serving-latency--toks)) | Serving cost regressed for a given export format |
+| `mmlu-subset.jsonl` / `sloth bench --benchmark mmlu` | General knowledge regressed against a standard (or standard-style) benchmark |
+
+`sloth compare --base` automates the parts of this table that are
+threshold-gated (regression drop, compliance floor, latency ratio, minimum
+suite rows) — see [`docs/fine-tuning.md`](docs/fine-tuning.md#agent-path) for
+the exact `--json` shape and exit codes.
+
 ### Role-specific adapters
 
 The design targets small, role-specific adapters rather than one large mixed blob.

@@ -171,6 +171,32 @@ def test_metrics_import_loads_no_ml_stack():
     )
 
 
+def test_scorers_import_loads_no_ml_stack():
+    """sloth.tune.scorers is pure-stdlib-at-import — no ML module leaks in.
+
+    Constraint/JSON-schema/tool-call scoring must stay usable with no ML stack
+    installed, exactly like metrics/datasets/config/scope. The only
+    third-party import (``sacrebleu``) is deferred inside gleu()/bleu().
+    """
+    code = (
+        "import sloth.tune.scorers; import sys; "
+        "heavy = [m for m in ('torch', 'unsloth', 'transformers', 'peft', 'sacrebleu') "
+        "if m in sys.modules]; "
+        "assert not heavy, f'scorers pulled in {heavy}'; "
+        "print('PASS')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=_REPO_ROOT,
+    )
+    assert result.returncode == 0, (
+        f"Expected returncode 0, got {result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+
+
 def test_metrics_module_imports_only_stdlib():
     """Every top-level import in metrics.py resolves to a stdlib module."""
     code = (
@@ -184,6 +210,61 @@ def test_metrics_module_imports_only_stdlib():
         "if isinstance(n, ast.ImportFrom) and n.level == 0 and n.module]; "
         "extra = sorted(r for r in roots if r not in sys.stdlib_module_names); "
         "assert not extra, f'non-stdlib imports in metrics.py: {extra}'; "
+        "print('PASS')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=_REPO_ROOT,
+    )
+    assert result.returncode == 0, (
+        f"Expected returncode 0, got {result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+
+
+def test_bench_module_imports_only_stdlib():
+    """Every top-level import in _bench.py resolves to stdlib or this package.
+
+    The lm_eval harness is a container-only dependency, so importing
+    ``sloth.tune._bench`` on the host (where the introspection verbs live) must
+    not need it: the only ``lm_eval`` import sits inside ``run_bench``'s call
+    chain. Mirrors the metrics.py guard above.
+    """
+    code = (
+        "import ast, sys, pathlib; "
+        "import sloth.tune._bench as m; "
+        "tree = ast.parse(pathlib.Path(m.__file__).read_text(encoding='utf-8')); "
+        "roots = set(); "
+        "[roots.update(a.name.split('.')[0] for a in n.names) "
+        "for n in tree.body if isinstance(n, ast.Import)]; "
+        "[roots.add(n.module.split('.')[0]) for n in tree.body "
+        "if isinstance(n, ast.ImportFrom) and n.level == 0 and n.module]; "
+        "extra = sorted(r for r in roots "
+        "if r not in sys.stdlib_module_names and r != 'sloth'); "
+        "assert not extra, f'non-stdlib top-level imports in _bench.py: {extra}'; "
+        "print('PASS')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=_REPO_ROOT,
+    )
+    assert result.returncode == 0, (
+        f"Expected returncode 0, got {result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+
+
+def test_bench_import_loads_no_ml_stack():
+    """Importing sloth.tune._bench (and the bench verb) pulls in no ML module."""
+    code = (
+        "import sloth.tune._bench, sloth.cli._commands.bench; import sys; "
+        "heavy = [m for m in ('torch', 'unsloth', 'transformers', 'peft', 'lm_eval') "
+        "if m in sys.modules]; "
+        "assert not heavy, f'bench pulled in {heavy}'; "
         "print('PASS')"
     )
     result = subprocess.run(
