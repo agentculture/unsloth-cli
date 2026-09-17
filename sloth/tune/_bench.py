@@ -45,6 +45,7 @@ records which one the hardware actually took.
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import subprocess  # nosec B404 - fixed argv, no shell, container-local binary
 import tempfile
@@ -76,6 +77,84 @@ MERGE_FALLBACK_HINT = (
     "bench that directory with `sloth bench --model <dir>`. See the "
     "'Warm-cache check for sloth bench' section of docs/dgx-spark.md."
 )
+
+
+# ---------------------------------------------------------------------------
+# Argv validation (every CLI-provided string is checked BEFORE the argv is built)
+# ---------------------------------------------------------------------------
+
+#: An lm_eval ``--tasks`` spec: task names, joined by commas, nothing else. No
+#: shell metacharacters, no whitespace, no ``=`` (which would let a task string
+#: smuggle an extra ``--model_args`` key past the composer).
+_TASK_SPEC_RE = re.compile(r"^[A-Za-z0-9_,.-]+$")
+
+#: A Hugging Face repo id, ``org/name``. Deliberately narrower than the hub's own
+#: rules: no commas, no ``=``, no shell metacharacters.
+_HF_REPO_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+#: Characters that would break out of one ``--model_args`` fragment into another
+#: (``key=value`` pairs joined by ``,``) — never allowed inside a model reference.
+_MODEL_ARGS_SEPARATORS = (",", "=")
+
+
+def _validate_tasks(tasks: str) -> str:
+    """Return *tasks* when it is a plain lm_eval task spec, else ``CliError(code=1)``."""
+    if not _TASK_SPEC_RE.match(tasks):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"invalid --tasks spec: {tasks!r}",
+            remediation=(
+                "A task spec is one or more lm_eval task names joined by commas, using "
+                "only letters, digits, '_', '.', '-' (e.g. `mmlu` or "
+                "`mmlu_astronomy,mmlu_logic`). Drop any spaces or shell characters."
+            ),
+        )
+    return tasks
+
+
+def _validate_count(value: int | None, flag: str) -> int | None:
+    """Return *value* when it is a non-negative integer (or ``None``)."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"invalid {flag}: {value!r}",
+            remediation=f"Pass {flag} as a non-negative whole number, e.g. `{flag} 20`.",
+        )
+    return value
+
+
+def _validate_model_reference(value: str, label: str) -> str:
+    """Return *value* when it is an existing path or a ``org/name`` repo id.
+
+    Everything that reaches ``--model_args`` as ``pretrained=`` / ``peft=`` goes
+    through here: a reference that is neither on disk nor a well-formed hub id —
+    or that carries a ``,``/``=`` and could therefore forge a second
+    ``--model_args`` fragment — is a user error, not something to hand to the
+    harness.
+    """
+    text = str(value)
+    if any(separator in text for separator in _MODEL_ARGS_SEPARATORS):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"invalid {label} reference: {text!r}",
+            remediation=(
+                "A model reference may not contain ',' or '=' — those separate "
+                "lm_eval's --model_args fragments. Rename the directory, or pass a "
+                "Hugging Face repo id of the form org/name."
+            ),
+        )
+    if Path(text).exists() or _HF_REPO_ID_RE.match(text):
+        return text
+    raise CliError(
+        code=EXIT_USER_ERROR,
+        message=f"invalid {label} reference: {text!r}",
+        remediation=(
+            "Pass an existing local directory, or a Hugging Face repo id of the form "
+            "org/name (letters, digits, '.', '_' and '-' only)."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -208,9 +287,19 @@ def _run(cmd: Sequence[str]) -> int:
     stdout/stderr are left attached to this process so the harness's own
     progress lines reach the operator's terminal through
     :func:`sloth.tune.container.launch`'s tee.
+
+    Injection surface: *cmd* is always the fixed argv :func:`lm_eval_command`
+    composes, run with ``shell=False`` (the list form), and every CLI-provided
+    string that reaches it — the task spec, the row/few-shot counts and the
+    model/adapter references — is validated by :func:`_validate_tasks`,
+    :func:`_validate_count` and :func:`_validate_model_reference` before
+    :func:`run_bench` composes the argv. No value can introduce a new flag, a new
+    ``--model_args`` fragment or a shell metacharacter.
     """
     emit_diagnostic(f"running: {shlex.join(cmd)}")
-    return subprocess.run(list(cmd), check=False).returncode  # nosec B603
+    # pythonsecurity:S6350 - shell=False list argv; every user-supplied element is
+    # validated in run_bench (see this function's docstring).
+    return subprocess.run(list(cmd), check=False).returncode  # nosec B603 # NOSONAR
 
 
 # ---------------------------------------------------------------------------
@@ -402,12 +491,15 @@ def run_bench(
         results file. The remediation names the merged-16-bit fallback.
     """
     target = Path(target_path)
-    task_spec = tasks or benchmark
+    task_spec = _validate_tasks(tasks or benchmark)
+    num_fewshot = _validate_count(num_fewshot, "--num-fewshot") or 0
+    limit = _validate_count(limit, "--limit")
     if kind == "adapter":
         base, load_in_4bit = resolve_adapter_target(target)
-        peft: str | None = str(target)
+        peft: str | None = _validate_model_reference(str(target), "adapter")
     else:
         base, load_in_4bit, peft = str(target), False, None
+    base = _validate_model_reference(base, "model")
 
     with tempfile.TemporaryDirectory(prefix="sloth-bench-") as tmp:
         cmd = lm_eval_command(

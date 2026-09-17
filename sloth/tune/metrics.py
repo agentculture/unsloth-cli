@@ -168,6 +168,38 @@ def score_records(
     return results
 
 
+def _is_metric_number(value: Any) -> bool:
+    """Return whether *value* counts as a foldable numeric metric.
+
+    ``bool`` is an ``int`` subclass in Python, but a boolean row field (e.g.
+    ``exact_match``) is a flag, not a metric — so it is excluded.
+    """
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _generic_metric_keys(results: Sequence[dict[str, Any]]) -> list[str]:
+    """Return the sorted row keys that :func:`summarize` folds in generically."""
+    keys: set[str] = set()
+    for row in results:
+        for key, value in row.items():
+            if key not in _NON_METRIC_KEYS and key != "f1" and _is_metric_number(value):
+                keys.add(key)
+    return sorted(keys)
+
+
+def _fold_generic_metrics(results: Sequence[dict[str, Any]]) -> dict[str, float]:
+    """Mean every generic numeric metric across the rows that reported it.
+
+    Keys are visited in sorted order and each mean is rounded to
+    :data:`_F1_PLACES`; a key no row reported a number for scores ``0.0``.
+    """
+    folded: dict[str, float] = {}
+    for key in _generic_metric_keys(results):
+        values = [float(row[key]) for row in results if _is_metric_number(row.get(key))]
+        folded[key] = round(sum(values) / len(values), _F1_PLACES) if values else 0.0
+    return folded
+
+
 def summarize(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """Return ``{total, exact_match, exact_match_pct, f1, ...}`` over scored *results*.
 
@@ -191,24 +223,7 @@ def summarize(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "f1": round(mean_f1, _F1_PLACES),
     }
 
-    numeric_keys: set[str] = set()
-    for row in results:
-        for key, value in row.items():
-            if key in _NON_METRIC_KEYS or key == "f1":
-                continue
-            if isinstance(value, bool):
-                continue
-            if isinstance(value, (int, float)):
-                numeric_keys.add(key)
-
-    for key in sorted(numeric_keys):
-        values = [
-            float(row[key])
-            for row in results
-            if isinstance(row.get(key), (int, float)) and not isinstance(row.get(key), bool)
-        ]
-        payload[key] = round(sum(values) / len(values), _F1_PLACES) if values else 0.0
-
+    payload.update(_fold_generic_metrics(results))
     return payload
 
 

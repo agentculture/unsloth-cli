@@ -27,6 +27,7 @@ nested under a noun.
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -264,6 +265,29 @@ def _adapter_suites(adapter_dir: Path) -> tuple[list[str], int | None]:
     return files, batch_size
 
 
+def _ensure_writable_results_dir(base_dir: Path) -> None:
+    """Create ``<adapter>/eval-base/`` AS THE HOST USER and require it writable.
+
+    Docker creates a bind-mounted host path that does not exist yet as *root*,
+    and the container runs as the host uid, so its writer would get EACCES on
+    every suite and the base side would come back empty (live-measured
+    2026-09-17, plan risk r15). A leftover root-owned directory from such a run
+    is the same trap, so this runs *before* the adapter re-eval: failing here
+    costs seconds, failing after the base run costs the whole hour.
+    """
+    base_dir.mkdir(parents=True, exist_ok=True)
+    if not os.access(base_dir, os.W_OK):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"base results directory is not writable: {base_dir}",
+            remediation=(
+                "It was probably created as root by an earlier container run. Remove it "
+                f"(`rmdir {base_dir}` works when it is empty) or chown it to your user, "
+                "then re-run."
+            ),
+        )
+
+
 def _launch_eval(
     flag: str,
     reference: str,
@@ -355,79 +379,117 @@ def _check_thresholds(
     for suite in sorted(set(suites_a) & set(suites_b)):
         a = suites_a.get(suite) or {}
         b = suites_b.get(suite) or {}
-
-        acc_a, acc_b = a.get(_ACCURACY_KEY), b.get(_ACCURACY_KEY)
-        if suite in regression_suites and _is_number(acc_a) and _is_number(acc_b):
-            drop = acc_a - acc_b
-            if drop > thresholds.regression_drop_pp:
-                failures.append(
-                    {
-                        "check": "regression",
-                        "suite": suite,
-                        "message": (
-                            f"{suite}: {_ACCURACY_KEY} dropped {drop:.2f} pp "
-                            f"({acc_a} -> {acc_b}), over the "
-                            f"{thresholds.regression_drop_pp} pp allowance"
-                        ),
-                    }
-                )
-
-        compliance = b.get(_COMPLIANCE_KEY)
-        if _is_number(compliance) and compliance < thresholds.compliance_min_pct:
-            failures.append(
-                {
-                    "check": "compliance",
-                    "suite": suite,
-                    "message": (
-                        f"{suite}: adapter {_COMPLIANCE_KEY} {compliance} is below the "
-                        f"{thresholds.compliance_min_pct} minimum"
-                    ),
-                }
-            )
-
-        lat_a, lat_b = a.get(_LATENCY_KEY), b.get(_LATENCY_KEY)
-        if _is_number(lat_a) and _is_number(lat_b) and lat_a > 0:
-            ratio = lat_b / lat_a
-            if ratio > thresholds.latency_max_ratio:
-                failures.append(
-                    {
-                        "check": "latency",
-                        "suite": suite,
-                        "message": (
-                            f"{suite}: median latency ratio {ratio:.3f} "
-                            f"({lat_b} ms vs {lat_a} ms) is over the "
-                            f"{thresholds.latency_max_ratio} maximum"
-                        ),
-                    }
-                )
-
-        for side, metrics in (("base", a), ("adapter", b)):
-            rows = metrics.get(_ROWS_KEY)
-            if _is_number(rows) and rows < thresholds.min_suite_rows:
-                failures.append(
-                    {
-                        "check": "min_suite_rows",
-                        "suite": suite,
-                        "message": (
-                            f"{suite}: the {side} result holds {rows} row(s), under the "
-                            f"{thresholds.min_suite_rows}-row minimum"
-                        ),
-                    }
-                )
-
-        prec_a, prec_b = a.get(_PRECISION_KEY), b.get(_PRECISION_KEY)
-        if prec_a is not None and prec_b is not None and prec_a != prec_b:
-            failures.append(
-                {
-                    "check": "precision",
-                    "suite": suite,
-                    "message": (
-                        f"{suite}: {_PRECISION_KEY} differs between the two result sets "
-                        f"(base={prec_a}, adapter={prec_b})"
-                    ),
-                }
-            )
+        candidates: list[dict[str, Any] | None] = [
+            _regression_failure(suite, a, b, thresholds, regression_suites),
+            _compliance_failure(suite, b, thresholds),
+            _latency_failure(suite, a, b, thresholds),
+            *_min_rows_failures(suite, a, b, thresholds),
+            _precision_failure(suite, a, b, thresholds),
+        ]
+        failures.extend(entry for entry in candidates if entry is not None)
     return failures
+
+
+def _regression_failure(
+    suite: str,
+    a: dict[str, Any],
+    b: dict[str, Any],
+    thresholds: ThresholdsConfig,
+    regression_suites: set[str],
+) -> dict[str, Any] | None:
+    """The ``regression`` gate: a tagged suite's accuracy dropping too far."""
+    acc_a, acc_b = a.get(_ACCURACY_KEY), b.get(_ACCURACY_KEY)
+    if not (suite in regression_suites and _is_number(acc_a) and _is_number(acc_b)):
+        return None
+    drop = acc_a - acc_b
+    if drop <= thresholds.regression_drop_pp:
+        return None
+    return {
+        "check": "regression",
+        "suite": suite,
+        "message": (
+            f"{suite}: {_ACCURACY_KEY} dropped {drop:.2f} pp "
+            f"({acc_a} -> {acc_b}), over the "
+            f"{thresholds.regression_drop_pp} pp allowance"
+        ),
+    }
+
+
+def _compliance_failure(
+    suite: str, b: dict[str, Any], thresholds: ThresholdsConfig
+) -> dict[str, Any] | None:
+    """The ``compliance`` gate: the adapter's ``compliance_pct`` under the floor."""
+    compliance = b.get(_COMPLIANCE_KEY)
+    if not (_is_number(compliance) and compliance < thresholds.compliance_min_pct):
+        return None
+    return {
+        "check": "compliance",
+        "suite": suite,
+        "message": (
+            f"{suite}: adapter {_COMPLIANCE_KEY} {compliance} is below the "
+            f"{thresholds.compliance_min_pct} minimum"
+        ),
+    }
+
+
+def _latency_failure(
+    suite: str, a: dict[str, Any], b: dict[str, Any], thresholds: ThresholdsConfig
+) -> dict[str, Any] | None:
+    """The ``latency`` gate: the adapter/base median-latency ratio over the cap."""
+    lat_a, lat_b = a.get(_LATENCY_KEY), b.get(_LATENCY_KEY)
+    if not (_is_number(lat_a) and _is_number(lat_b) and lat_a > 0):
+        return None
+    ratio = lat_b / lat_a
+    if ratio <= thresholds.latency_max_ratio:
+        return None
+    return {
+        "check": "latency",
+        "suite": suite,
+        "message": (
+            f"{suite}: median latency ratio {ratio:.3f} "
+            f"({lat_b} ms vs {lat_a} ms) is over the "
+            f"{thresholds.latency_max_ratio} maximum"
+        ),
+    }
+
+
+def _min_rows_failures(
+    suite: str, a: dict[str, Any], b: dict[str, Any], thresholds: ThresholdsConfig
+) -> list[dict[str, Any]]:
+    """The ``min_suite_rows`` gate, checked on both sides (base first)."""
+    entries: list[dict[str, Any]] = []
+    for side, side_metrics in (("base", a), ("adapter", b)):
+        rows = side_metrics.get(_ROWS_KEY)
+        if _is_number(rows) and rows < thresholds.min_suite_rows:
+            entries.append(
+                {
+                    "check": "min_suite_rows",
+                    "suite": suite,
+                    "message": (
+                        f"{suite}: the {side} result holds {rows} row(s), under the "
+                        f"{thresholds.min_suite_rows}-row minimum"
+                    ),
+                }
+            )
+    return entries
+
+
+def _precision_failure(
+    suite: str, a: dict[str, Any], b: dict[str, Any], thresholds: ThresholdsConfig
+) -> dict[str, Any] | None:
+    """The ``precision`` guard: both sides stating a different ``base_load_in_4bit``."""
+    del thresholds  # uniform gate signature; this guard reads no threshold number
+    prec_a, prec_b = a.get(_PRECISION_KEY), b.get(_PRECISION_KEY)
+    if prec_a is None or prec_b is None or prec_a == prec_b:
+        return None
+    return {
+        "check": "precision",
+        "suite": suite,
+        "message": (
+            f"{suite}: {_PRECISION_KEY} differs between the two result sets "
+            f"(base={prec_a}, adapter={prec_b})"
+        ),
+    }
 
 
 def _render_base_text(report: dict[str, Any]) -> str:
@@ -481,6 +543,7 @@ def _cmd_compare_base(args: argparse.Namespace) -> int:
     thresholds, source = _resolve_thresholds(getattr(args, "config", None))
     suite_files, batch_size = _adapter_suites(adapter_dir)
     base_dir = adapter_dir / BASE_EVAL_DIR
+    _ensure_writable_results_dir(base_dir)
 
     # Sequential, one model at a time: the adapter is re-scored first (its
     # results stay under <adapter>/eval/), then the base (under eval-base/).
@@ -493,11 +556,8 @@ def _cmd_compare_base(args: argparse.Namespace) -> int:
         batch_size=batch_size,
         workdir=adapter_dir.resolve(),
     )
-    # Pre-create the base results dir AS THE HOST USER: docker creates a
-    # bind-mounted host path that does not exist yet as root, and the container
-    # runs as the host uid, so its writer would get EACCES on every suite and
-    # the base side would silently come back empty (live-measured 2026-09-17).
-    base_dir.mkdir(parents=True, exist_ok=True)
+    # Created as the host user (and checked writable) before the adapter run —
+    # see _ensure_writable_results_dir.
     _launch_eval(
         "--model",
         args.base,

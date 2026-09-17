@@ -636,33 +636,49 @@ def _normalize_named_results(
         return dict(raw_result["suites"])
     files = raw_result.get("files") if isinstance(raw_result, dict) else None
     if not (isinstance(files, list) and files and named_suites):
-        return {name: raw_result for name in suite_names}
+        return dict.fromkeys(suite_names, raw_result)
 
-    by_path: dict[str, dict[str, Any]] = {}
-    for entry in files:
-        path = entry.get("path") if isinstance(entry, dict) else None
-        if isinstance(path, str):
-            by_path[str(Path(path).resolve())] = entry
+    by_path = _index_file_entries(files)
     run_level = {
         key: value
         for key, value in raw_result.items()
         if key in _RUN_LEVEL_KEYS and key not in ("results", "files")
     }
-    named: dict[str, dict[str, Any]] = {}
-    for name in suite_names:
-        entries = [
-            by_path[str(p.resolve())]
-            for p in named_suites.get(name, [])
-            if str(p.resolve()) in by_path
-        ]
-        if not entries:
-            named[name] = raw_result
-            continue
-        payload = dict(entries[0]) if len(entries) == 1 else metrics.aggregate(entries)
-        for key, value in run_level.items():
-            payload.setdefault(key, value)
-        named[name] = payload
-    return named
+    return {
+        name: _suite_payload(named_suites.get(name, []), by_path, raw_result, run_level)
+        for name in suite_names
+    }
+
+
+def _index_file_entries(files: list[Any]) -> dict[str, dict[str, Any]]:
+    """Index the seams' ``files`` entries by their resolved ``path``."""
+    by_path: dict[str, dict[str, Any]] = {}
+    for entry in files:
+        path = entry.get("path") if isinstance(entry, dict) else None
+        if isinstance(path, str):
+            by_path[str(Path(path).resolve())] = entry
+    return by_path
+
+
+def _suite_payload(
+    suite_files: list[Path],
+    by_path: dict[str, dict[str, Any]],
+    raw_result: dict[str, Any],
+    run_level: dict[str, Any],
+) -> dict[str, Any]:
+    """Return one suite's payload: its own file entries, or the whole run.
+
+    The single file entry when the suite named one file, :func:`metrics.aggregate`
+    over its entries when it named several, and *raw_result* verbatim when none of
+    the run's file entries belong to it.
+    """
+    entries = [by_path[str(p.resolve())] for p in suite_files if str(p.resolve()) in by_path]
+    if not entries:
+        return raw_result
+    payload = dict(entries[0]) if len(entries) == 1 else metrics.aggregate(entries)
+    for key, value in run_level.items():
+        payload.setdefault(key, value)
+    return payload
 
 
 #: Run-level keys the seams set once per invocation (not per file) that every

@@ -218,6 +218,24 @@ class TestParseToolCallQwen3:
         result = parse_tool_call(prediction, "qwen3")
         assert result == {"name": "search", "arguments": {"q": "cats"}}
 
+    def test_parses_deeply_nested_object_arguments(self) -> None:
+        """Nested ``{...}`` inside ``arguments`` must still match.
+
+        Regression guard for the tempting S5857 "rewrite ``.*?`` as ``[^}]*``"
+        fix: a negated character class stops at the first inner ``}`` and would
+        fail every nested tool call.
+        """
+        prediction = (
+            "<tool_call>\n"
+            '{"name": "plot", "arguments": {"axes": {"x": {"label": "t"}}, "grid": [1, 2]}}'
+            "\n</tool_call>"
+        )
+        result = parse_tool_call(prediction, "qwen3")
+        assert result == {
+            "name": "plot",
+            "arguments": {"axes": {"x": {"label": "t"}}, "grid": [1, 2]},
+        }
+
     def test_missing_block_raises(self) -> None:
         with pytest.raises(ValueError, match="tool_call"):
             parse_tool_call("no tool call here", "qwen3")
