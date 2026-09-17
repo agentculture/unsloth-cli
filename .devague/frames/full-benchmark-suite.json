@@ -4,7 +4,7 @@
   "schema_version": 6,
   "status": "exported",
   "created": "2026-09-16T20:19:58Z",
-  "updated": "2026-09-17T04:09:23Z",
+  "updated": "2026-09-17T05:11:11Z",
   "claims": [
     {
       "id": "c1",
@@ -980,6 +980,50 @@
       ],
       "origin": "llm",
       "status": "approved"
+    },
+    {
+      "id": "l2",
+      "code": "grader-unverified",
+      "what": "t2 task agent: first draft of test_different_seed_can_differ read the first holdout file after the second split_holdout call had overwritten it, so the assertion was true by construction; caught only when the test failed, fixed by reading before the second call",
+      "skipped_check": "inspect the test's read/write ordering before trusting it",
+      "refs": [
+        "plan full-benchmark-suite t2 / tests/test_tune_datasets.py"
+      ],
+      "origin": "llm",
+      "status": "proposed"
+    },
+    {
+      "id": "l3",
+      "code": "grader-unverified",
+      "what": "t9 task agent wrote the compare --base implementation before its tests; the 30 tests were authored against known-good code and all passed on first run, so they confirm behaviour rather than having driven it",
+      "skipped_check": "red-first test run before implementing",
+      "refs": [
+        "plan full-benchmark-suite t9 / tests/test_cmd_compare.py"
+      ],
+      "origin": "llm",
+      "status": "proposed"
+    },
+    {
+      "id": "l4",
+      "code": "control-absent",
+      "what": "t13 task agent generated the MMLU-style subset before checking its answer distribution (61 of 120 keyed 'B', so a constant answer scored 50.8%); caught by printing a Counter afterwards, fixed by rotating options to balance A-D",
+      "skipped_check": "answer-key distribution check before committing a multiple-choice suite",
+      "refs": [
+        "plan full-benchmark-suite t13 / examples/generate_mmlu_subset.py"
+      ],
+      "origin": "llm",
+      "status": "proposed"
+    },
+    {
+      "id": "l5",
+      "code": "grader-unverified",
+      "what": "t13 task agent's first lazy-import guard for _bench.py used ast.walk (descends into function bodies) copied from the metrics.py guard, which would flag the deliberate lazy import; fixed to walk tree.body only. Its first extra-metrics test also used the scorer's internal constraint shape rather than the suite shape the validator reads",
+      "skipped_check": "run the new guard against a module that has a lazy import before trusting it",
+      "refs": [
+        "plan full-benchmark-suite t13 / tests/test_lazy_import.py"
+      ],
+      "origin": "llm",
+      "status": "proposed"
     }
   ],
   "obligations": []

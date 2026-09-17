@@ -5,7 +5,7 @@
   "schema_version": 5,
   "status": "exported",
   "created": "2026-09-17T04:09:32Z",
-  "updated": "2026-09-17T04:15:14Z",
+  "updated": "2026-09-17T08:31:32Z",
   "targets": [
     {
       "id": "c1",
@@ -764,6 +764,94 @@
       "text": "UMA headroom for the live run: lobes vLLM resident (~90 of 121 GB) OOMs a 1.2B train; the live run needs the box freed or the page-cache trick, and its numbers depend on what else is resident",
       "kind": "unknown_nonblocking",
       "task_id": "t16",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r6",
+      "text": "sacrebleu 2.6.0 exposes no GLEU metric: scorers.gleu lazy-imports sacrebleu for its tokenizer only and computes Google-GLEU (Wu et al. 2016) in pure Python; bleu() delegates to sacrebleu. Disclosed in the docstring; reviewers expecting a native sentence_gleu should read that",
+      "kind": "follow_up",
+      "task_id": "t4",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r7",
+      "text": "summary['eval'] top-level exact_match_pct/f1 come from a suite literally named 'target' when present, else the first suite in glob order; no CLI path names a suite 'target' yet \u2014 t9 (compare) and t14 (skill/docs) must either adopt that name for the target-task suite or accept the first-suite fallback",
+      "kind": "follow_up",
+      "task_id": "t9",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r8",
+      "text": "t10 placed instruction/structured/toolcall suites under examples/eval/, so the documented 'sloth validate --suite examples/eval/' (validate.py SUITE_SCHEMA=task) exits 1; also datasets.detect_schema still returns only chat/task, so t6 added a local fallback detector in _trainer.py. Deviation d1 covers both: centralise detection of the five schemas in datasets.detect_schema and make validate --suite use it; sloth eval's directory form then also uses the central detector",
+      "kind": "unknown_blocking",
+      "task_id": "t14",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r9",
+      "text": "t11 left the 'local dataset path outside the repo is mounted read-only' criterion unimplemented: the :ro flag needs container.py's mount builder, which was off-limits to it; datasets are mounted read-write today. Small follow-up: add an extra_mounts read-only option in build_command and use it for external dataset paths",
+      "kind": "follow_up",
+      "task_id": "t11",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r10",
+      "text": "with [eval] holdout_fraction > 0, split_holdout renders chat rows to task rows on BOTH sides, so a chat-schema corpus (e.g. examples/demo-corpus.jsonl) trains on 'role: content' text instead of the tokenizer chat template; the no-holdout path keeps the template. Follow-up: split_holdout should keep chat rows on the train side and only render the holdout side (its returned 'schema' key reports the source schema, not the output)",
+      "kind": "follow_up",
+      "task_id": "t7",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r11",
+      "text": "compare --base precision guard only fires when both result sets state base_load_in_4bit; a --model base run records None today (eval has no flag to state it), so the guard is vacuous until the base eval records precision \u2014 t16's live run must set it (derive from the model dir's quantization_config or a new --base-load-in-4bit flag)",
+      "kind": "follow_up",
+      "task_id": "t9",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r12",
+      "text": "eval's default overlap check reads dataset.path from training_metadata.json (the full corpus), so the holdout suite the run itself split off is flagged as overlapping; when metadata has holdout.train_path the check should use it. Workaround in the live run: --train-dataset examples/demo-corpus.train.jsonl",
+      "kind": "follow_up",
+      "task_id": "t8",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r13",
+      "text": "MEASURED 2026-09-17: on LFM2.5-1.2B the batched eval path (left padding, batch 8) produces degenerate generations (runs of ':' or echoed 'Input:' lines) and 0/46 exact on the target suites, while batch 1 on the same adapter and suites scores cli-contract 5/14, task-format 9/16, holdout 6/59. Batched decoding is not merely non-bit-identical (#28 r8) \u2014 it is invalid for LFM2's short-conv layers under left padding. Every accuracy/latency number for LFM2 must be batch 1 until the eval loop gains a per-family padding guard (follow-up: default batch 1 for lfm2, or right-pad with a position-id fix)",
+      "kind": "follow_up",
+      "task_id": "t6",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r14",
+      "text": "MEASURED 2026-09-17: gguf Q4_K_M export of the fixture adapter scores 0/46 exact on the target suites (F1 0.24/0.48/0.36) where merged-16bit scores 14/46 (F1 0.27/0.62/0.63), AWQ 12/46 and NVFP4 9/46 \u2014 the GGUF path (llama-completion, whitespace token approximation, no chat/task template guarantee) loses far more than the other quantisations; follow-up: verify the llama.cpp prompt path renders the same Task:/Input:/Output: prompt and stop conditions before attributing the loss to Q4_K_M itself",
+      "kind": "follow_up",
+      "task_id": "t16",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r15",
+      "text": "MEASURED 2026-09-17: compare --base's second container run could not write its results \u2014 docker creates a bind-mounted host path that does not yet exist as root, so <adapter>/eval-base/ was root-owned and the in-container uid-1000 writer got EACCES on every suite; compare then read an empty base side and reported passed=true with one-sided deltas. Fix: pre-create the results dir on the host before launching and fail (exit 1) when the base side has no results at all",
+      "kind": "follow_up",
+      "task_id": "t9",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r16",
+      "text": "MEASURED 2026-09-17: the base LFM2.5-1.2B scores 75.8% letter accuracy on examples/eval/mmlu-subset.jsonl and the fixture adapter 61.7% \u2014 a 14 pp general-knowledge regression that the new suites expose but the compare gate does not fail, because regression_drop_pp is applied to exact_match_pct of regression-tagged suites only. Follow-up: gate choice_acc_pct (and compliance_pct) on any regression-tagged suite, and let --regression-suite tag mmlu-subset by default",
+      "kind": "follow_up",
+      "task_id": "t9",
       "resolved": false,
       "resolution": ""
     }
