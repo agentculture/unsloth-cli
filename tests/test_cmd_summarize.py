@@ -332,13 +332,49 @@ def _write_eval_json(directory: Path, payload: dict = _EVAL_PAYLOAD) -> None:
 def test_summary_json_includes_eval_block_when_present(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """A legacy-only run dir (predates suite-keying) keeps unchanged top-level
+    exact_match_pct/f1 (h19) plus a 'suites' block carrying the same numbers
+    under the 'legacy' suite key."""
     output_dir = tmp_path / "adapter"
     _write_eval_json(output_dir)
 
     rc = cmd_summarize(_args(str(output_dir), json_mode=True))
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["eval"] == {"exact_match_pct": 75.0, "f1": 0.82, "file_count": 2}
+    assert payload["eval"]["exact_match_pct"] == 75.0
+    assert payload["eval"]["f1"] == 0.82
+    assert set(payload["eval"]["suites"]) == {"legacy"}
+    assert payload["eval"]["suites"]["legacy"]["exact_match_pct"] == 75.0
+    assert payload["eval"]["suites"]["legacy"]["f1"] == 0.82
+    assert payload["eval"]["suites"]["legacy"]["file_count"] == 2
+
+
+def test_summary_json_mixed_eval_dir_reports_both_suites(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A run dir with both eval/<suite>.json AND a legacy eval.json reports
+    both suites (covers h19/c33's 'mixed dir reports both')."""
+    output_dir = tmp_path / "adapter"
+    _write_eval_json(output_dir)
+    eval_dir = output_dir / "eval"
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    holdout_payload = dict(_EVAL_PAYLOAD)
+    holdout_payload.update(
+        schema_version=2,
+        suite="holdout",
+        batch_size=4,
+        target="adapter",
+        written_at="2026-07-06T03:00:00+00:00",
+        base_load_in_4bit=False,
+    )
+    (eval_dir / "holdout.json").write_text(json.dumps(holdout_payload), encoding="utf-8")
+
+    rc = cmd_summarize(_args(str(output_dir), json_mode=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert set(payload["eval"]["suites"]) == {"legacy", "holdout"}
+    assert payload["eval"]["suites"]["holdout"]["batch_size"] == 4
+    assert payload["eval"]["suites"]["holdout"]["base_load_in_4bit"] is False
 
 
 def test_summary_text_mode_shows_eval_block(
@@ -351,9 +387,35 @@ def test_summary_text_mode_shows_eval_block(
     assert rc == 0
     out = capsys.readouterr().out
     assert "eval:" in out
+    assert "suite: legacy" in out
     assert "75.0" in out
     assert "0.82" in out
     assert "files:" in out
+
+
+def test_summary_text_mode_shows_batch_size_and_base_precision(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output_dir = tmp_path / "adapter"
+    eval_dir = output_dir / "eval"
+    eval_dir.mkdir(parents=True)
+    payload = dict(_EVAL_PAYLOAD)
+    payload.update(
+        schema_version=2,
+        suite="holdout",
+        batch_size=16,
+        target="adapter",
+        written_at="2026-07-06T03:00:00+00:00",
+        base_load_in_4bit=True,
+    )
+    (eval_dir / "holdout.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    rc = cmd_summarize(_args(str(output_dir)))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "suite: holdout" in out
+    assert "batch_size: 16" in out
+    assert "base_load_in_4bit: True" in out
 
 
 def test_summary_omits_eval_block_silently_when_absent(

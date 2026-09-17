@@ -485,6 +485,15 @@ Both halves are optional: a run with no checkpoint yet, or a missing
 `training_metadata.json`, still summarizes — the gap is recorded in a `notes`
 list rather than raised as an error.
 
+When the run has eval results, the `eval` block lists every suite found —
+both the newer `eval/<suite>.json` files (one per named suite, e.g.
+`target`, `holdout`) and, for older run dirs, the flat legacy `eval.json`
+(shown as suite `legacy`) — each carrying its own metrics, file count,
+`batch_size` and base precision (`base_load_in_4bit`). The block also keeps
+top-level `exact_match_pct`/`f1` fields (taken from the `target` suite when
+present, else the first suite) so older readers of `summarize`'s output keep
+working unchanged.
+
 ## Usage
 
     unsloth-cli summarize <run_id>

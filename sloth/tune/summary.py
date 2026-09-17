@@ -27,6 +27,7 @@ from typing import Any
 
 from sloth.cli._errors import CliError
 from sloth.tune.metadata import read_metadata
+from sloth.tune.metrics import EVAL_JSON_DIR, EVAL_JSON_NAME
 
 _CHECKPOINT_PREFIX = "checkpoint-"
 
@@ -104,21 +105,27 @@ def _training_progress(state: dict[str, Any]) -> dict[str, Any]:
 # Eval discovery
 # ---------------------------------------------------------------------------
 
-_EVAL_JSON_NAME = "eval.json"
+#: The suite key used for a flat, legacy ``eval.json`` (predates suite-keyed
+#: ``eval/<suite>.json`` files — see :func:`sloth.tune.metrics.write_eval_json`).
+_LEGACY_SUITE_NAME = "legacy"
+
+#: Bookkeeping keys on an eval payload that are never folded in as a numeric
+#: metric, even when their value happens to be a number (``schema_version``).
+#: ``batch_size`` and ``base_load_in_4bit`` are also bookkeeping, but they are
+#: handled explicitly by :func:`_eval_summary` (rendered even when ``None``),
+#: not silently dropped, so they are not listed here.
+_EVAL_METRIC_EXCLUDE_KEYS = frozenset({"schema_version"})
 
 
-def read_eval(output_dir: str | Path) -> dict[str, Any] | None:
-    """Read+parse ``eval.json`` directly inside *output_dir* (the file
-    :func:`sloth.tune.metrics.write_eval_json` writes for ``sloth eval``).
+def _read_json_file(path: Path) -> dict[str, Any] | None:
+    """Read+parse one JSON object file, tolerating absence/corruption.
 
-    Returns ``None`` on absence, a decode failure, or a parse failure —
-    tolerated, never raised, exactly like :func:`read_trainer_state`.
-    Read-only: this module never computes or recomputes a metric, it only
-    reads the numbers ``sloth eval`` already wrote.
+    Returns ``None`` on a missing file, an OS error, invalid UTF-8, a JSON
+    decode failure, or a payload that isn't a JSON object — never raises.
+    Shared by every eval-result reader in this module.
     """
-    eval_path = Path(output_dir) / _EVAL_JSON_NAME
     try:
-        raw = eval_path.read_text(encoding="utf-8")
+        raw = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return None
     try:
@@ -128,16 +135,116 @@ def read_eval(output_dir: str | Path) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def read_eval(output_dir: str | Path) -> dict[str, dict[str, Any]]:
+    """Read every eval result recorded for *output_dir* as ``{suite: payload}``.
+
+    Two sources are merged:
+
+    * ``<output_dir>/eval/<suite>.json`` — the newer, suite-keyed files
+      written by :func:`sloth.tune.metrics.write_eval_json`'s three-argument
+      call shape. Each file's own ``suite`` field names its key (falling back
+      to the file's stem when that field is missing/not a string).
+    * ``<output_dir>/eval.json`` — the flat, legacy single-file layout (the
+      two-argument call shape). When present it is added under the suite key
+      ``"legacy"`` (see :data:`_LEGACY_SUITE_NAME`), so a pre-existing run dir
+      that predates suite-keying still summarizes exactly as before (h19).
+
+    Absence of either source is not an error, and a corrupt individual file
+    is skipped rather than failing the whole read (tolerated, never raised,
+    exactly like :func:`read_trainer_state`). A run with no eval results at
+    all returns ``{}``. Read-only: this module never computes or recomputes a
+    metric, it only reads the numbers ``sloth eval`` already wrote.
+    """
+    output_path = Path(output_dir)
+    suites: dict[str, dict[str, Any]] = {}
+
+    eval_dir = output_path / EVAL_JSON_DIR
+    if eval_dir.is_dir():
+        for path in sorted(eval_dir.glob("*.json")):
+            payload = _read_json_file(path)
+            if payload is None:
+                continue
+            suite = payload.get("suite")
+            suite_name = suite if isinstance(suite, str) and suite else path.stem
+            suites[suite_name] = payload
+
+    legacy_payload = _read_json_file(output_path / EVAL_JSON_NAME)
+    if legacy_payload is not None:
+        suites[_LEGACY_SUITE_NAME] = legacy_payload
+
+    return suites
+
+
 def _eval_summary(payload: dict[str, Any]) -> dict[str, Any]:
-    """Reduce a parsed ``eval.json`` payload to the aggregate fields a
-    summary cares about: ``exact_match_pct``, ``f1``, and the suite file
-    count (``len(payload["files"])``)."""
+    """Reduce one suite's eval payload to its summary block.
+
+    Every top-level numeric field (``exact_match_pct``, ``f1``, ``total``,
+    ``exact_match``, and any custom metric a scorer added — see
+    :func:`sloth.tune.metrics.summarize`) is folded in generically: any key
+    whose value is a ``bool``, ``list``, or ``dict`` is skipped, and
+    :data:`_EVAL_METRIC_EXCLUDE_KEYS` drops pure bookkeeping fields, so a
+    brand-new metric name shows up here without this function ever knowing it
+    in advance. On top of that generic fold, this always adds the suite's
+    file count (``len(payload["files"])``) and, when the key is present on
+    *payload* (even if its value is ``None``), ``batch_size`` and
+    ``base_load_in_4bit`` ("base precision") verbatim.
+    """
+    summary: dict[str, Any] = {}
+    for key, value in payload.items():
+        if key in _EVAL_METRIC_EXCLUDE_KEYS:
+            continue
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (list, dict)):
+            continue
+        if isinstance(value, (int, float)):
+            summary[key] = value
+
     files = payload.get("files")
-    file_count = len(files) if isinstance(files, list) else 0
+    summary["file_count"] = len(files) if isinstance(files, list) else 0
+    if "batch_size" in payload:
+        summary["batch_size"] = payload.get("batch_size")
+    if "base_load_in_4bit" in payload:
+        summary["base_load_in_4bit"] = payload.get("base_load_in_4bit")
+    return summary
+
+
+def _select_target_suite(suites: dict[str, dict[str, Any]]) -> str:
+    """Pick the suite whose ``exact_match_pct``/``f1`` back the top-level,
+    backward-compatible fields on ``build_summary()["eval"]``.
+
+    Prefers a suite literally named ``"target"`` (the target-task suite, once
+    ``sloth eval`` wires suite names through); otherwise falls back to the
+    first suite in *suites* (insertion order — the ``eval/*.json`` files in
+    glob-sorted order, then ``"legacy"`` last). For a run with only a legacy
+    ``eval.json`` (no ``eval/`` dir at all) that first/only suite IS
+    ``"legacy"``, so existing readers of ``summary["eval"]["f1"]`` keep
+    working unchanged (h19).
+    """
+    if "target" in suites:
+        return "target"
+    return next(iter(suites))
+
+
+def _build_eval_block(suites: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    """Build the ``eval`` block of :func:`build_summary` from *suites*.
+
+    Returns ``None`` when *suites* is empty (no eval results at all — no
+    note, degrades silently, exactly like the rest of this module). Otherwise
+    returns ``{"suites": {name: summary, ...}, "exact_match_pct": ..., "f1":
+    ...}`` — the per-suite summaries keyed by suite name, plus the legacy
+    flat ``exact_match_pct``/``f1`` fields taken from the selected suite (see
+    :func:`_select_target_suite`) so old readers of ``summary["eval"]["f1"]``
+    keep working without change.
+    """
+    if not suites:
+        return None
+    suite_summaries = {name: _eval_summary(payload) for name, payload in suites.items()}
+    chosen = suite_summaries[_select_target_suite(suites)]
     return {
-        "exact_match_pct": payload.get("exact_match_pct"),
-        "f1": payload.get("f1"),
-        "file_count": file_count,
+        "suites": suite_summaries,
+        "exact_match_pct": chosen.get("exact_match_pct"),
+        "f1": chosen.get("f1"),
     }
 
 
@@ -286,11 +393,25 @@ def build_summary(output_dir: str | Path) -> dict[str, Any]:
                                        # export's own output dir has an
                                        # eval.json
             "eval": {
-                "exact_match_pct": float | None,
-                "f1": float | None,
-                "file_count": int,
+                "suites": {
+                    "<suite name>": {          # e.g. "target", "holdout", "legacy"
+                        "exact_match_pct": float,
+                        "f1": float,
+                        "total": int,          # plus any other numeric metric key
+                        "file_count": int,
+                        "batch_size": int | None,          # when present on the suite's file
+                        "base_load_in_4bit": bool | None,  # when present on the suite's file
+                    },
+                    ...
+                },
+                "exact_match_pct": float | None,  # from the "target" suite when present,
+                "f1": float | None,               # else the first suite (see
+                                                   # _select_target_suite) — kept so
+                                                   # existing readers of
+                                                   # summary["eval"]["f1"] keep working
             } | None,                 # read_eval(output_dir) — None, silently,
-                                       # when no eval.json is present
+                                       # when no eval results (neither eval/*.json nor a
+                                       # legacy eval.json) are present
             "notes": list[str],       # what was skipped/degraded, and why
         }
 
@@ -298,11 +419,13 @@ def build_summary(output_dir: str | Path) -> dict[str, Any]:
     ``trainer_state.json`` degrades that half to ``None`` plus a note in
     ``notes`` — the other half (and the overall summary) is still returned.
     Likewise a missing/corrupt export index or record degrades ``exports`` to
-    ``[]`` (or a partial list) plus a note, never an exception. A missing
-    ``eval.json`` (at *output_dir* or at any export's own output dir) is not
-    an error and adds no note — it degrades to ``None`` (or an absent
-    ``"eval"`` key on an export entry) silently, exactly like an export-free
-    run's empty ``exports`` list.
+    ``[]`` (or a partial list) plus a note, never an exception. Missing eval
+    results (at *output_dir* or at any export's own output dir) are not an
+    error and add no note — they degrade to ``None`` (or an absent ``"eval"``
+    key on an export entry) silently, exactly like an export-free run's empty
+    ``exports`` list. A run dir that predates suite-keyed eval results (only a
+    flat ``eval.json``, no ``eval/`` dir) still summarizes with unchanged
+    ``exact_match_pct``/``f1`` (h19) — it becomes the single ``"legacy"`` suite.
     """
     output_path = Path(output_dir)
     notes: list[str] = []
@@ -329,16 +452,15 @@ def build_summary(output_dir: str | Path) -> dict[str, Any]:
     exports, export_notes = discover_exports(output_path)
     notes.extend(export_notes)
 
-    eval_payload = read_eval(output_path)
-    eval_summary = _eval_summary(eval_payload) if eval_payload is not None else None
+    eval_summary = _build_eval_block(read_eval(output_path))
 
     for export in exports:
         export_output = export.get("output")
         if not export_output or not isinstance(export_output, (str, os.PathLike)):
             continue
-        export_eval_payload = read_eval(export_output)
-        if export_eval_payload is not None:
-            export["eval"] = _eval_summary(export_eval_payload)
+        export_eval_block = _build_eval_block(read_eval(export_output))
+        if export_eval_block is not None:
+            export["eval"] = export_eval_block
 
     return {
         "output_dir": str(output_path),

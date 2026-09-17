@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from sloth.tune.metrics import EVAL_JSON_DIR
 from sloth.tune.summary import build_summary, discover_exports, read_eval
 
 _RECORD_A = {
@@ -240,42 +241,145 @@ def _write_eval_json(directory: Path, payload: dict) -> Path:
 
 
 def test_read_eval_reads_parsed_payload(tmp_path: Path) -> None:
+    """A flat legacy eval.json (no eval/ dir) reads as the single 'legacy' suite."""
     adapter = tmp_path / "adapter"
     _write_eval_json(adapter, _EVAL_PAYLOAD)
 
-    payload = read_eval(adapter)
+    suites = read_eval(adapter)
 
-    assert payload is not None
-    assert payload["exact_match_pct"] == 75.0
-    assert len(payload["files"]) == 2
+    assert set(suites) == {"legacy"}
+    assert suites["legacy"]["exact_match_pct"] == 75.0
+    assert len(suites["legacy"]["files"]) == 2
 
 
-def test_read_eval_missing_file_returns_none(tmp_path: Path) -> None:
+def test_read_eval_missing_file_returns_empty_dict(tmp_path: Path) -> None:
     adapter = tmp_path / "adapter"
     adapter.mkdir()
 
-    assert read_eval(adapter) is None
+    assert read_eval(adapter) == {}
 
 
-def test_read_eval_corrupt_file_returns_none(tmp_path: Path) -> None:
+def test_read_eval_corrupt_legacy_file_is_skipped(tmp_path: Path) -> None:
     adapter = tmp_path / "adapter"
     adapter.mkdir()
     (adapter / "eval.json").write_text("not json", encoding="utf-8")
 
-    assert read_eval(adapter) is None
+    assert read_eval(adapter) == {}
+
+
+def _write_suite_eval_json(
+    adapter: Path, suite: str, payload: dict, *, batch_size: int | None = 8
+) -> Path:
+    eval_dir = adapter / EVAL_JSON_DIR
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    record = dict(payload)
+    record["schema_version"] = 2
+    record["suite"] = suite
+    record["batch_size"] = batch_size
+    record["target"] = "adapter"
+    record["written_at"] = "2026-07-06T02:00:00+00:00"
+    record["base_load_in_4bit"] = True
+    path = eval_dir / f"{suite}.json"
+    path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    return path
+
+
+def test_read_eval_reads_suite_keyed_files(tmp_path: Path) -> None:
+    adapter = tmp_path / "adapter"
+    _write_suite_eval_json(adapter, "holdout", _EVAL_PAYLOAD)
+
+    suites = read_eval(adapter)
+
+    assert set(suites) == {"holdout"}
+    assert suites["holdout"]["batch_size"] == 8
+    assert suites["holdout"]["base_load_in_4bit"] is True
+
+
+def test_read_eval_mixed_dir_reads_both_suite_and_legacy(tmp_path: Path) -> None:
+    """h19/c33: a run dir with BOTH the new eval/<suite>.json layout and an
+    old flat eval.json (predating suite-keying) reports both."""
+    adapter = tmp_path / "adapter"
+    _write_suite_eval_json(adapter, "holdout", _EVAL_PAYLOAD)
+    _write_eval_json(adapter, _EVAL_PAYLOAD)
+
+    suites = read_eval(adapter)
+
+    assert set(suites) == {"holdout", "legacy"}
+
+
+def test_read_eval_corrupt_suite_file_is_skipped(tmp_path: Path) -> None:
+    adapter = tmp_path / "adapter"
+    eval_dir = adapter / EVAL_JSON_DIR
+    eval_dir.mkdir(parents=True)
+    (eval_dir / "holdout.json").write_text("not json", encoding="utf-8")
+
+    assert read_eval(adapter) == {}
 
 
 def test_build_summary_includes_eval_block(tmp_path: Path) -> None:
+    """Legacy-only run dir (predates suite-keying, e.g. a072b88): summarizes
+    with unchanged top-level exact_match_pct/f1 (h19), as the sole 'legacy'
+    suite."""
     output_dir = tmp_path / "adapter"
     _write_eval_json(output_dir, _EVAL_PAYLOAD)
 
     summary = build_summary(output_dir)
 
-    assert summary["eval"] == {"exact_match_pct": 75.0, "f1": 0.82, "file_count": 2}
+    assert summary["eval"]["exact_match_pct"] == 75.0
+    assert summary["eval"]["f1"] == 0.82
+    assert set(summary["eval"]["suites"]) == {"legacy"}
+    assert summary["eval"]["suites"]["legacy"]["exact_match_pct"] == 75.0
+    assert summary["eval"]["suites"]["legacy"]["f1"] == 0.82
+    assert summary["eval"]["suites"]["legacy"]["file_count"] == 2
     assert summary["notes"] == [
         "no training_metadata.json found — metadata omitted",
         "no checkpoint-N directory found — no trainer_state.json to read",
     ]
+
+
+def test_build_summary_mixed_eval_reports_both_suites(tmp_path: Path) -> None:
+    output_dir = tmp_path / "adapter"
+    _write_suite_eval_json(output_dir, "holdout", _EVAL_PAYLOAD)
+    _write_eval_json(output_dir, _EVAL_PAYLOAD)
+
+    summary = build_summary(output_dir)
+
+    assert set(summary["eval"]["suites"]) == {"holdout", "legacy"}
+
+
+def test_build_summary_prefers_target_suite_for_top_level_fields(tmp_path: Path) -> None:
+    output_dir = tmp_path / "adapter"
+    other_payload = dict(_EVAL_PAYLOAD)
+    other_payload["exact_match_pct"] = 10.0
+    other_payload["f1"] = 0.1
+    _write_suite_eval_json(output_dir, "holdout", other_payload)
+    target_payload = dict(_EVAL_PAYLOAD)
+    target_payload["exact_match_pct"] = 99.0
+    target_payload["f1"] = 0.99
+    _write_suite_eval_json(output_dir, "target", target_payload)
+
+    summary = build_summary(output_dir)
+
+    assert summary["eval"]["exact_match_pct"] == 99.0
+    assert summary["eval"]["f1"] == 0.99
+
+
+def test_build_summary_falls_back_to_first_suite_when_no_target(tmp_path: Path) -> None:
+    output_dir = tmp_path / "adapter"
+    alpha_payload = dict(_EVAL_PAYLOAD)
+    alpha_payload["exact_match_pct"] = 11.0
+    alpha_payload["f1"] = 0.11
+    _write_suite_eval_json(output_dir, "alpha", alpha_payload)
+    beta_payload = dict(_EVAL_PAYLOAD)
+    beta_payload["exact_match_pct"] = 22.0
+    beta_payload["f1"] = 0.22
+    _write_suite_eval_json(output_dir, "beta", beta_payload)
+
+    summary = build_summary(output_dir)
+
+    # glob-sorted: "alpha" < "beta" -> alpha is the first/only-fallback suite.
+    assert summary["eval"]["exact_match_pct"] == 11.0
+    assert summary["eval"]["f1"] == 0.11
 
 
 def test_build_summary_eval_none_when_absent_no_note(tmp_path: Path) -> None:
@@ -300,7 +404,9 @@ def test_build_summary_attaches_eval_to_export_entry(tmp_path: Path) -> None:
 
     assert len(summary["exports"]) == 1
     export_eval = summary["exports"][0]["eval"]
-    assert export_eval == {"exact_match_pct": 75.0, "f1": 0.82, "file_count": 2}
+    assert export_eval["exact_match_pct"] == 75.0
+    assert export_eval["f1"] == 0.82
+    assert export_eval["suites"]["legacy"]["file_count"] == 2
 
 
 def test_build_summary_export_entry_omits_eval_key_when_absent(tmp_path: Path) -> None:
@@ -346,14 +452,14 @@ def test_build_summary_export_index_with_list_output_is_skipped(tmp_path: Path) 
     assert "eval" not in summary["exports"][0]
 
 
-def test_read_eval_invalid_utf8_returns_none(tmp_path: Path) -> None:
+def test_read_eval_invalid_utf8_returns_empty_dict(tmp_path: Path) -> None:
     """qodo finding: read_eval must tolerate invalid UTF-8 (UnicodeDecodeError)
     exactly like it tolerates OSError/JSON errors — never raise."""
     adapter = tmp_path / "adapter"
     adapter.mkdir()
     (adapter / "eval.json").write_bytes(b"\xff\xfe\x00invalid-utf8")
 
-    assert read_eval(adapter) is None
+    assert read_eval(adapter) == {}
 
 
 def test_build_summary_invalid_utf8_eval_at_run_level_degrades(tmp_path: Path) -> None:
