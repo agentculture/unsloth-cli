@@ -1,10 +1,23 @@
 """Dataset validation for unsloth-cli fine-tuning verbs (pure stdlib, no torch).
 
-Supports two JSONL schemas:
+Supports five JSONL schemas:
 
 * **chat** — each line is ``{"messages": [{"role": <str>, "content": <str>}, ...]}``.
   Valid roles: ``"system"``, ``"user"``, ``"assistant"``.
 * **task** — each line is ``{"task": <str>, "input": <str>, "expected_output": <str>}``.
+* **instruction** — the **task** keys, plus an optional ``"constraints"`` list:
+  ``{"task": <str>, "input": <str>, "expected_output": <str>, "constraints": [...]}``.
+  Each item of ``constraints`` is a single-key object naming one check:
+  ``{"max_words": <int>}``, ``{"min_words": <int>}``, ``{"must_contain": <str>}``,
+  ``{"must_not_contain": <str>}``, ``{"must_refuse": <bool>}``, or
+  ``{"json_only": <bool>}``. Any other key on a constraint object is rejected by name.
+* **structured** — ``{"task": <str>, "input": <str>, "json_schema": <object>}`` where
+  ``json_schema`` is a JSON-Schema **subset**: only the keywords ``type``,
+  ``required``, ``properties``, ``enum``, ``items``, and ``additionalProperties``
+  are recognised (nested inside ``properties``/``items`` recursively); any other
+  keyword anywhere in the schema is a validation error naming that keyword.
+* **toolcall** — ``{"task": <str>, "input": <str>, "expected_tool_call":
+  {"name": <str>, "arguments": <object>}}``.
 
 Usage::
 
@@ -13,14 +26,32 @@ Usage::
     records = validate_dataset("train.jsonl", schema="chat")
     # => list[dict] on success, CliError raised on the first invalid line
 
-Public API is intentionally small; all error paths raise :class:`CliError`
-so callers never have to inspect return codes.
+Two further helpers support cross-dataset hygiene, both **pure stdlib** and
+neither one raises ``CliError`` itself — they hand back findings for a CLI
+caller (see ``sloth train``/``sloth eval``, wired in a later task) to turn
+into a ``CliError`` with a hint naming the offenders:
+
+* :func:`split_holdout` — a seeded, deterministic train/holdout split. Chat
+  rows are rendered down into scorable **task** rows: the prompt is every
+  message but the final (assistant) turn, rendered as deterministic
+  ``"role: content"`` lines joined by newlines (there is no tokenizer in this
+  stdlib-only core, so this plain-text rendering is the documented, stable
+  contract), and ``expected_output`` is the final message's content.
+* :func:`overlap_check` — normalises **chat** and **task** rows (on both
+  sides) to a ``(prompt, expected_output)`` pair and reports every ``path:line``
+  location that shares a pair with another location in the checked set — this
+  is how train/eval leakage across the chat and task schemas is caught.
+
+Public API is intentionally small; validation error paths raise
+:class:`CliError` so callers never have to inspect return codes.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import random
+from collections import defaultdict
 from pathlib import Path
 
 from sloth.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
@@ -32,7 +63,26 @@ from sloth.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 VALID_ROLES = frozenset({"system", "user", "assistant"})
 CHAT_KEYS = frozenset({"messages"})
 TASK_KEYS = frozenset({"task", "input", "expected_output"})
-KNOWN_SCHEMAS = frozenset({"chat", "task"})
+INSTRUCTION_KEYS = TASK_KEYS | {"constraints"}
+STRUCTURED_KEYS = frozenset({"task", "input", "json_schema"})
+TOOLCALL_KEYS = frozenset({"task", "input", "expected_tool_call"})
+TOOLCALL_INNER_KEYS = frozenset({"name", "arguments"})
+
+CONSTRAINT_VALUE_TYPES: dict[str, type] = {
+    "max_words": int,
+    "min_words": int,
+    "must_contain": str,
+    "must_not_contain": str,
+    "must_refuse": bool,
+    "json_only": bool,
+}
+ALLOWED_CONSTRAINT_KEYS = frozenset(CONSTRAINT_VALUE_TYPES)
+
+JSON_SCHEMA_SUBSET_KEYWORDS = frozenset(
+    {"type", "required", "properties", "enum", "items", "additionalProperties"}
+)
+
+KNOWN_SCHEMAS = frozenset({"chat", "task", "instruction", "structured", "toolcall"})
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +234,328 @@ def _validate_task_record(record: object, line_no: int) -> None:
             )
 
 
+def _validate_constraint(constraint: object, idx: int, line_no: int) -> None:
+    """Raise CliError if a single ``constraints[idx]`` object is malformed."""
+    if not isinstance(constraint, dict):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=(
+                f"line {line_no}: constraints[{idx}] must be a JSON object, "
+                f"got {type(constraint).__name__}"
+            ),
+            remediation=(
+                f"Each constraint must be a single-key object, one of: "
+                f"{sorted(ALLOWED_CONSTRAINT_KEYS)}."
+            ),
+        )
+
+    extra = set(constraint.keys()) - ALLOWED_CONSTRAINT_KEYS
+    if extra:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"line {line_no}: constraints[{idx}] has unknown key(s) {sorted(extra)!r}",
+            remediation=f"Constraint keys must be one of: {sorted(ALLOWED_CONSTRAINT_KEYS)}.",
+        )
+
+    if len(constraint) != 1:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=(
+                f"line {line_no}: constraints[{idx}] must have exactly one key, "
+                f"got {sorted(constraint.keys())!r}"
+            ),
+            remediation=f"Constraint keys must be one of: {sorted(ALLOWED_CONSTRAINT_KEYS)}.",
+        )
+
+    ((key, value),) = constraint.items()
+    expected_type = CONSTRAINT_VALUE_TYPES[key]
+    # bool is an int subclass in Python; guard int-typed keys against bool values
+    # and vice versa so True/False never silently satisfies an int constraint.
+    type_ok = isinstance(value, expected_type) and not (
+        expected_type is int and isinstance(value, bool)
+    )
+    if not type_ok:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=(
+                f'line {line_no}: constraints[{idx}]["{key}"] must be a '
+                f"{expected_type.__name__}, got {type(value).__name__}"
+            ),
+            remediation=f'"{key}" must be a {expected_type.__name__}.',
+        )
+
+
+def _validate_instruction_record(record: object, line_no: int) -> None:
+    """Raise CliError if *record* does not conform to the instruction schema."""
+    if not isinstance(record, dict):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"line {line_no}: expected a JSON object, got {type(record).__name__}",
+            remediation=(
+                "Each line must be a JSON object: "
+                '{"task": ..., "input": ..., "expected_output": ..., "constraints": [...]}'
+            ),
+        )
+
+    extra = set(record.keys()) - INSTRUCTION_KEYS
+    if extra:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"line {line_no}: unexpected keys {sorted(extra)!r} in instruction record",
+            remediation=(
+                'Instruction records may only have keys "task", "input", '
+                '"expected_output", and "constraints".'
+            ),
+        )
+
+    for key in ("task", "input", "expected_output"):
+        if key not in record:
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=f'line {line_no}: missing required key "{key}"',
+                remediation=(
+                    'Instruction records must include "task", "input", '
+                    'and "expected_output" — all strings.'
+                ),
+            )
+        value = record[key]
+        if not isinstance(value, str):
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=(f'line {line_no}: "{key}" must be a string, got {type(value).__name__}'),
+                remediation=f'"{key}" must be a plain string.',
+            )
+
+    if "constraints" in record:
+        constraints = record["constraints"]
+        if not isinstance(constraints, list):
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=(
+                    f'line {line_no}: "constraints" must be a list, '
+                    f"got {type(constraints).__name__}"
+                ),
+                remediation='"constraints" must be a JSON array of constraint objects.',
+            )
+        for idx, constraint in enumerate(constraints):
+            _validate_constraint(constraint, idx, line_no)
+
+
+def _validate_json_schema_subset(schema: object, line_no: int, path: str) -> None:
+    """Raise CliError if *schema* uses a keyword outside the documented subset.
+
+    Recognised keywords: ``type``, ``required``, ``properties``, ``enum``,
+    ``items``, ``additionalProperties``. ``properties`` values and ``items``
+    are validated recursively as nested schemas.
+    """
+    if not isinstance(schema, dict):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"line {line_no}: {path} must be a JSON object, got {type(schema).__name__}",
+            remediation=f"{path} must be a JSON-Schema-subset object.",
+        )
+
+    extra = set(schema.keys()) - JSON_SCHEMA_SUBSET_KEYWORDS
+    if extra:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=(f"line {line_no}: {path} uses unsupported keyword(s) {sorted(extra)!r}"),
+            remediation=(
+                f"Only these JSON-Schema keywords are supported: "
+                f"{sorted(JSON_SCHEMA_SUBSET_KEYWORDS)}."
+            ),
+        )
+
+    if "type" in schema and not isinstance(schema["type"], str):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f'line {line_no}: {path}["type"] must be a string',
+            remediation='"type" must be a JSON-Schema type name, e.g. "object" or "string".',
+        )
+
+    if "required" in schema:
+        required = schema["required"]
+        if not isinstance(required, list) or not all(isinstance(r, str) for r in required):
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=f'line {line_no}: {path}["required"] must be a list of strings',
+                remediation='"required" must be a JSON array of property-name strings.',
+            )
+
+    if "additionalProperties" in schema and not isinstance(schema["additionalProperties"], bool):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f'line {line_no}: {path}["additionalProperties"] must be a boolean',
+            remediation='"additionalProperties" must be true or false.',
+        )
+
+    if "enum" in schema and not isinstance(schema["enum"], list):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f'line {line_no}: {path}["enum"] must be a list',
+            remediation='"enum" must be a JSON array of allowed values.',
+        )
+
+    if "properties" in schema:
+        properties = schema["properties"]
+        if not isinstance(properties, dict):
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=f'line {line_no}: {path}["properties"] must be a JSON object',
+                remediation='"properties" must map property names to nested schemas.',
+            )
+        for prop_name, prop_schema in properties.items():
+            _validate_json_schema_subset(
+                prop_schema, line_no, f'{path}["properties"]["{prop_name}"]'
+            )
+
+    if "items" in schema:
+        _validate_json_schema_subset(schema["items"], line_no, f'{path}["items"]')
+
+
+def _validate_structured_record(record: object, line_no: int) -> None:
+    """Raise CliError if *record* does not conform to the structured schema."""
+    if not isinstance(record, dict):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"line {line_no}: expected a JSON object, got {type(record).__name__}",
+            remediation=(
+                "Each line must be a JSON object: "
+                '{"task": ..., "input": ..., "json_schema": {...}}'
+            ),
+        )
+
+    extra = set(record.keys()) - STRUCTURED_KEYS
+    if extra:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"line {line_no}: unexpected keys {sorted(extra)!r} in structured record",
+            remediation='Structured records must have exactly keys "task", "input", "json_schema".',
+        )
+
+    for key in ("task", "input"):
+        if key not in record:
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=f'line {line_no}: missing required key "{key}"',
+                remediation=f'Structured records must include "{key}" (a string).',
+            )
+        if not isinstance(record[key], str):
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=(
+                    f'line {line_no}: "{key}" must be a string, '
+                    f"got {type(record[key]).__name__}"
+                ),
+                remediation=f'"{key}" must be a plain string.',
+            )
+
+    if "json_schema" not in record:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f'line {line_no}: missing required key "json_schema"',
+            remediation=(
+                'Structured records must include "json_schema": a JSON-Schema-subset object.'
+            ),
+        )
+
+    _validate_json_schema_subset(record["json_schema"], line_no, "json_schema")
+
+
+def _validate_toolcall_record(record: object, line_no: int) -> None:
+    """Raise CliError if *record* does not conform to the toolcall schema."""
+    if not isinstance(record, dict):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"line {line_no}: expected a JSON object, got {type(record).__name__}",
+            remediation=(
+                "Each line must be a JSON object: "
+                '{"task": ..., "input": ..., "expected_tool_call": {"name": ..., "arguments": ...}}'
+            ),
+        )
+
+    extra = set(record.keys()) - TOOLCALL_KEYS
+    if extra:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"line {line_no}: unexpected keys {sorted(extra)!r} in toolcall record",
+            remediation=(
+                'Toolcall records must have exactly keys "task", "input", "expected_tool_call".'
+            ),
+        )
+
+    for key in ("task", "input"):
+        if key not in record:
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=f'line {line_no}: missing required key "{key}"',
+                remediation=f'Toolcall records must include "{key}" (a string).',
+            )
+        if not isinstance(record[key], str):
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=(
+                    f'line {line_no}: "{key}" must be a string, '
+                    f"got {type(record[key]).__name__}"
+                ),
+                remediation=f'"{key}" must be a plain string.',
+            )
+
+    if "expected_tool_call" not in record:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f'line {line_no}: missing required key "expected_tool_call"',
+            remediation=(
+                'Toolcall records must include "expected_tool_call": '
+                '{"name": <str>, "arguments": <object>}.'
+            ),
+        )
+
+    call = record["expected_tool_call"]
+    if not isinstance(call, dict):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=(
+                f'line {line_no}: "expected_tool_call" must be a JSON object, '
+                f"got {type(call).__name__}"
+            ),
+            remediation='"expected_tool_call" must be {"name": <str>, "arguments": <object>}.',
+        )
+
+    extra_inner = set(call.keys()) - TOOLCALL_INNER_KEYS
+    if extra_inner:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=(
+                f"line {line_no}: unexpected keys {sorted(extra_inner)!r} in expected_tool_call"
+            ),
+            remediation='"expected_tool_call" must have exactly keys "name", "arguments".',
+        )
+
+    if "name" not in call or not isinstance(call.get("name"), str):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f'line {line_no}: "expected_tool_call.name" must be a string',
+            remediation='"expected_tool_call.name" must be the tool name as a string.',
+        )
+
+    if "arguments" not in call or not isinstance(call.get("arguments"), dict):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f'line {line_no}: "expected_tool_call.arguments" must be a JSON object',
+            remediation='"expected_tool_call.arguments" must be a JSON object of tool arguments.',
+        )
+
+
+_SCHEMA_VALIDATORS = {
+    "chat": _validate_chat_record,
+    "task": _validate_task_record,
+    "instruction": _validate_instruction_record,
+    "structured": _validate_structured_record,
+    "toolcall": _validate_toolcall_record,
+}
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -248,7 +620,7 @@ def validate_dataset(
             remediation="Check that the file exists and is readable.",
         ) from exc
 
-    validator = _validate_chat_record if schema == "chat" else _validate_task_record
+    validator = _SCHEMA_VALIDATORS[schema]
 
     records: list[dict] = []
     with fh:
@@ -373,3 +745,242 @@ def validate_suite(path: str | os.PathLike, schema: str = "task") -> dict[str, o
         reported.append({"path": str(file_path), "line_count": len(records)})
         total += len(records)
     return {"files": reported, "total_records": total}
+
+
+# ---------------------------------------------------------------------------
+# Seeded holdout split
+# ---------------------------------------------------------------------------
+
+
+def render_chat_prompt(messages: list[dict]) -> str:
+    """Render chat *messages* as deterministic ``"role: content"`` lines.
+
+    There is no tokenizer in this stdlib-only core, so this plain-text
+    rendering (one line per message, joined by ``"\\n"``, in message order)
+    is the documented, stable contract used to turn a chat row into a
+    scorable prompt string — used by both :func:`split_holdout` and
+    :func:`overlap_check`.
+    """
+    return "\n".join(f'{m["role"]}: {m["content"]}' for m in messages)
+
+
+def _chat_record_to_task_row(record: dict) -> dict:
+    """Convert a valid chat *record* into a scorable task-schema row.
+
+    ``prompt`` (the row's ``"input"``) is every message but the final one,
+    rendered via :func:`render_chat_prompt`; ``"expected_output"`` is the
+    final message's ``"content"``.
+    """
+    messages = record["messages"]
+    prompt = render_chat_prompt(messages[:-1])
+    expected_output = messages[-1]["content"]
+    return {"task": "chat-holdout", "input": prompt, "expected_output": expected_output}
+
+
+def split_holdout(
+    path: str | os.PathLike,
+    fraction: float,
+    seed: int,
+) -> dict[str, object]:
+    """Split the JSONL dataset at *path* into a seeded train/holdout pair.
+
+    The input file's schema is auto-detected (``"chat"`` or ``"task"``, via
+    :func:`detect_schema` on its first record) and every record is validated
+    with :func:`validate_dataset` before the split runs. Chat rows are
+    rendered into scorable task rows (see :func:`render_chat_prompt`) in
+    *both* output files, so a holdout produced from a chat dataset can always
+    be scored without a chat-aware harness.
+
+    Parameters
+    ----------
+    path:
+        Path to the source ``.jsonl`` file.
+    fraction:
+        The holdout's share of records, strictly between 0 and 1.
+    seed:
+        Seed for the deterministic shuffle. The same *path*, *fraction*, and
+        *seed* always produce byte-identical output files — the split order
+        comes from ``random.Random(seed).shuffle`` over the record indices,
+        not from any process-global RNG state.
+
+    Returns
+    -------
+    dict
+        ``{"train_path": Path, "holdout_path": Path, "train_count": int,
+        "holdout_count": int, "schema": str}``.
+
+    Raises
+    ------
+    CliError(code=1)
+        If *fraction* is not strictly between 0 and 1, or the source schema
+        cannot be detected.
+    CliError(code=1|2)
+        Propagated from :func:`validate_dataset` for a malformed or missing
+        source file.
+    """
+    if not 0 < fraction < 1:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"fraction must be strictly between 0 and 1, got {fraction!r}",
+            remediation="Pass a fraction like 0.1 for a 10% holdout.",
+        )
+
+    file_path = Path(path)
+
+    probe_schema: str | None = None
+    try:
+        with file_path.open(encoding="utf-8") as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    probe_schema = detect_schema(json.loads(line))
+                except json.JSONDecodeError:
+                    probe_schema = None
+                break
+    except OSError as exc:
+        raise CliError(
+            code=EXIT_ENV_ERROR,
+            message=f"cannot open dataset file {file_path}: {exc.strerror}",
+            remediation="Check that the file exists and is readable.",
+        ) from exc
+
+    if probe_schema not in ("chat", "task"):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"could not detect a chat or task schema in {file_path} to split",
+            remediation=(
+                "split_holdout only supports chat and task datasets; "
+                "validate the file with `sloth validate` first."
+            ),
+        )
+
+    records = validate_dataset(file_path, probe_schema)
+
+    indices = list(range(len(records)))
+    # Deterministic dataset shuffling, not a security/cryptographic use of
+    # randomness — reproducibility (same seed -> same split) is the goal.
+    random.Random(seed).shuffle(indices)  # nosec B311
+    holdout_count = round(len(records) * fraction)
+    holdout_count = max(0, min(holdout_count, len(records)))
+    holdout_index_set = set(indices[:holdout_count])
+
+    if probe_schema == "chat":
+        converted = [_chat_record_to_task_row(r) for r in records]
+    else:
+        converted = records
+
+    train_records = [converted[i] for i in range(len(records)) if i not in holdout_index_set]
+    holdout_records = [converted[i] for i in range(len(records)) if i in holdout_index_set]
+
+    train_path = file_path.with_name(f"{file_path.stem}.train.jsonl")
+    holdout_path = file_path.with_name(f"{file_path.stem}.holdout.jsonl")
+
+    for out_path, out_records in ((train_path, train_records), (holdout_path, holdout_records)):
+        with out_path.open("w", encoding="utf-8") as fh:
+            for record in out_records:
+                fh.write(json.dumps(record))
+                fh.write("\n")
+
+    return {
+        "train_path": train_path,
+        "holdout_path": holdout_path,
+        "train_count": len(train_records),
+        "holdout_count": len(holdout_records),
+        "schema": probe_schema,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cross-schema train/eval overlap check
+# ---------------------------------------------------------------------------
+
+
+def _normalize_row_for_overlap(record: object) -> tuple[str, str] | None:
+    """Normalise a chat or task *record* to a ``(prompt, expected_output)`` pair.
+
+    Returns ``None`` for anything that isn't a recognisable chat or task-shaped
+    row (e.g. instruction/structured/toolcall rows, or malformed JSON) — those
+    are simply not compared for overlap.
+    """
+    if not isinstance(record, dict):
+        return None
+
+    messages = record.get("messages")
+    if isinstance(messages, list) and messages:
+        last = messages[-1]
+        if not isinstance(last, dict) or "content" not in last:
+            return None
+        prompt = render_chat_prompt(messages[:-1])
+        return (prompt, last["content"])
+
+    if "input" in record and "expected_output" in record:
+        return (record["input"], record["expected_output"])
+
+    return None
+
+
+def overlap_check(
+    train_path: str | os.PathLike,
+    suite_paths: list[str | os.PathLike],
+) -> list[str]:
+    """Find duplicate ``(prompt, expected_output)`` pairs across *train_path* and *suite_paths*.
+
+    Chat and task rows are normalised to a common ``(prompt, expected_output)``
+    pair via :func:`_normalize_row_for_overlap`, so a chat training row and a
+    task eval row that render to the same prompt/answer are correctly caught
+    as the same duplicate. Rows that don't normalise (instruction, structured,
+    toolcall rows, or malformed JSON lines) are silently skipped — they are
+    not compared.
+
+    This function only reports; it never raises :class:`CliError`. A CLI
+    caller (e.g. ``sloth train``) is expected to raise ``CliError(code=1)``
+    with a hint naming the offending locations when the returned list is
+    non-empty.
+
+    Parameters
+    ----------
+    train_path:
+        Path to the training ``.jsonl`` file.
+    suite_paths:
+        Paths to one or more eval-suite ``.jsonl`` files to check against
+        *train_path* (and against each other).
+
+    Returns
+    -------
+    list[str]
+        A sorted list of ``"path:line"`` strings — every location (in
+        *train_path* or any of *suite_paths*) whose normalised pair also
+        appears at another location in the checked set. Empty when there is
+        no overlap.
+    """
+    locations: dict[tuple[str, str], list[str]] = defaultdict(list)
+
+    def _scan(scan_path: Path) -> None:
+        try:
+            fh = scan_path.open(encoding="utf-8")
+        except OSError:
+            return
+        with fh:
+            for line_no, raw_line in enumerate(fh, start=1):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                key = _normalize_row_for_overlap(record)
+                if key is not None:
+                    locations[key].append(f"{scan_path}:{line_no}")
+
+    _scan(Path(train_path))
+    for suite_path in suite_paths:
+        _scan(Path(suite_path))
+
+    duplicates: list[str] = []
+    for locs in locations.values():
+        if len(locs) > 1:
+            duplicates.extend(locs)
+    return sorted(duplicates)
