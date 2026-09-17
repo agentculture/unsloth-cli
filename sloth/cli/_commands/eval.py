@@ -361,23 +361,67 @@ def _render_suite_label(suite_paths: list[Path]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_train_dataset(target_dir: Path, train_dataset_arg: str | None) -> Path | None:
-    """Return the training dataset path to overlap-check against, or ``None``.
+#: Emitted (on stderr) when no training dataset can be resolved at all.
+_NO_TRAIN_DATASET_NOTE = (
+    "note: no --train-dataset given and no training_metadata.json found; "
+    "skipping train/eval overlap check"
+)
 
-    ``--train-dataset`` (when given) always wins. Otherwise, when
-    ``<target_dir>/training_metadata.json`` exists, its ``dataset.path`` field
-    (written by :func:`sloth.tune.metadata.write_metadata`) is used. Returns
-    ``None`` when neither source is available — the caller skips the check and
-    emits a diagnostic rather than failing.
+
+def _is_hub_dataset(dataset: dict[str, Any]) -> bool:
+    """True when a metadata ``dataset`` record names a Hugging Face hub dataset.
+
+    Either shape counts: the ``{"hf_id", "split", "revision"}`` record
+    :func:`sloth.tune.metadata.write_metadata` writes for a ``hf:`` spec, or an
+    explicit ``{"source": "hf"}`` marker.
+    """
+    return bool(dataset.get("hf_id")) or dataset.get("source") == "hf"
+
+
+def _hub_skip_note(dataset: dict[str, Any]) -> str:
+    """The stderr diagnostic for a hub training dataset the check cannot read."""
+    hf_id = dataset.get("hf_id") or "<unknown>"
+    split = dataset.get("split")
+    named = f"{hf_id}:{split}" if split else str(hf_id)
+    return (
+        f"note: training_metadata.json records the Hugging Face hub dataset {named} "
+        "(no local file to diff), so the train/eval overlap check was SKIPPED — the "
+        "eval suite(s) may contain rows the model was trained on. To run it, materialise "
+        "the training rows as a local JSONL and pass --train-dataset <local jsonl>."
+    )
+
+
+def _resolve_train_dataset(
+    target_dir: Path, train_dataset_arg: str | None
+) -> tuple[Path | None, str | None]:
+    """Return ``(training dataset path, skip note)`` for the overlap check.
+
+    ``--train-dataset`` (when given) always wins. Otherwise
+    ``<target_dir>/training_metadata.json`` is consulted: ``holdout.train_path``
+    (the rows actually trained on, once a run split off a holdout — plan risk
+    r12) is preferred over ``dataset.path``, which is the whole pre-split file.
+
+    Exactly one of the two return slots is ever set. A ``None`` path always
+    carries a note explaining the skip, so a **hub** dataset — which has no local
+    file to diff — is reported as an explicit skip on stderr rather than
+    silently passing for a check that never ran.
     """
     if train_dataset_arg:
-        return Path(train_dataset_arg)
+        return Path(train_dataset_arg), None
     try:
         record = metadata.read_metadata(target_dir)
     except CliError:
-        return None
-    dataset_path = record.get("dataset", {}).get("path")
-    return Path(dataset_path) if dataset_path else None
+        return None, _NO_TRAIN_DATASET_NOTE
+    dataset = record.get("dataset")
+    dataset = dataset if isinstance(dataset, dict) else {}
+    holdout = record.get("holdout")
+    holdout = holdout if isinstance(holdout, dict) else {}
+    dataset_path = holdout.get("train_path") or dataset.get("path")
+    if dataset_path:
+        return Path(dataset_path), None
+    if _is_hub_dataset(dataset):
+        return None, _hub_skip_note(dataset)
+    return None, _NO_TRAIN_DATASET_NOTE
 
 
 def _check_train_eval_overlap(
@@ -389,16 +433,14 @@ def _check_train_eval_overlap(
 
     Raises ``CliError(code=1)`` with every duplicated ``file:line`` location
     named in the hint when an overlap is found. When no training dataset can be
-    resolved (neither ``--train-dataset`` nor a readable
-    ``training_metadata.json``), the check is skipped and a diagnostic is
-    emitted on stderr instead of failing.
+    resolved (neither ``--train-dataset`` nor a readable local dataset in
+    ``training_metadata.json``), the check is skipped and the diagnostic
+    :func:`_resolve_train_dataset` chose — a generic one, or the hub-dataset
+    one naming how to run the check — is emitted on stderr instead of failing.
     """
-    train_dataset = _resolve_train_dataset(target_dir, train_dataset_arg)
+    train_dataset, skip_note = _resolve_train_dataset(target_dir, train_dataset_arg)
     if train_dataset is None:
-        emit_diagnostic(
-            "note: no --train-dataset given and no training_metadata.json found; "
-            "skipping train/eval overlap check"
-        )
+        emit_diagnostic(skip_note or _NO_TRAIN_DATASET_NOTE)
         return
     overlaps = datasets.overlap_check(train_dataset, suite_paths)
     if overlaps:
@@ -443,7 +485,7 @@ def _needs_llama_cpp(path: Path) -> bool:
 
 def _launch_container(
     target: _EvalTarget,
-    suite_paths: list[Path],
+    suite_entries: list[str],
     *,
     quant: str | None,
     batch_size: int,
@@ -453,10 +495,14 @@ def _launch_container(
 ) -> dict[str, Any]:
     """Re-run this eval inside the NGC container with ``--in-container``.
 
-    Every resolved suite file is forwarded as its own ``--suite <abs path>`` flag
-    (a directory is already expanded to individual files by
-    :func:`_resolve_named_suites` before this is called), matching the
-    in-container argv contract: ``eval --in-container --json --suite <p> [--suite
+    Every **original** ``--suite`` entry is forwarded as its own ``--suite <abs
+    path>`` flag — a directory entry stays a directory. The host has already
+    resolved and validated every file behind it (:func:`_resolve_named_suites`),
+    but flattening a directory into its children here would make the container
+    name one suite per child file instead of the one suite the caller asked for
+    (``eval/<dirname>.json``). The in-container run re-expands and re-names each
+    entry with the same code, so both sides agree. The argv contract is
+    unchanged: ``eval --in-container --json --suite <p> [--suite
     <p> ...] [--quant q] [--batch-size n] [--perplexity] [--tool-call-family f]``
     plus ``--adapter``/``--model``. ``--json`` is always forwarded to the
     container (unconditionally, regardless of the host's own ``--json`` flag) so
@@ -464,7 +510,7 @@ def _launch_container(
     :func:`~sloth.tune.container.launch` to parse and return; the caller
     re-renders that dict for the host's own ``--json`` flag.
 
-    Identity mounts (``host == container``) for the target's and every suite file's
+    Identity mounts (``host == container``) for the target's and every suite entry's
     parent dirs make the host-absolute paths in *sloth_args* resolve unchanged
     inside the container; ``sorted`` keeps the docker argv deterministic. A
     ``--model`` run also takes everything :func:`container.export_launch_kwargs`
@@ -476,10 +522,10 @@ def _launch_container(
     JSON result line the container printed); raises :class:`CliError` on any
     container failure.
     """
-    suite_abs = [p.resolve() for p in suite_paths]
+    suite_abs = [Path(entry).resolve() for entry in suite_entries]
     sloth_args = ["eval", target.flag, target.reference]
-    for suite_file in suite_abs:
-        sloth_args += ["--suite", str(suite_file)]
+    for suite_entry in suite_abs:
+        sloth_args += ["--suite", str(suite_entry)]
     if quant:
         sloth_args += ["--quant", str(quant)]
     sloth_args += ["--batch-size", str(batch_size)]
@@ -708,7 +754,7 @@ def _write_eval_json_at(
     ``sloth.tune.summary.read_eval(..., subdir="eval-base")``).
     """
     name = metrics.sanitize_suite_name(suite)
-    record = dict(payload)
+    record = metrics.canonicalize_result_paths(dict(payload))
     record["schema_version"] = metrics.SCHEMA_VERSION
     record["suite"] = name
     record["batch_size"] = batch_size
@@ -855,7 +901,7 @@ def cmd_eval(args: argparse.Namespace) -> int | None:
         # normalize() tolerates a flat/legacy dict too (e.g. a test double).
         raw_result = _launch_container(
             target,
-            [p.resolve() for p in suite_paths],
+            list(raw_suite),
             quant=quant,
             batch_size=batch_size,
             perplexity=perplexity,

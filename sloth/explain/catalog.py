@@ -409,7 +409,8 @@ included) into the directory that was evaluated: the adapter directory for
 when a single `.gguf` file is passed. `--results-dir DIR` redirects those
 writes: the same records, written flat into `DIR` instead. That is how
 `unsloth-cli compare --base` keeps a base model's scores in
-`<adapter>/eval-base/` without disturbing the adapter's own `eval/`.
+`<adapter>/eval-base/` and its adapter re-eval in `<adapter>/eval-compare/`
+without disturbing the adapter's own `eval/`.
 
 ## Two targets: `--adapter` or `--model`
 
@@ -767,9 +768,13 @@ reports per-suite, per-metric deltas and checks them against the
 The two models run in **two separate, sequential container invocations** — the
 adapter first, then the base — so they are never resident on the GPU at the
 same time. The base run's per-suite results land under
-`<adapter-dir>/eval-base/<suite>.json` (via `eval --results-dir`), leaving the
-adapter's own `eval/` untouched. When the second run fails (an out-of-memory
-container exit is `2`), the first run's results stay on disk.
+`<adapter-dir>/eval-base/<suite>.json`, and the adapter's own re-eval under
+`<adapter-dir>/eval-compare/<suite>.json` (both via `eval --results-dir`) —
+leaving `<adapter-dir>/eval/`, the record the suite list was read from,
+untouched. Each of those two directories is emptied of stale `*.json` right
+before its run, so the report only ever reads this invocation's numbers. When
+the second run fails (an out-of-memory container exit is `2`), the first run's
+results stay on disk.
 
 ## The `--base` gate
 

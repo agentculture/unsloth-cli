@@ -507,9 +507,12 @@ class _FakeLaunch:
     """Stands in for ``sloth.tune.container.launch``.
 
     Records every invocation's argv and writes the per-suite result files the
-    real in-container ``sloth eval`` would have written: into ``<adapter>/eval``
-    for the ``--adapter`` run, into ``--results-dir`` for the base run. No
-    docker, no GPU. ``fail_on`` (1-based call index) raises instead — the
+    real in-container ``sloth eval`` would have written: into ``--results-dir``
+    when one is given (``<adapter>/eval-compare`` for the adapter run,
+    ``<adapter>/eval-base`` for the base run), into ``<adapter>/eval``
+    otherwise. Which result set is written is decided by the flag the run
+    carries (``--adapter`` vs ``--model``), exactly as the two models differ.
+    No docker, no GPU. ``fail_on`` (1-based call index) raises instead — the
     simulated OOM.
     """
 
@@ -537,12 +540,12 @@ class _FakeLaunch:
                 ),
             )
         results_dir = _flag_value(sloth_args, "--results-dir")
-        if results_dir is None:
-            out = Path(_flag_value(sloth_args, "--adapter")) / "eval"
-            results = self.adapter_results
-        else:
+        is_adapter_run = "--adapter" in sloth_args
+        results = self.adapter_results if is_adapter_run else self.base_results
+        if results_dir is not None:
             out = Path(results_dir)
-            results = self.base_results
+        else:
+            out = Path(_flag_value(sloth_args, "--adapter")) / "eval"
         for name, payload in results.items():
             _write_suite_result(out, name, payload)
         return {"suites": dict(results)}
@@ -585,7 +588,7 @@ def test_compare_base_makes_two_sequential_container_invocations(
     first, second = (c["sloth_args"] for c in fake.calls)
     assert first[:2] == ["eval", "--adapter"]
     assert _flag_value(first, "--adapter") == str(adapter.resolve())
-    assert "--results-dir" not in first
+    assert _flag_value(first, "--results-dir") == str((adapter / "eval-compare").resolve())
     assert second[:2] == ["eval", "--model"]
     assert _flag_value(second, "--model") == "unsloth/Qwen3-4B"
     assert _flag_value(second, "--results-dir") == str((adapter / "eval-base").resolve())
@@ -844,7 +847,7 @@ def test_compare_base_oom_on_second_run_exits_2_and_keeps_first_results(
     assert "batch-size" in exc_info.value.remediation
 
     assert len(fake.calls) == 2
-    first = adapter / "eval" / "regression.json"
+    first = adapter / "eval-compare" / "regression.json"
     assert first.is_file(), "the first run's results must survive the second run's failure"
     assert json.loads(first.read_text(encoding="utf-8"))["exact_match_pct"] == 81.0
     assert not (adapter / "eval-base" / "regression.json").exists()
@@ -967,24 +970,35 @@ def test_compare_base_does_not_gate_a_suite_only_one_side_has(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A legacy ``eval.json`` (read back as the pseudo-suite ``legacy``) has no
-    base-side counterpart: it shows up in the deltas but never fails a gate."""
+    """A suite only the base run produced has no adapter-side counterpart: it
+    shows up in the deltas (with ``None`` for the missing side) but never fails
+    a gate — not even the row-count one it would trip if it were gated.
+
+    A legacy ``eval.json`` under the adapter is likewise never folded into the
+    adapter side: that side is this comparison's own re-eval (``eval-compare/``),
+    not whatever the run directory happens to hold."""
     adapter, suite_file = base_fixture
     _write_eval_json(adapter, exact_match_pct=80.0, f1=0.8)  # 4 rows, under min_suite_rows
+    # The legacy record names "a.jsonl" relative to the run directory (r5).
+    (adapter / "a.jsonl").write_text(suite_file.read_text(encoding="utf-8"), encoding="utf-8")
     _install(
         monkeypatch,
         _FakeLaunch(
             {"regression": _suite_payload("regression", suite_file)},
-            {"regression": _suite_payload("regression", suite_file)},
+            {
+                "regression": _suite_payload("regression", suite_file),
+                "extra": _suite_payload("extra", suite_file, total=1),
+            },
         ),
     )
     rc = cmd_compare(_base_args(str(adapter), "unsloth/Qwen3-4B", json_mode=True))
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["verdict"]["passed"] is True
-    legacy = payload["deltas"]["suites"]["legacy"]
-    assert legacy["exact_match_pct"]["a"] is None
-    assert legacy["exact_match_pct"]["b"] == 80.0
+    extra = payload["deltas"]["suites"]["extra"]
+    assert extra["exact_match_pct"]["a"] == 80.0
+    assert extra["exact_match_pct"]["b"] is None
+    assert "legacy" not in payload["deltas"]["suites"]
 
 
 def test_compare_base_precreates_results_dir_and_fails_on_empty_base_side(
@@ -1036,3 +1050,258 @@ def test_compare_base_refuses_an_unwritable_results_dir_before_any_launch(
     assert "not writable" in exc_info.value.message
     assert str(base_dir) in exc_info.value.remediation
     assert fake.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Qodo review (PR #29) — r2/r3/r4/r5/r6
+# ---------------------------------------------------------------------------
+
+
+def test_compare_base_rescores_the_adapter_into_eval_compare(
+    base_fixture: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """r2: the adapter re-eval must not overwrite ``<adapter>/eval/`` — the
+    recorded results are the suite list this comparison is built from."""
+    adapter, suite_file = base_fixture
+    before = (adapter / "eval" / "regression.json").read_text(encoding="utf-8")
+    fake = _install(
+        monkeypatch,
+        _FakeLaunch(
+            {"regression": _suite_payload("regression", suite_file, exact_match_pct=81.0)},
+            {"regression": _suite_payload("regression", suite_file, exact_match_pct=80.0)},
+        ),
+    )
+    rc = cmd_compare(_base_args(str(adapter), "unsloth/Qwen3-4B", json_mode=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert (adapter / "eval-compare" / "regression.json").is_file()
+    assert (adapter / "eval" / "regression.json").read_text(encoding="utf-8") == before
+
+    adapter_argv = fake.calls[0]["sloth_args"]
+    assert _flag_value(adapter_argv, "--results-dir") == str((adapter / "eval-compare").resolve())
+    suite = payload["deltas"]["suites"]["regression"]
+    assert suite["exact_match_pct"]["b"] == 81.0, "the adapter side comes from eval-compare/"
+    assert payload["b"]["eval"]["suites"]["regression"]["exact_match_pct"] == 81.0
+
+
+def test_compare_base_resolves_a_relative_base_path(
+    base_fixture: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """r3: a relative local --base must reach the container as an absolute path,
+    with its parent mounted; an HF repo id stays verbatim."""
+    adapter, suite_file = base_fixture
+    base_model = suite_file.parent / "base-model"
+    base_model.mkdir()
+    (base_model / "config.json").write_text("{}", encoding="utf-8")
+    fake = _install(
+        monkeypatch,
+        _FakeLaunch(
+            {"regression": _suite_payload("regression", suite_file)},
+            {"regression": _suite_payload("regression", suite_file)},
+        ),
+    )
+    monkeypatch.chdir(base_model.parent)
+    assert cmd_compare(_base_args(str(adapter), "base-model", json_mode=True)) == 0
+    capsys.readouterr()
+
+    base_argv = fake.calls[1]["sloth_args"]
+    assert _flag_value(base_argv, "--model") == str(base_model.resolve())
+    mounts = [host for host, _ in fake.calls[1]["kwargs"]["extra_mounts"]]
+    assert str(base_model.resolve().parent) in mounts
+
+
+def test_compare_base_keeps_a_hf_repo_id_verbatim(
+    base_fixture: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    adapter, suite_file = base_fixture
+    fake = _install(
+        monkeypatch,
+        _FakeLaunch(
+            {"regression": _suite_payload("regression", suite_file)},
+            {"regression": _suite_payload("regression", suite_file)},
+        ),
+    )
+    assert cmd_compare(_base_args(str(adapter), "unsloth/Qwen3-4B", json_mode=True)) == 0
+    capsys.readouterr()
+    assert _flag_value(fake.calls[1]["sloth_args"], "--model") == "unsloth/Qwen3-4B"
+
+
+def test_compare_base_clears_stale_results_before_each_run(
+    base_fixture: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """r4: only this invocation's artifacts may be read back."""
+    adapter, suite_file = base_fixture
+    for subdir in ("eval-base", "eval-compare"):
+        stale = adapter / subdir
+        stale.mkdir()
+        (stale / "stale.json").write_text(
+            json.dumps(_suite_payload("stale", suite_file, exact_match_pct=1.0)), encoding="utf-8"
+        )
+    _install(
+        monkeypatch,
+        _FakeLaunch(
+            {"regression": _suite_payload("regression", suite_file)},
+            {"regression": _suite_payload("regression", suite_file)},
+        ),
+    )
+    rc = cmd_compare(_base_args(str(adapter), "unsloth/Qwen3-4B", json_mode=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert not (adapter / "eval-base" / "stale.json").exists()
+    assert not (adapter / "eval-compare" / "stale.json").exists()
+    assert list(payload["deltas"]["suites"]) == ["regression"]
+
+
+def test_compare_base_resolves_a_relative_recorded_suite_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """r5: a legacy result file recording a relative suite path resolves against
+    the directory that result file lives in."""
+    dataset = _write_dataset(tmp_path)
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    write_metadata(
+        adapter, model="unsloth/Qwen3-4B", method="qlora", dataset_path=dataset, hyperparameters={}
+    )
+    suite_file = adapter / "eval" / "regression.jsonl"
+    suite_file.parent.mkdir(parents=True, exist_ok=True)
+    suite_file.write_text('{"task": "t", "input": "i", "expected_output": "o"}\n', encoding="utf-8")
+    payload = _suite_payload("regression", suite_file)
+    payload["files"] = [{"path": "regression.jsonl", "total": 120}]
+    _write_suite_result(adapter / "eval", "regression", payload)
+
+    fake = _install(
+        monkeypatch,
+        _FakeLaunch(
+            {"regression": _suite_payload("regression", suite_file)},
+            {"regression": _suite_payload("regression", suite_file)},
+        ),
+    )
+    assert cmd_compare(_base_args(str(adapter), "unsloth/Qwen3-4B", json_mode=True)) == 0
+    capsys.readouterr()
+    assert _flag_value(fake.calls[0]["sloth_args"], "--suite") == str(suite_file.resolve())
+
+
+def test_compare_base_unresolvable_recorded_suite_path_exits_1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r5: a recorded suite path that resolves nowhere is exit 1 with a hint to
+    re-run ``sloth eval`` — never a mount of a nonexistent path."""
+    dataset = _write_dataset(tmp_path)
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    write_metadata(
+        adapter, model="unsloth/Qwen3-4B", method="qlora", dataset_path=dataset, hyperparameters={}
+    )
+    payload = _suite_payload("regression", tmp_path / "gone.jsonl")
+    payload["files"] = [{"path": "gone.jsonl", "total": 120}]
+    _write_suite_result(adapter / "eval", "regression", payload)
+
+    def _must_not_launch(*args: object, **kwargs: object) -> dict:
+        raise AssertionError("no container may be launched for a missing suite file")
+
+    monkeypatch.setattr(compare_mod.container, "launch", _must_not_launch)
+    with pytest.raises(CliError) as exc_info:
+        cmd_compare(_base_args(str(adapter), "unsloth/Qwen3-4B"))
+    assert exc_info.value.code == 1
+    assert "gone.jsonl" in exc_info.value.message
+    assert "sloth eval" in exc_info.value.remediation
+
+
+def test_compare_reports_dataset_delta_for_a_changed_hub_split(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """r6: hub datasets carry no sha256 — their identity is (hf_id, split, revision)."""
+    dir_a = tmp_path / "exp-a"
+    dir_a.mkdir()
+    write_metadata(
+        dir_a, model="m", method="lora", dataset_path="hf:org/corpus:train", hyperparameters={}
+    )
+    dir_b = tmp_path / "exp-b"
+    dir_b.mkdir()
+    write_metadata(
+        dir_b, model="m", method="lora", dataset_path="hf:org/corpus:test", hyperparameters={}
+    )
+
+    assert cmd_compare(_args(str(dir_a), str(dir_b), json_mode=True)) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["deltas"]["dataset"]["a"]["split"] == "train"
+    assert payload["deltas"]["dataset"]["b"]["split"] == "test"
+
+
+def test_compare_reports_dataset_delta_for_a_changed_hub_revision(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dir_a = tmp_path / "exp-a"
+    dir_a.mkdir()
+    write_metadata(
+        dir_a,
+        model="m",
+        method="lora",
+        dataset_path="hf:org/corpus",
+        hyperparameters={},
+        hf_revision="v1",
+    )
+    dir_b = tmp_path / "exp-b"
+    dir_b.mkdir()
+    write_metadata(
+        dir_b,
+        model="m",
+        method="lora",
+        dataset_path="hf:org/corpus",
+        hyperparameters={},
+        hf_revision="v2",
+    )
+
+    assert cmd_compare(_args(str(dir_a), str(dir_b), json_mode=True)) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "dataset" in payload["deltas"]
+
+
+def test_compare_no_dataset_delta_for_the_same_hub_dataset(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dir_a = tmp_path / "exp-a"
+    dir_a.mkdir()
+    write_metadata(
+        dir_a, model="m", method="lora", dataset_path="hf:org/corpus:train", hyperparameters={}
+    )
+    dir_b = tmp_path / "exp-b"
+    dir_b.mkdir()
+    write_metadata(
+        dir_b, model="m", method="lora", dataset_path="hf:org/corpus:train", hyperparameters={}
+    )
+
+    assert cmd_compare(_args(str(dir_a), str(dir_b), json_mode=True)) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "dataset" not in payload["deltas"]
+
+
+def test_compare_reports_dataset_delta_between_hub_and_local(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dataset = _write_dataset(tmp_path)
+    dir_a = tmp_path / "exp-a"
+    dir_a.mkdir()
+    write_metadata(
+        dir_a, model="m", method="lora", dataset_path="hf:org/corpus:train", hyperparameters={}
+    )
+    dir_b = tmp_path / "exp-b"
+    dir_b.mkdir()
+    write_metadata(dir_b, model="m", method="lora", dataset_path=dataset, hyperparameters={})
+
+    assert cmd_compare(_args(str(dir_a), str(dir_b), json_mode=True)) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "dataset" in payload["deltas"]

@@ -204,7 +204,8 @@ class TestWriteEvalJsonLegacyShape:
         )
         assert destination == tmp_path / metrics.EVAL_JSON_NAME
         written = json.loads(destination.read_text(encoding="utf-8"))
-        assert written["suite_paths"] == ["a.jsonl"]
+        # Recorded canonically (Qodo r5) so a later reader in another cwd finds it.
+        assert written["suite_paths"] == [str(Path("a.jsonl").resolve())]
         assert written["target"] == "adapter"
         assert written["written_at"].startswith("20")
         # No new-schema fields leak into the legacy shape.
@@ -220,7 +221,7 @@ class TestWriteEvalJsonLegacyShape:
 
         written = json.loads((tmp_path / metrics.EVAL_JSON_NAME).read_text(encoding="utf-8"))
         assert written["total"] == 2
-        assert written["suite_paths"] == ["b.jsonl"]
+        assert written["suite_paths"] == [str(Path("b.jsonl").resolve())]
         assert written["target"] == "model"
 
     def test_eval_json_name_constant_is_still_exported_and_unchanged(self) -> None:
@@ -310,3 +311,32 @@ def test_metrics_module_imports_only_stdlib() -> None:
             roots.add(node.module.split(".")[0])
     non_stdlib = {r for r in roots if r not in sys.stdlib_module_names}
     assert not non_stdlib, f"metrics.py imports non-stdlib modules: {sorted(non_stdlib)}"
+
+
+class TestResultPathsAreCanonicalAtWriteTime:
+    """Qodo r5: a result file must record suite paths that survive a later
+    ``sloth compare`` run from a different working directory."""
+
+    def test_suite_keyed_shape_resolves_file_paths(self, tmp_path: Path, monkeypatch) -> None:
+        suite = tmp_path / "regression.jsonl"
+        suite.write_text('{"task": "t", "input": "i", "expected_output": "o"}\n', encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+        destination = metrics.write_eval_json(
+            tmp_path,
+            "regression",
+            {"total": 1, "path": "regression.jsonl", "files": [{"path": "regression.jsonl"}]},
+            batch_size=1,
+        )
+        record = json.loads(destination.read_text(encoding="utf-8"))
+        assert record["files"][0]["path"] == str(suite.resolve())
+        assert record["path"] == str(suite.resolve())
+
+    def test_legacy_shape_resolves_suite_paths(self, tmp_path: Path, monkeypatch) -> None:
+        suite = tmp_path / "regression.jsonl"
+        suite.write_text('{"task": "t", "input": "i", "expected_output": "o"}\n', encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+        destination = metrics.write_eval_json(
+            tmp_path, {"total": 1}, suite_paths=["regression.jsonl"], target="adapter"
+        )
+        record = json.loads(destination.read_text(encoding="utf-8"))
+        assert record["suite_paths"] == [str(suite.resolve())]
