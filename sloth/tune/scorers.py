@@ -94,7 +94,7 @@ def _check_constraint(prediction: str, constraint: dict[str, Any]) -> bool:
     if kind == "json_only":
         try:
             json.loads(prediction.strip())
-        except (json.JSONDecodeError, ValueError):
+        except ValueError:
             return False
         return True
     raise ValueError(
@@ -137,49 +137,106 @@ _SCHEMA_TYPES: dict[str, type | tuple[type, ...]] = {
 }
 
 
-def _validate_subset(data: Any, schema: dict[str, Any], path: str, errors: list[str]) -> None:
-    unknown = sorted(set(schema.keys()) - SCHEMA_KEYWORDS)
-    for keyword in unknown:
+def _report_unknown_keywords(schema: dict[str, Any], path: str, errors: list[str]) -> None:
+    """Name every schema keyword outside :data:`SCHEMA_KEYWORDS` (never silently ignored)."""
+    for keyword in sorted(set(schema.keys()) - SCHEMA_KEYWORDS):
         errors.append(f"{path}: unsupported schema keyword {keyword!r}")
 
-    if "type" in schema:
-        expected = schema["type"]
-        pytype = _SCHEMA_TYPES.get(expected)
-        if pytype is None:
-            errors.append(f"{path}: unknown type {expected!r}")
-        elif isinstance(data, bool) and expected != "boolean":
-            # bool is an int subclass in Python; keep "type": "integer"/"number"
-            # from accepting True/False.
-            errors.append(f"{path}: expected {expected}, got bool")
-        elif not isinstance(data, pytype):
-            errors.append(f"{path}: expected {expected}, got {type(data).__name__}")
 
-    if "enum" in schema and data not in schema["enum"]:
+def _check_type_keyword(data: Any, schema: dict[str, Any], path: str, errors: list[str]) -> None:
+    """Apply ``"type"``: unknown type names and type mismatches both report."""
+    expected = schema["type"]
+    pytype = _SCHEMA_TYPES.get(expected)
+    if pytype is None:
+        errors.append(f"{path}: unknown type {expected!r}")
+    elif isinstance(data, bool) and expected != "boolean":
+        # bool is an int subclass in Python; keep "type": "integer"/"number"
+        # from accepting True/False.
+        errors.append(f"{path}: expected {expected}, got bool")
+    elif not isinstance(data, pytype):
+        errors.append(f"{path}: expected {expected}, got {type(data).__name__}")
+
+
+def _check_enum_keyword(data: Any, schema: dict[str, Any], path: str, errors: list[str]) -> None:
+    """Apply ``"enum"``: *data* must be one of the listed values."""
+    if data not in schema["enum"]:
         errors.append(f"{path}: {data!r} not in enum {schema['enum']!r}")
 
-    if isinstance(data, dict):
-        if "required" in schema:
-            for key in schema["required"]:
-                if key not in data:
-                    errors.append(f"{path}: missing required property {key!r}")
-        properties = schema.get("properties", {})
-        if "properties" in schema:
-            for key, subschema in properties.items():
-                if key in data:
-                    _validate_subset(data[key], subschema, f"{path}.{key}", errors)
-        if "additionalProperties" in schema:
-            additional = schema["additionalProperties"]
-            extra = sorted(set(data.keys()) - set(properties.keys()))
-            if additional is False:
-                for key in extra:
-                    errors.append(f"{path}: additional property {key!r} not allowed")
-            elif isinstance(additional, dict):
-                for key in extra:
-                    _validate_subset(data[key], additional, f"{path}.{key}", errors)
 
+def _check_required_keyword(
+    data: Any, schema: dict[str, Any], path: str, errors: list[str]
+) -> None:
+    """Apply ``"required"`` to a mapping: every named property must be present."""
+    for key in schema["required"]:
+        if key not in data:
+            errors.append(f"{path}: missing required property {key!r}")
+
+
+def _check_properties_keyword(
+    data: Any, schema: dict[str, Any], path: str, errors: list[str]
+) -> None:
+    """Apply ``"properties"``: recurse into each declared property that is present."""
+    for key, subschema in schema["properties"].items():
+        if key in data:
+            _validate_subset(data[key], subschema, f"{path}.{key}", errors)
+
+
+def _check_additional_properties_keyword(
+    data: Any, schema: dict[str, Any], path: str, errors: list[str]
+) -> None:
+    """Apply ``"additionalProperties"``: ``False`` forbids extras, a dict validates them."""
+    additional = schema["additionalProperties"]
+    extra = sorted(set(data.keys()) - set(schema.get("properties", {})))
+    if additional is False:
+        for key in extra:
+            errors.append(f"{path}: additional property {key!r} not allowed")
+    elif isinstance(additional, dict):
+        for key in extra:
+            _validate_subset(data[key], additional, f"{path}.{key}", errors)
+
+
+def _check_items_keyword(data: Any, schema: dict[str, Any], path: str, errors: list[str]) -> None:
+    """Apply ``"items"`` to a list: recurse into every element."""
+    for index, item in enumerate(data):
+        _validate_subset(item, schema["items"], f"{path}[{index}]", errors)
+
+
+_Checker = Callable[[Any, dict[str, Any], str, list[str]], None]
+
+#: Keyword checkers applied to any value, in report order.
+_VALUE_CHECKERS: dict[str, _Checker] = {
+    "type": _check_type_keyword,
+    "enum": _check_enum_keyword,
+}
+
+#: Keyword checkers applied only when the value is a mapping, in report order.
+_MAPPING_CHECKERS: dict[str, _Checker] = {
+    "required": _check_required_keyword,
+    "properties": _check_properties_keyword,
+    "additionalProperties": _check_additional_properties_keyword,
+}
+
+
+def _apply_checkers(
+    checkers: dict[str, _Checker],
+    data: Any,
+    schema: dict[str, Any],
+    path: str,
+    errors: list[str],
+) -> None:
+    """Run each checker in *checkers* whose keyword is present in *schema*, in order."""
+    for keyword, check in checkers.items():
+        if keyword in schema:
+            check(data, schema, path, errors)
+
+
+def _validate_subset(data: Any, schema: dict[str, Any], path: str, errors: list[str]) -> None:
+    _report_unknown_keywords(schema, path, errors)
+    _apply_checkers(_VALUE_CHECKERS, data, schema, path, errors)
+    if isinstance(data, dict):
+        _apply_checkers(_MAPPING_CHECKERS, data, schema, path, errors)
     if "items" in schema and isinstance(data, list):
-        for index, item in enumerate(data):
-            _validate_subset(item, schema["items"], f"{path}[{index}]", errors)
+        _check_items_keyword(data, schema, path, errors)
 
 
 def check_json_subset(prediction: str | Any, schema: dict[str, Any]) -> dict[str, Any]:
@@ -197,7 +254,7 @@ def check_json_subset(prediction: str | Any, schema: dict[str, Any]) -> dict[str
     if isinstance(prediction, str):
         try:
             data = json.loads(prediction)
-        except (json.JSONDecodeError, ValueError) as exc:
+        except ValueError as exc:
             return {"valid": False, "errors": [f"invalid JSON: {exc}"]}
     else:
         data = prediction
@@ -228,7 +285,10 @@ def _parse_qwen3_tool_call(prediction: str) -> dict[str, Any]:
     template also accepts (and re-emits verbatim) a JSON-encoded *string*, so
     this parser decodes it a second time when needed.
     """
-    match = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", prediction, re.DOTALL)
+    # NOSONAR: the reluctant `.*?` is required here -- `arguments` is itself a JSON
+    # object, so a negated class like `[^}]*` would stop at the first inner `}` and
+    # fail to match any nested tool call. The `\}\s*</tool_call>` tail bounds it.
+    match = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", prediction, re.DOTALL)  # NOSONAR
     if not match:
         raise ValueError("no <tool_call>...</tool_call> block found in prediction")
     payload = json.loads(match.group(1))
@@ -237,6 +297,23 @@ def _parse_qwen3_tool_call(prediction: str) -> dict[str, Any]:
     if isinstance(arguments, str):
         arguments = json.loads(arguments) if arguments.strip() else {}
     return {"name": name, "arguments": arguments}
+
+
+def _consume_quoted_char(
+    text: str, index: int, current: list[str], quote: str
+) -> tuple[int, str | None]:
+    """Copy the character at *index* while inside a quoted run.
+
+    Returns the next index and the still-open quote character (``None`` once the
+    run closes). A backslash escape copies the following character verbatim, so
+    an escaped quote never ends the run.
+    """
+    char = text[index]
+    current.append(char)
+    if char == "\\" and index + 1 < len(text):
+        current.append(text[index + 1])
+        return index + 2, quote
+    return index + 1, None if char == quote else quote
 
 
 def _split_top_level(text: str) -> list[str]:
@@ -249,14 +326,7 @@ def _split_top_level(text: str) -> list[str]:
     while index < len(text):
         char = text[index]
         if quote is not None:
-            current.append(char)
-            if char == "\\" and index + 1 < len(text):
-                current.append(text[index + 1])
-                index += 2
-                continue
-            if char == quote:
-                quote = None
-            index += 1
+            index, quote = _consume_quoted_char(text, index, current, quote)
             continue
         if char in "'\"":
             quote = char
@@ -292,7 +362,7 @@ def _parse_lfm2_value(raw: str) -> Any:
     raw = raw.strip()
     try:
         return json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         pass
     try:
         return ast.literal_eval(raw)
@@ -327,7 +397,7 @@ def _parse_lfm2_tool_call(prediction: str) -> dict[str, Any]:
     if not match:
         raise ValueError("no <|tool_call_start|>...<|tool_call_end|> block found in prediction")
     body = match.group(1).strip()
-    call_match = re.match(r"([A-Za-z_][A-Za-z0-9_]*)\((.*)\)\s*$", body, re.DOTALL)
+    call_match = re.match(r"([A-Za-z_]\w*)\((.*)\)\s*$", body, re.DOTALL)
     if not call_match:
         raise ValueError(f"could not parse LFM2 tool-call syntax: {body!r}")
     name = call_match.group(1)
@@ -498,8 +568,10 @@ _CHOICE_LETTER_RE = re.compile(r"(?<![A-Za-z0-9])([A-Da-d])(?![A-Za-z0-9])")
 #: ``"Answer: B"``, ``"answer is (c)"``, ``"The correct option — D"``. Checked
 #: before the bare-letter scan so a prose preamble containing a standalone
 #: ``"a"`` (the English article) cannot win over a stated answer.
+# The classes below are written upper-case only on purpose: ``re.IGNORECASE``
+# already folds case, so spelling ``a-d`` as well would be a duplicate range.
 _CHOICE_MARKER_RE = re.compile(
-    r"\b(?:answer|option|choice)\b[^A-Za-z0-9]{0,8}([A-Da-d])(?![A-Za-z0-9])",
+    r"\b(?:answer|option|choice)\b[^A-Z0-9]{0,8}([A-D])(?![A-Z0-9])",
     re.IGNORECASE,
 )
 

@@ -445,7 +445,7 @@ def _require_dataset_map(run_section: dict) -> "dict[str, str] | None":
         raise CliError(
             code=EXIT_USER_ERROR,
             message=(
-                f"'dataset_map' must be a table ([run.dataset_map]), got " f"{type(value).__name__}"
+                f"'dataset_map' must be a table ([run.dataset_map]), got {type(value).__name__}"
             ),
             remediation=_DATASET_MAP_REMEDIATION,
         )
