@@ -1,0 +1,116 @@
+{"task": "arithmetic", "input": "What is 7 + 5?", "expected_output": "12"}
+{"task": "arithmetic", "input": "What is 12 + 9?", "expected_output": "21"}
+{"task": "arithmetic", "input": "What is 23 + 18?", "expected_output": "41"}
+{"task": "arithmetic", "input": "What is 40 + 16?", "expected_output": "56"}
+{"task": "arithmetic", "input": "What is 56 + 7?", "expected_output": "63"}
+{"task": "arithmetic", "input": "What is 64 + 8?", "expected_output": "72"}
+{"task": "arithmetic", "input": "What is 81 + 9?", "expected_output": "90"}
+{"task": "arithmetic", "input": "What is 100 + 25?", "expected_output": "125"}
+{"task": "arithmetic", "input": "What is 144 + 12?", "expected_output": "156"}
+{"task": "arithmetic", "input": "What is 15 + 3?", "expected_output": "18"}
+{"task": "arithmetic", "input": "What is 27 + 4?", "expected_output": "31"}
+{"task": "arithmetic", "input": "What is 33 + 11?", "expected_output": "44"}
+{"task": "arithmetic", "input": "What is 19 - 6?", "expected_output": "13"}
+{"task": "arithmetic", "input": "What is 36 - 12?", "expected_output": "24"}
+{"task": "arithmetic", "input": "What is 54 - 18?", "expected_output": "36"}
+{"task": "arithmetic", "input": "What is 63 - 21?", "expected_output": "42"}
+{"task": "arithmetic", "input": "What is 88 - 4?", "expected_output": "84"}
+{"task": "arithmetic", "input": "What is 90 - 15?", "expected_output": "75"}
+{"task": "arithmetic", "input": "What is 72 - 9?", "expected_output": "63"}
+{"task": "arithmetic", "input": "What is 48 - 6?", "expected_output": "42"}
+{"task": "arithmetic", "input": "What is 25 - 17?", "expected_output": "8"}
+{"task": "arithmetic", "input": "What is 31 - 13?", "expected_output": "18"}
+{"task": "arithmetic", "input": "What is 3 * 4?", "expected_output": "12"}
+{"task": "arithmetic", "input": "What is 6 * 7?", "expected_output": "42"}
+{"task": "arithmetic", "input": "What is 8 * 9?", "expected_output": "72"}
+{"task": "arithmetic", "input": "What is 11 * 12?", "expected_output": "132"}
+{"task": "arithmetic", "input": "What is 5 * 20?", "expected_output": "100"}
+{"task": "arithmetic", "input": "What is 14 * 3?", "expected_output": "42"}
+{"task": "arithmetic", "input": "What is 17 * 5?", "expected_output": "85"}
+{"task": "arithmetic", "input": "What is 21 * 4?", "expected_output": "84"}
+{"task": "arithmetic", "input": "What is 9 * 9?", "expected_output": "81"}
+{"task": "arithmetic", "input": "What is 13 * 6?", "expected_output": "78"}
+{"task": "arithmetic", "input": "What is 144 divided by 12?", "expected_output": "12"}
+{"task": "arithmetic", "input": "What is 81 divided by 9?", "expected_output": "9"}
+{"task": "arithmetic", "input": "What is 100 divided by 25?", "expected_output": "4"}
+{"task": "arithmetic", "input": "What is 64 divided by 8?", "expected_output": "8"}
+{"task": "arithmetic", "input": "What is 72 divided by 6?", "expected_output": "12"}
+{"task": "arithmetic", "input": "What is 90 divided by 15?", "expected_output": "6"}
+{"task": "arithmetic", "input": "What is 56 divided by 7?", "expected_output": "8"}
+{"task": "arithmetic", "input": "What is 48 divided by 4?", "expected_output": "12"}
+{"task": "answer", "input": "What is the capital city of France?", "expected_output": "Paris"}
+{"task": "answer", "input": "What is the capital city of Japan?", "expected_output": "Tokyo"}
+{"task": "answer", "input": "What is the capital city of Canada?", "expected_output": "Ottawa"}
+{"task": "answer", "input": "What is the capital city of Australia?", "expected_output": "Canberra"}
+{"task": "answer", "input": "What is the capital city of Italy?", "expected_output": "Rome"}
+{"task": "answer", "input": "What is the capital city of Spain?", "expected_output": "Madrid"}
+{"task": "answer", "input": "What is the capital city of Portugal?", "expected_output": "Lisbon"}
+{"task": "answer", "input": "What is the capital city of Norway?", "expected_output": "Oslo"}
+{"task": "answer", "input": "What is the capital city of Sweden?", "expected_output": "Stockholm"}
+{"task": "answer", "input": "What is the capital city of Finland?", "expected_output": "Helsinki"}
+{"task": "answer", "input": "What is the capital city of Greece?", "expected_output": "Athens"}
+{"task": "answer", "input": "What is the capital city of Egypt?", "expected_output": "Cairo"}
+{"task": "answer", "input": "What is the capital city of Kenya?", "expected_output": "Nairobi"}
+{"task": "answer", "input": "What is the capital city of India?", "expected_output": "New Delhi"}
+{"task": "answer", "input": "What is the capital city of Thailand?", "expected_output": "Bangkok"}
+{"task": "answer", "input": "What is the capital city of Mexico?", "expected_output": "Mexico City"}
+{"task": "answer", "input": "What is the capital city of Argentina?", "expected_output": "Buenos Aires"}
+{"task": "answer", "input": "What is the capital city of Peru?", "expected_output": "Lima"}
+{"task": "answer", "input": "What is the capital city of Poland?", "expected_output": "Warsaw"}
+{"task": "answer", "input": "What is the capital city of Austria?", "expected_output": "Vienna"}
+{"task": "convert", "input": "How many metres are in 1 kilometre?", "expected_output": "1000"}
+{"task": "convert", "input": "How many metres are in 2.5 kilometres?", "expected_output": "2500"}
+{"task": "convert", "input": "How many minutes are in 1 hour?", "expected_output": "60"}
+{"task": "convert", "input": "How many minutes are in 3 hours?", "expected_output": "180"}
+{"task": "convert", "input": "How many hours are in 1 day?", "expected_output": "24"}
+{"task": "convert", "input": "How many hours are in 5 days?", "expected_output": "120"}
+{"task": "convert", "input": "How many grams are in 1 kilogram?", "expected_output": "1000"}
+{"task": "convert", "input": "How many grams are in 4 kilograms?", "expected_output": "4000"}
+{"task": "convert", "input": "How many mebibytes are in 1 gibibyte?", "expected_output": "1024"}
+{"task": "convert", "input": "How many mebibytes are in 2 gibibytes?", "expected_output": "2048"}
+{"task": "convert", "input": "How many seconds are in 1 minute?", "expected_output": "60"}
+{"task": "convert", "input": "How many seconds are in 7 minutes?", "expected_output": "420"}
+{"task": "convert", "input": "How many days are in 1 week?", "expected_output": "7"}
+{"task": "convert", "input": "How many days are in 3 weeks?", "expected_output": "21"}
+{"task": "convert", "input": "How many centimetres are in 1 metre?", "expected_output": "100"}
+{"task": "convert", "input": "How many millilitres are in 2 litres?", "expected_output": "2000"}
+{"task": "format", "input": "Convert to uppercase: 'agent'", "expected_output": "AGENT"}
+{"task": "format", "input": "Convert to uppercase: 'adapter'", "expected_output": "ADAPTER"}
+{"task": "format", "input": "Convert to uppercase: 'stream'", "expected_output": "STREAM"}
+{"task": "format", "input": "Convert to uppercase: 'schema'", "expected_output": "SCHEMA"}
+{"task": "format", "input": "Convert to uppercase: 'corpus'", "expected_output": "CORPUS"}
+{"task": "format", "input": "Convert to lowercase: 'ADAPTER'", "expected_output": "adapter"}
+{"task": "format", "input": "Convert to lowercase: 'STDOUT'", "expected_output": "stdout"}
+{"task": "format", "input": "Convert to lowercase: 'SCHEMA'", "expected_output": "schema"}
+{"task": "format", "input": "Convert to lowercase: 'TOKEN'", "expected_output": "token"}
+{"task": "format", "input": "Convert to title case: 'hello world'", "expected_output": "Hello World"}
+{"task": "format", "input": "Convert to title case: 'quiet morning'", "expected_output": "Quiet Morning"}
+{"task": "format", "input": "Convert to title case: 'open source'", "expected_output": "Open Source"}
+{"task": "format", "input": "Reverse the string: 'stream'", "expected_output": "maerts"}
+{"task": "format", "input": "Reverse the string: 'token'", "expected_output": "nekot"}
+{"task": "format", "input": "Reverse the string: 'level'", "expected_output": "level"}
+{"task": "format", "input": "Reverse the string: 'corpus'", "expected_output": "suproc"}
+{"task": "sort", "input": "Sort these numbers in ascending order: 5, 2, 9, 1", "expected_output": "1, 2, 5, 9"}
+{"task": "sort", "input": "Sort these numbers in ascending order: 12, 3, 7, 20", "expected_output": "3, 7, 12, 20"}
+{"task": "sort", "input": "Sort these numbers in ascending order: 8, 8, 2, 4", "expected_output": "2, 4, 8, 8"}
+{"task": "sort", "input": "Sort these numbers in ascending order: 31, 14, 27, 6", "expected_output": "6, 14, 27, 31"}
+{"task": "sort", "input": "Sort these numbers in ascending order: 100, 45, 67, 2", "expected_output": "2, 45, 67, 100"}
+{"task": "sort", "input": "Sort these words alphabetically: pear, apple, mango", "expected_output": "apple, mango, pear"}
+{"task": "sort", "input": "Sort these words alphabetically: delta, alpha, charlie, bravo", "expected_output": "alpha, bravo, charlie, delta"}
+{"task": "sort", "input": "Sort these words alphabetically: zebra, otter, ibex", "expected_output": "ibex, otter, zebra"}
+{"task": "sort", "input": "Sort these words alphabetically: north, east, south, west", "expected_output": "east, north, south, west"}
+{"task": "sort", "input": "Sort these words alphabetically: tuesday, friday, monday", "expected_output": "friday, monday, tuesday"}
+{"task": "date", "input": "What date is 7 days after 2026-01-01? Answer as YYYY-MM-DD.", "expected_output": "2026-01-08"}
+{"task": "date", "input": "What date is 30 days after 2026-01-01? Answer as YYYY-MM-DD.", "expected_output": "2026-01-31"}
+{"task": "date", "input": "What date is 21 days after 2026-02-10? Answer as YYYY-MM-DD.", "expected_output": "2026-03-03"}
+{"task": "date", "input": "What date is 14 days after 2026-03-15? Answer as YYYY-MM-DD.", "expected_output": "2026-03-29"}
+{"task": "date", "input": "What date is 1 days after 2026-06-30? Answer as YYYY-MM-DD.", "expected_output": "2026-07-01"}
+{"task": "date", "input": "What date is 45 days after 2026-11-20? Answer as YYYY-MM-DD.", "expected_output": "2027-01-04"}
+{"task": "date", "input": "What date is 7 days before 2026-01-01? Answer as YYYY-MM-DD.", "expected_output": "2025-12-25"}
+{"task": "date", "input": "What date is 30 days before 2026-01-01? Answer as YYYY-MM-DD.", "expected_output": "2025-12-02"}
+{"task": "date", "input": "What date is 21 days before 2026-02-10? Answer as YYYY-MM-DD.", "expected_output": "2026-01-20"}
+{"task": "date", "input": "What date is 14 days before 2026-03-15? Answer as YYYY-MM-DD.", "expected_output": "2026-03-01"}
+{"task": "date", "input": "What day of the week is 2026-01-01?", "expected_output": "Thursday"}
+{"task": "date", "input": "What day of the week is 2026-05-04?", "expected_output": "Monday"}
+{"task": "date", "input": "What day of the week is 2026-09-17?", "expected_output": "Thursday"}
+{"task": "date", "input": "What day of the week is 2026-12-25?", "expected_output": "Friday"}
