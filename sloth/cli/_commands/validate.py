@@ -11,24 +11,35 @@ via an argparse mutually-exclusive group, so calling :func:`cmd_validate`
 directly gets the same contract):
 
 * ``--dataset PATH`` — a single JSONL training dataset (chat or task schema,
-  auto-detected unless ``--schema`` is passed).
+  auto-detected unless ``--schema`` is passed). An ``hf:<org>/<name>[:split]``
+  spec is rendered through ``--dataset-map``; ``--schema`` pins the schema its
+  mapped rows are validated against and must agree with the mapping.
 * ``--suite PATH`` — a single JSONL eval suite, or a directory of them (every
   ``*.jsonl`` child is validated); defaults to the ``task`` schema and reports
   per-file record counts plus a total.
+
+``--config PATH`` supplies either of them from a ``run.toml``: the ``[run]``
+section's ``dataset`` and ``[run.dataset_map]`` table fill ``--dataset`` /
+``--dataset-map`` when those flags are absent (explicit flags always win), so a
+caller holding only a run config can validate the dataset that run would train
+on without re-spelling the column mapping.
 
 Usage::
 
     sloth validate --dataset data/train.jsonl
     sloth validate --dataset data/train.jsonl --schema task
     sloth validate --dataset data/train.jsonl --json
+    sloth validate --config run.toml --json
     sloth validate --suite data/eval.jsonl
     sloth validate --suite examples/eval/ --json
 
 Exit codes:
     0 — dataset/suite is valid (report emitted to stdout)
-    1 — invalid dataset/suite, missing file, bad schema, or both/neither of
-        --dataset and --suite passed (error to stderr)
-    2 — environment error (dataset file exists but cannot be opened)
+    1 — invalid dataset/suite, missing file, bad schema, a --schema that
+        contradicts the --dataset-map, or both/neither of --dataset and
+        --suite passed (error to stderr)
+    2 — environment error (dataset file exists but cannot be opened; a
+        --config that is missing or not valid TOML)
 """
 
 from __future__ import annotations
@@ -42,6 +53,7 @@ from typing import Any
 from sloth.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 from sloth.cli._output import emit_diagnostic, emit_result
 from sloth.tune._trainer import infer_hf_dataset_schema, is_hf_dataset_spec, load_external_records
+from sloth.tune.config import load_config
 from sloth.tune.datasets import (
     AUTO_SCHEMA,
     KNOWN_SCHEMAS,
@@ -135,8 +147,9 @@ def _require_exactly_one_target(dataset_arg: str | None, suite_arg: str | None) 
             code=EXIT_USER_ERROR,
             message="one of --dataset or --suite is required",
             remediation=(
-                "Pass --dataset <path> to validate a training dataset, or "
-                "--suite <path> to validate an eval suite (file or directory)."
+                "Pass --dataset <path> to validate a training dataset, "
+                "--suite <path> to validate an eval suite (file or directory), "
+                "or --config <run.toml> to take the dataset from a run config."
             ),
         )
 
@@ -184,6 +197,34 @@ def _parse_dataset_map_arg(pairs: list[str] | None) -> "dict[str, str] | None":
     return mapping
 
 
+def _resolve_hf_schema(requested_schema: str | None, dataset_map: "dict[str, str] | None") -> str:
+    """Return the schema an ``hf:`` dataset's mapped rows are validated against.
+
+    Without ``--schema`` the schema is **inferred** from *dataset_map*'s keys,
+    exactly as ``sloth train`` infers it. With ``--schema`` the pinned value
+    wins — but it must agree with the mapping, because the mapping is what
+    renders the rows: a ``messages`` mapping can only produce ``chat`` rows and
+    a ``task``/``input``/``expected_output`` mapping can only produce ``task``
+    rows. A mismatch is a user error (code 1) rather than a silently ignored
+    flag.
+    """
+    inferred = infer_hf_dataset_schema(dataset_map)
+    if requested_schema is None or requested_schema == inferred:
+        return inferred
+    raise CliError(
+        code=EXIT_USER_ERROR,
+        message=(
+            f"--schema {requested_schema} does not match --dataset-map: the mapped "
+            f"keys {sorted(dataset_map or {})!r} render {inferred!r} rows"
+        ),
+        remediation=(
+            f"Pass --schema {inferred} (or drop --schema to use the inferred "
+            f"schema), or change --dataset-map to the keys the "
+            f"{requested_schema!r} schema needs."
+        ),
+    )
+
+
 def _cmd_validate_hf_dataset(args: argparse.Namespace) -> None:
     """Handler for ``sloth validate --dataset hf:<org>/<name>[:split]``.
 
@@ -196,6 +237,10 @@ def _cmd_validate_hf_dataset(args: argparse.Namespace) -> None:
     json_mode = bool(getattr(args, "json", False))
     spec = args.dataset
     dataset_map = _parse_dataset_map_arg(getattr(args, "dataset_map", None))
+    requested_schema = getattr(args, "schema", None)
+    # Resolve the schema BEFORE the (potentially slow) offline load, so an
+    # incompatible --schema / --dataset-map pair is reported straight away.
+    schema = _resolve_hf_schema(requested_schema, dataset_map)
 
     previous_offline = os.environ.get("HF_HUB_OFFLINE")
     os.environ["HF_HUB_OFFLINE"] = "1"
@@ -232,10 +277,11 @@ def _cmd_validate_hf_dataset(args: argparse.Namespace) -> None:
         else:
             os.environ["HF_HUB_OFFLINE"] = previous_offline
 
-    schema = infer_hf_dataset_schema(dataset_map)
+    pinned = requested_schema is not None
     report: dict[str, Any] = {
         "valid": True,
         "schema": schema,
+        "schema_source": "pinned" if pinned else "inferred",
         "line_count": len(records),
         "source": spec,
     }
@@ -243,9 +289,10 @@ def _cmd_validate_hf_dataset(args: argparse.Namespace) -> None:
     if json_mode:
         emit_result(report, json_mode=True)
     else:
+        origin = "pinned via --schema" if pinned else "inferred from --dataset-map"
         lines = [
             f"dataset: {spec}",
-            f"schema:  {schema}",
+            f"schema:  {schema} ({origin})",
             f"records: {len(records)} (sampled, cache-only)",
             "status:  valid",
         ]
@@ -302,11 +349,41 @@ def _cmd_validate_dataset(args: argparse.Namespace) -> None:
         emit_result("\n".join(lines), json_mode=False)
 
 
+def _apply_config_defaults(args: argparse.Namespace) -> None:
+    """Fill ``--dataset`` / ``--dataset-map`` from ``--config``'s ``[run]`` section.
+
+    Reads the run TOML with the *same* :func:`sloth.tune.config.load_config`
+    ``sloth train`` uses, so ``sloth validate --config run.toml`` checks exactly
+    the dataset that run would train on — the cross-repo entry point used by
+    callers that only hold a run config (and therefore cannot spell out
+    ``--dataset-map`` on the command line).
+
+    Explicit flags always win: a value already on *args* is left untouched, and
+    ``--config`` supplies only what is missing. ``--suite`` is left alone too —
+    a config's dataset is never pulled in behind a ``--suite`` run.
+    """
+    config_arg = getattr(args, "config", None)
+    if not config_arg:
+        return
+
+    config = load_config(config_arg)
+
+    if not getattr(args, "dataset", None) and not getattr(args, "suite", None):
+        args.dataset = config.dataset
+    if not getattr(args, "dataset_map", None) and config.dataset_map:
+        args.dataset_map = [f"{key}={value}" for key, value in config.dataset_map.items()]
+
+
 def cmd_validate(args: argparse.Namespace) -> int | None:
     """Handler for ``sloth validate``.
 
+    ``--config <run.toml>`` is applied first (see
+    :func:`_apply_config_defaults`), filling in ``--dataset`` /
+    ``--dataset-map`` when those flags are absent.
+
     Dispatches to one of two shared validators depending on which flag was
-    passed — exactly one of ``--dataset`` / ``--suite`` is required:
+    passed — exactly one of ``--dataset`` / ``--suite`` is required (``--config``
+    may supply the ``--dataset`` side):
 
     * ``--dataset`` validates a JSONL training dataset against the requested
       schema (or auto-detected schema) — see :func:`_cmd_validate_dataset`.
@@ -317,6 +394,8 @@ def cmd_validate(args: argparse.Namespace) -> int | None:
 
     Returns ``None`` (exit 0) on success; raises :class:`CliError` on failure.
     """
+    _apply_config_defaults(args)
+
     dataset_arg = getattr(args, "dataset", None)
     suite_arg = getattr(args, "suite", None)
 
@@ -342,8 +421,9 @@ def register(sub: argparse._SubParsersAction) -> None:
             "Validate a JSONL dataset file (--dataset) against the chat or task "
             "schema, or an eval suite (--suite; a file or a directory of them) "
             "against the task schema. Exactly one of --dataset / --suite is "
-            "required. Uses the same validation rules as ``sloth train`` and "
-            "``sloth eval``, respectively."
+            "required (--config <run.toml> can supply the --dataset side). Uses "
+            "the same validation rules as ``sloth train`` and ``sloth eval``, "
+            "respectively."
         ),
     )
     p.add_argument(
@@ -383,6 +463,15 @@ def register(sub: argparse._SubParsersAction) -> None:
             "chat schema, or --dataset-map task=instruction --dataset-map "
             "input=context --dataset-map expected_output=response for the "
             "task schema. Ignored for a local JSONL --dataset."
+        ),
+    )
+    p.add_argument(
+        "--config",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to a run.toml; its [run] dataset and [run.dataset_map] are used "
+            "when --dataset / --dataset-map are not passed (explicit flags win)."
         ),
     )
     p.add_argument("--json", action="store_true", help="Emit structured JSON.")

@@ -248,6 +248,51 @@ class TestParseToolCallQwen3:
         result = parse_tool_call(prediction, "qwen3")
         assert result == {"name": "ping", "arguments": {}}
 
+    # --- tag-delimited capture (Qodo r4): no brace matching at all ----------
+
+    def test_parses_multi_level_nested_objects(self) -> None:
+        prediction = (
+            "<tool_call>\n"
+            '{"name": "cfg", "arguments": {"a": {"b": {"c": {"d": {"e": 1}}}}}}'
+            "\n</tool_call>"
+        )
+        assert parse_tool_call(prediction, "qwen3") == {
+            "name": "cfg",
+            "arguments": {"a": {"b": {"c": {"d": {"e": 1}}}}},
+        }
+
+    def test_parses_arrays_of_objects(self) -> None:
+        prediction = (
+            "<tool_call>\n"
+            '{"name": "batch", "arguments": {"items": [{"id": 1}, {"id": 2}], "n": [[1], [2]]}}'
+            "\n</tool_call>"
+        )
+        assert parse_tool_call(prediction, "qwen3") == {
+            "name": "batch",
+            "arguments": {"items": [{"id": 1}, {"id": 2}], "n": [[1], [2]]},
+        }
+
+    def test_parses_braces_inside_quoted_strings(self) -> None:
+        prediction = (
+            "<tool_call>\n"
+            '{"name": "run", "arguments": {"code": "if (x) { y } else { z }", "t": "}"}}'
+            "\n</tool_call>"
+        )
+        assert parse_tool_call(prediction, "qwen3") == {
+            "name": "run",
+            "arguments": {"code": "if (x) { y } else { z }", "t": "}"},
+        }
+
+    def test_trailing_text_after_payload_inside_tags_is_a_parse_error(self) -> None:
+        """Everything between the tags is the payload — junk in it is a JSON error."""
+        prediction = '<tool_call>{"name": "f", "arguments": {}} oops</tool_call>'
+        with pytest.raises(ValueError):
+            parse_tool_call(prediction, "qwen3")
+
+    def test_missing_closing_tag_raises(self) -> None:
+        with pytest.raises(ValueError, match="tool_call"):
+            parse_tool_call('<tool_call>{"name": "f", "arguments": {}}', "qwen3")
+
 
 # ---------------------------------------------------------------------------
 # parse_tool_call — lfm2

@@ -268,6 +268,11 @@ def check_json_subset(prediction: str | Any, schema: dict[str, Any]) -> dict[str
 # ---------------------------------------------------------------------------
 
 
+#: Literal tags wrapping a qwen3 tool-call payload (see :func:`_parse_qwen3_tool_call`).
+QWEN3_TOOL_CALL_OPEN = "<tool_call>"
+QWEN3_TOOL_CALL_CLOSE = "</tool_call>"
+
+
 def _parse_qwen3_tool_call(prediction: str) -> dict[str, Any]:
     """Parse a qwen3-family tool call.
 
@@ -284,14 +289,26 @@ def _parse_qwen3_tool_call(prediction: str) -> dict[str, Any]:
     ``</tool_call>`` tags. ``arguments`` is normally a JSON object but the
     template also accepts (and re-emits verbatim) a JSON-encoded *string*, so
     this parser decodes it a second time when needed.
+
+    The payload is taken as *everything between the first ``<tool_call>`` and
+    the next ``</tool_call>``*, stripped and handed to ``json.loads`` — no
+    brace matching, so nested objects, arrays, and braces inside quoted
+    strings all parse. Raises ``ValueError`` when no block is found, when the
+    block is unterminated, or when the payload is not valid JSON.
     """
-    # The reluctant `.*?` is required here (NOSONAR below) -- `arguments` is itself a JSON
-    # object, so a negated class like `[^}]*` would stop at the first inner `}` and
-    # fail to match any nested tool call. The `\}\s*</tool_call>` tail bounds it.
-    match = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", prediction, re.DOTALL)  # NOSONAR
-    if not match:
+    # Tag-delimited, not brace-matched: everything between the first opening
+    # tag and the next closing tag is the payload. A brace-counting regex is
+    # the wrong tool here -- `arguments` is itself a JSON object and may nest
+    # objects, arrays, or `{`/`}` inside quoted strings; `json.loads` is the
+    # only correct brace matcher, so the tags just bound the text handed to it.
+    start = prediction.find(QWEN3_TOOL_CALL_OPEN)
+    if start == -1:
         raise ValueError("no <tool_call>...</tool_call> block found in prediction")
-    payload = json.loads(match.group(1))
+    body_start = start + len(QWEN3_TOOL_CALL_OPEN)
+    end = prediction.find(QWEN3_TOOL_CALL_CLOSE, body_start)
+    if end == -1:
+        raise ValueError("unterminated <tool_call> block (no </tool_call>) in prediction")
+    payload = json.loads(prediction[body_start:end].strip())
     name = payload.get("name")
     arguments = payload.get("arguments", {})
     if isinstance(arguments, str):

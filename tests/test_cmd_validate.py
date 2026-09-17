@@ -53,6 +53,7 @@ def _make_args(
     schema: str | None = None,
     json_mode: bool = False,
     dataset_map: list[str] | None = None,
+    config: Path | str | None = None,
 ) -> argparse.Namespace:
     """Build the Namespace argparse would produce for ``sloth validate``."""
     return argparse.Namespace(
@@ -61,6 +62,7 @@ def _make_args(
         schema=schema,
         json=json_mode,
         dataset_map=dataset_map,
+        config=str(config) if config is not None else None,
     )
 
 
@@ -754,3 +756,192 @@ class TestValidateHfDataset:
             ]
         )
         assert args.dataset_map == ["messages=conversations"]
+
+
+class TestValidateHfPinnedSchema:
+    """A pinned --schema must drive an ``hf:`` validation, not be ignored (Qodo r3)."""
+
+    def test_pinned_schema_matching_mapping_is_used(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rows = [{"conversations": [{"role": "user", "content": "hi"}]}]
+        monkeypatch.setitem(__import__("sys").modules, "datasets", _fake_datasets_module(rows))
+
+        args = _make_args(
+            "hf:my-org/my-dataset:train",
+            dataset_map=["messages=conversations"],
+            schema="chat",
+            json_mode=True,
+        )
+        assert cmd_validate(args) in (None, 0)
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["schema"] == "chat"
+        assert payload["schema_source"] == "pinned"
+
+    def test_pinned_schema_reported_in_text_mode(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rows = [{"instruction": "x", "context": "y", "response": "z"}]
+        monkeypatch.setitem(__import__("sys").modules, "datasets", _fake_datasets_module(rows))
+
+        args = _make_args(
+            "hf:my-org/my-dataset",
+            dataset_map=[
+                "task=instruction",
+                "input=context",
+                "expected_output=response",
+            ],
+            schema="task",
+        )
+        assert cmd_validate(args) in (None, 0)
+        out = capsys.readouterr().out
+        assert "task" in out
+        assert "--schema" in out
+
+    def test_inferred_schema_reported_when_not_pinned(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rows = [{"conversations": [{"role": "user", "content": "hi"}]}]
+        monkeypatch.setitem(__import__("sys").modules, "datasets", _fake_datasets_module(rows))
+
+        args = _make_args(
+            "hf:my-org/my-dataset",
+            dataset_map=["messages=conversations"],
+            json_mode=True,
+        )
+        cmd_validate(args)
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["schema_source"] == "inferred"
+
+    def test_chat_mapping_with_schema_task_is_user_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rows = [{"conversations": [{"role": "user", "content": "hi"}]}]
+        monkeypatch.setitem(__import__("sys").modules, "datasets", _fake_datasets_module(rows))
+
+        args = _make_args(
+            "hf:my-org/my-dataset",
+            dataset_map=["messages=conversations"],
+            schema="task",
+        )
+        with pytest.raises(CliError) as exc_info:
+            cmd_validate(args)
+        assert exc_info.value.code == 1
+        assert "chat" in exc_info.value.message
+        assert exc_info.value.remediation
+
+    def test_task_mapping_with_schema_chat_is_user_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rows = [{"instruction": "x", "context": "y", "response": "z"}]
+        monkeypatch.setitem(__import__("sys").modules, "datasets", _fake_datasets_module(rows))
+
+        args = _make_args(
+            "hf:my-org/my-dataset",
+            dataset_map=["task=instruction", "input=context", "expected_output=response"],
+            schema="chat",
+        )
+        with pytest.raises(CliError) as exc_info:
+            cmd_validate(args)
+        assert exc_info.value.code == 1
+        assert exc_info.value.remediation
+
+
+# ---------------------------------------------------------------------------
+# --config: read dataset / dataset_map from a run.toml (Qodo r5)
+# ---------------------------------------------------------------------------
+
+
+def _write_run_toml(
+    tmp_path: Path, dataset: str, dataset_map: dict[str, str] | None = None
+) -> Path:
+    lines = [
+        "[run]",
+        'model = "unsloth/Qwen3-1.7B"',
+        f'dataset = "{dataset}"',
+        'output = "out/adapter"',
+    ]
+    if dataset_map:
+        lines.append("")
+        lines.append("[run.dataset_map]")
+        lines.extend(f'{key} = "{value}"' for key, value in dataset_map.items())
+    path = tmp_path / "run.toml"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+class TestValidateFromConfig:
+    def test_local_dataset_from_config(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        dataset = _write_dataset(tmp_path, _VALID_TASK, name="task.jsonl")
+        config = _write_run_toml(tmp_path, str(dataset))
+
+        args = _make_args(config=config, json_mode=True)
+        assert cmd_validate(args) in (None, 0)
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["valid"] is True
+        assert payload["schema"] == "task"
+        assert payload["line_count"] == 1
+
+    def test_hf_dataset_map_forwarded_from_config(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rows = [{"conversations": [{"role": "user", "content": "hi"}]}]
+        monkeypatch.setitem(__import__("sys").modules, "datasets", _fake_datasets_module(rows))
+        config = _write_run_toml(
+            tmp_path,
+            "hf:my-org/my-dataset:train",
+            dataset_map={"messages": "conversations"},
+        )
+
+        args = _make_args(config=config, json_mode=True)
+        assert cmd_validate(args) in (None, 0)
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["valid"] is True
+        assert payload["schema"] == "chat"
+        assert payload["source"] == "hf:my-org/my-dataset:train"
+
+    def test_explicit_dataset_overrides_config(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        chat = _write_dataset(tmp_path, _VALID_CHAT, name="chat.jsonl")
+        config = _write_run_toml(tmp_path, str(tmp_path / "does-not-exist.jsonl"))
+
+        args = _make_args(chat, config=config, json_mode=True)
+        assert cmd_validate(args) in (None, 0)
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["schema"] == "chat"
+
+    def test_explicit_dataset_map_overrides_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rows = [{"turns": [{"role": "user", "content": "hi"}]}]
+        monkeypatch.setitem(__import__("sys").modules, "datasets", _fake_datasets_module(rows))
+        config = _write_run_toml(
+            tmp_path,
+            "hf:my-org/my-dataset",
+            dataset_map={"messages": "conversations"},
+        )
+
+        args = _make_args(config=config, dataset_map=["messages=turns"], json_mode=True)
+        assert cmd_validate(args) in (None, 0)
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["line_count"] == 1
+
+    def test_missing_config_file_exits_2(self, tmp_path: Path) -> None:
+        args = _make_args(config=tmp_path / "nope.toml")
+        with pytest.raises(CliError) as exc_info:
+            cmd_validate(args)
+        assert exc_info.value.code == 2
+
+    def test_register_wires_config_flag(self, tmp_path: Path) -> None:
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="command")
+        register(sub)
+        args = parser.parse_args(["validate", "--config", str(tmp_path / "run.toml")])
+        assert args.config == str(tmp_path / "run.toml")
+        assert args.dataset is None
