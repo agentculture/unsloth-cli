@@ -62,7 +62,9 @@ from __future__ import annotations
 import argparse
 import inspect
 import json as _json
+import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -102,10 +104,17 @@ class _EvalTarget:
     ``flag`` is the CLI flag it came from (``--adapter`` / ``--model``) and is what
     gets forwarded to the in-container run, so the container evaluates the same
     kind of thing the host was asked about.
+
+    ``remote`` marks a ``--model`` that is a **Hugging Face repo id**
+    (``org/name``) rather than a local path — the base-model form ``sloth
+    compare --base`` scores. Nothing on disk corresponds to it, so it is never
+    bind-mounted and its results have no natural home: such a run requires
+    ``--results-dir``.
     """
 
     flag: str
     path: Path
+    remote: bool = False
 
     @property
     def kind(self) -> str:
@@ -113,9 +122,36 @@ class _EvalTarget:
         return self.flag.lstrip("-")
 
     @property
+    def reference(self) -> str:
+        """What is forwarded to the in-container run: the repo id verbatim for a
+        remote model, the absolute path otherwise."""
+        return str(self.path) if self.remote else str(self.path.resolve())
+
+    @property
     def directory(self) -> Path:
-        """The directory results are written under (the parent, for a bare .gguf file)."""
+        """The directory results are written under (the parent, for a bare .gguf file).
+
+        A remote (HF repo id) target owns no directory; the working directory
+        stands in, and ``--results-dir`` is required to redirect the write.
+        """
+        if self.remote:
+            return Path.cwd()
         return self.path if self.path.is_dir() else self.path.parent
+
+
+#: A Hugging Face repo id: exactly one ``/``, both halves plain identifiers.
+_HF_REPO_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _is_hf_repo_id(value: str) -> bool:
+    """True when *value* looks like a Hugging Face repo id (``org/name``).
+
+    Deliberately narrow: a single ``/``, no leading ``./`` or ``/``, no path
+    traversal — anything else is treated as a (missing) local path, so a typo'd
+    directory still fails with the "directory not found" error rather than being
+    silently sent to the hub.
+    """
+    return bool(_HF_REPO_ID_RE.match(value))
 
 
 def _resolve_target(args: argparse.Namespace) -> _EvalTarget:
@@ -153,6 +189,11 @@ def _resolve_target(args: argparse.Namespace) -> _EvalTarget:
     path = Path(value)
     # --model also accepts a single .gguf file (disambiguates multi-quant export dirs).
     gguf_file = flag == "--model" and path.is_file() and path.suffix == ".gguf"
+    # --model also accepts a Hugging Face repo id (org/name) for a base model that
+    # was never exported — the form `sloth compare --base` scores. It is only
+    # taken as a repo id when nothing local answers to that name.
+    if flag == "--model" and not path.exists() and _is_hf_repo_id(value):
+        return _EvalTarget(flag=flag, path=path, remote=True)
     if not path.is_dir() and not gguf_file:
         remediation = (
             "Pass an existing adapter directory with --adapter <path>. "
@@ -428,6 +469,7 @@ def _launch_container(
     batch_size: int,
     perplexity: bool = False,
     tool_call_family: str | None = None,
+    results_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Re-run this eval inside the NGC container with ``--in-container``.
 
@@ -454,9 +496,8 @@ def _launch_container(
     JSON result line the container printed); raises :class:`CliError` on any
     container failure.
     """
-    target_abs = target.path.resolve()
     suite_abs = [p.resolve() for p in suite_paths]
-    sloth_args = ["eval", target.flag, str(target_abs)]
+    sloth_args = ["eval", target.flag, target.reference]
     for suite_file in suite_abs:
         sloth_args += ["--suite", str(suite_file)]
     if quant:
@@ -466,14 +507,26 @@ def _launch_container(
         sloth_args.append("--perplexity")
     if tool_call_family:
         sloth_args += ["--tool-call-family", str(tool_call_family)]
+    if results_dir is not None:
+        sloth_args += ["--results-dir", str(Path(results_dir).resolve())]
     sloth_args.append("--json")
     sloth_args.append("--in-container")
 
-    own_mounts = [
-        (str(p), str(p)) for p in sorted({target_abs.parent, *(s.parent for s in suite_abs)})
-    ]
+    # A remote (HF repo id) target has no host path to bind-mount; a local one's
+    # parent dir is mounted identity so the forwarded absolute path resolves
+    # unchanged inside the container. Same for --results-dir, which the container
+    # must be able to write back to.
+    mount_dirs = {s.parent for s in suite_abs}
+    if not target.remote:
+        mount_dirs.add(target.path.resolve().parent)
+    if results_dir is not None:
+        results_abs = Path(results_dir).resolve()
+        results_abs.mkdir(parents=True, exist_ok=True)
+        mount_dirs.add(results_abs)
+    own_mounts = [(str(p), str(p)) for p in sorted(mount_dirs)]
+    workdir = target.directory if target.remote else target.path.resolve().parent
     kwargs: dict[str, Any] = {
-        "workdir": str(target_abs.parent),
+        "workdir": str(workdir),
         "checkout": str(_repo_root()),
     }
     supplied: dict[str, Any] = {}
@@ -639,14 +692,53 @@ _RUN_LEVEL_KEYS = frozenset(
 )
 
 
+def _write_eval_json_at(
+    results_dir: Path,
+    suite: str,
+    payload: dict[str, Any],
+    *,
+    batch_size: int,
+    base_load_in_4bit: bool | None = None,
+) -> Path:
+    """Write ``<results_dir>/<suite>.json`` — the ``--results-dir`` form.
+
+    Same record stamping as :func:`sloth.tune.metrics.write_eval_json`'s
+    suite-keyed shape (``schema_version``, ``suite``, ``batch_size``,
+    ``target``, ``written_at``, ``base_load_in_4bit``), but written **flat**
+    into the caller-named directory instead of into a nested ``eval/`` child:
+    the caller already named the exact directory it wants
+    (``sloth compare --base`` writes the base model's scores to
+    ``<adapter>/eval-base/``, read back with
+    ``sloth.tune.summary.read_eval(..., subdir="eval-base")``).
+    """
+    name = metrics.sanitize_suite_name(suite)
+    record = dict(payload)
+    record["schema_version"] = metrics.SCHEMA_VERSION
+    record["suite"] = name
+    record["batch_size"] = batch_size
+    record["target"] = None
+    record["written_at"] = datetime.now(timezone.utc).isoformat()
+    record["base_load_in_4bit"] = base_load_in_4bit
+    results_dir.mkdir(parents=True, exist_ok=True)
+    destination = results_dir / f"{name}.json"
+    destination.write_text(_json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    return destination
+
+
 def _write_named_eval_json(
     target_dir: Path,
     named_results: dict[str, dict[str, Any]],
     *,
     batch_size: int,
     base_load_in_4bit: bool | None = None,
+    results_dir: Path | None = None,
 ) -> None:
-    """Write ``<target_dir>/eval/<name>.json`` for every suite in *named_results*.
+    """Write one result file per suite in *named_results*.
+
+    Default: ``<target_dir>/eval/<name>.json``. With *results_dir* (the
+    ``--results-dir`` flag) the files go flat into that directory instead —
+    only *where* changes, never *what* is written (see
+    :func:`_write_eval_json_at`).
 
     Mirrors :func:`sloth.tune._trainer.write_eval_json`'s failure handling: an
     :class:`OSError` (e.g. a read-only target directory) becomes a stderr
@@ -654,13 +746,22 @@ def _write_named_eval_json(
     """
     for name, payload in named_results.items():
         try:
-            metrics.write_eval_json(
-                target_dir,
-                name,
-                payload,
-                batch_size=batch_size,
-                base_load_in_4bit=base_load_in_4bit,
-            )
+            if results_dir is None:
+                metrics.write_eval_json(
+                    target_dir,
+                    name,
+                    payload,
+                    batch_size=batch_size,
+                    base_load_in_4bit=base_load_in_4bit,
+                )
+            else:
+                _write_eval_json_at(
+                    results_dir,
+                    name,
+                    payload,
+                    batch_size=batch_size,
+                    base_load_in_4bit=base_load_in_4bit,
+                )
         except OSError as exc:
             emit_diagnostic(f"note: could not write eval/{name}.json: {exc}")
 
@@ -712,12 +813,25 @@ def cmd_eval(args: argparse.Namespace) -> int | None:
     train_dataset_arg = getattr(args, "train_dataset", None)
     _raw_batch_size = getattr(args, "batch_size", None)
     batch_size = DEFAULT_BATCH_SIZE if _raw_batch_size is None else int(_raw_batch_size)
+    _raw_results_dir = getattr(args, "results_dir", None)
+    results_dir = Path(_raw_results_dir) if _raw_results_dir else None
 
     # --- validate --batch-size BEFORE suite validation or container launch ---
     _validate_batch_size(batch_size)
 
     # --- resolve the target: exactly one of --adapter / --model --------------
     target = _resolve_target(args)
+
+    # A Hugging Face repo id owns no directory to write results into.
+    if target.remote and results_dir is None:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"--model {target.path} is a Hugging Face repo id; --results-dir is required",
+            remediation=(
+                "Pass --results-dir <dir> to say where the per-suite result files should "
+                "be written, or pass a local model directory produced by `sloth export`."
+            ),
+        )
 
     # --- resolve, name, and validate every suite ------------------------------
     # A directory is expanded to its sorted *.jsonl children and every file is
@@ -750,6 +864,7 @@ def cmd_eval(args: argparse.Namespace) -> int | None:
             batch_size=batch_size,
             perplexity=perplexity,
             tool_call_family=tool_call_family,
+            results_dir=results_dir,
         )
         named_results = _normalize_named_results(raw_result, suite_names, named_suites)
         if json_mode:
@@ -792,6 +907,7 @@ def cmd_eval(args: argparse.Namespace) -> int | None:
         base_load_in_4bit=(
             raw_result.get("base_load_in_4bit") if isinstance(raw_result, dict) else None
         ),
+        results_dir=results_dir,
     )
 
     # --- emit results (always suite-keyed) ------------------------------------
@@ -879,6 +995,17 @@ def register(sub: argparse._SubParsersAction) -> None:
             "before any container launch. Defaults to the dataset recorded in the "
             "target's training_metadata.json when present; skipped (with a stderr "
             "diagnostic) when neither is available."
+        ),
+    )
+    p.add_argument(
+        "--results-dir",
+        dest="results_dir",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Write the per-suite result files flat into DIR instead of into "
+            "<target>/eval/. Only where the results are written changes. Required "
+            "when --model names a Hugging Face repo id (which owns no directory)."
         ),
     )
     p.add_argument("--json", action="store_true", help="Emit structured JSON.")

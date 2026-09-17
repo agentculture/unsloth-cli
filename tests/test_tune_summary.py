@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from sloth.tune import summary
 from sloth.tune.metrics import EVAL_JSON_DIR
 from sloth.tune.summary import build_summary, discover_exports, read_eval
 
@@ -488,3 +489,55 @@ def test_build_summary_invalid_utf8_eval_at_export_level_degrades(tmp_path: Path
 
     assert len(summary["exports"]) == 1
     assert "eval" not in summary["exports"][0]
+
+
+# ---------------------------------------------------------------------------
+# read_eval(subdir=...) / build_eval_summary (t9)
+# ---------------------------------------------------------------------------
+
+
+def test_read_eval_reads_an_alternate_subdir(tmp_path: Path) -> None:
+    """``sloth compare --base`` keeps the base model's results in a sibling
+    directory; ``subdir`` reads them without touching the default behaviour."""
+    (tmp_path / "eval").mkdir()
+    (tmp_path / "eval" / "regression.json").write_text(
+        json.dumps({"suite": "regression", "exact_match_pct": 80.0}), encoding="utf-8"
+    )
+    (tmp_path / "eval-base").mkdir()
+    (tmp_path / "eval-base" / "regression.json").write_text(
+        json.dumps({"suite": "regression", "exact_match_pct": 70.0}), encoding="utf-8"
+    )
+
+    assert summary.read_eval(tmp_path)["regression"]["exact_match_pct"] == 80.0
+    base = summary.read_eval(tmp_path, subdir="eval-base")
+    assert list(base) == ["regression"]
+    assert base["regression"]["exact_match_pct"] == 70.0
+
+
+def test_read_eval_alternate_subdir_ignores_the_legacy_eval_json(tmp_path: Path) -> None:
+    """The flat legacy ``eval.json`` belongs to the target itself, never to a
+    sibling result set."""
+    (tmp_path / "eval.json").write_text(json.dumps({"exact_match_pct": 50.0}), encoding="utf-8")
+    (tmp_path / "eval-base").mkdir()
+    (tmp_path / "eval-base" / "regression.json").write_text(
+        json.dumps({"suite": "regression", "exact_match_pct": 70.0}), encoding="utf-8"
+    )
+
+    assert list(summary.read_eval(tmp_path, subdir="eval-base")) == ["regression"]
+    assert "legacy" in summary.read_eval(tmp_path)
+
+
+def test_build_eval_summary_returns_the_eval_block(tmp_path: Path) -> None:
+    (tmp_path / "eval-base").mkdir()
+    (tmp_path / "eval-base" / "target.json").write_text(
+        json.dumps({"suite": "target", "exact_match_pct": 70.0, "f1": 0.7, "total": 4}),
+        encoding="utf-8",
+    )
+    block = summary.build_eval_summary(tmp_path, subdir="eval-base")
+    assert block is not None
+    assert block["exact_match_pct"] == 70.0
+    assert block["suites"]["target"]["total"] == 4
+
+
+def test_build_eval_summary_is_none_without_results(tmp_path: Path) -> None:
+    assert summary.build_eval_summary(tmp_path, subdir="eval-base") is None

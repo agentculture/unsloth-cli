@@ -2290,3 +2290,152 @@ class TestNamedResultsSplitPerSuite:
         raw = {"total": 1, "exact_match": 1, "exact_match_pct": 100.0, "f1": 1.0}
         named = _normalize_named_results(raw, ["x", "y"], {"x": [], "y": []})
         assert named == {"x": raw, "y": raw}
+
+
+# ---------------------------------------------------------------------------
+# --results-dir + a Hugging Face repo id as --model (t9: the base-eval path
+# `sloth compare --base` drives)
+# ---------------------------------------------------------------------------
+
+
+def test_results_dir_writes_flat_suite_files(
+    tmp_adapter: Path,
+    tmp_suite: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--results-dir only changes WHERE the per-suite results are written: flat
+    into that directory, instead of into <target>/eval/."""
+    monkeypatch.setattr(eval_mod, "run_eval", _fake_run_eval_perfect)
+    results_dir = tmp_path / "eval-base"
+
+    args = _make_args(
+        adapter=str(tmp_adapter),
+        suite=str(tmp_suite),
+        in_container=True,
+        results_dir=str(results_dir),
+    )
+    cmd_eval(args)
+    capsys.readouterr()
+
+    written = results_dir / f"{tmp_suite.stem}.json"
+    assert written.is_file()
+    assert not (tmp_adapter / "eval").exists(), "the target's own eval/ must be left alone"
+    record = json.loads(written.read_text(encoding="utf-8"))
+    assert record["suite"] == tmp_suite.stem
+    assert record["exact_match_pct"] == 100.0
+    assert record["schema_version"] == 2
+    assert "written_at" in record
+
+
+def test_host_forwards_results_dir_to_container(
+    tmp_adapter: Path,
+    tmp_suite: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def _capture_launch(sloth_args: list[str], **kwargs: Any) -> dict[str, Any]:
+        captured["sloth_args"] = sloth_args
+        captured.update(kwargs)
+        return dict(_FAKE_EVAL_SUMMARY)
+
+    monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
+    results_dir = tmp_path / "eval-base"
+
+    cmd_eval(
+        _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), results_dir=str(results_dir))
+    )
+    capsys.readouterr()
+
+    forwarded = captured["sloth_args"]
+    assert "--results-dir" in forwarded
+    assert forwarded[forwarded.index("--results-dir") + 1] == str(results_dir.resolve())
+    targets = {target for _, target in (captured.get("extra_mounts") or [])}
+    assert str(results_dir.resolve()) in targets, "the container must be able to write there"
+
+
+def test_model_accepts_a_hugging_face_repo_id_with_results_dir(
+    tmp_suite: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A raw HF id needs no export: --model takes it verbatim and the results
+    go where --results-dir says."""
+    seen: list[str] = []
+
+    def _capture(model_dir: str, suite_path: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        seen.append(model_dir)
+        return _fake_run_eval_model(model_dir, suite_path, suite_paths=kwargs.get("suite_paths"))
+
+    monkeypatch.setattr(eval_mod, "run_eval_model", _capture)
+    results_dir = tmp_path / "eval-base"
+
+    cmd_eval(
+        _make_args(
+            model="unsloth/Qwen3-4B",
+            suite=str(tmp_suite),
+            in_container=True,
+            results_dir=str(results_dir),
+        )
+    )
+    capsys.readouterr()
+    assert seen == ["unsloth/Qwen3-4B"]
+    assert (results_dir / f"{tmp_suite.stem}.json").is_file()
+
+
+def test_model_repo_id_without_results_dir_is_a_user_error(tmp_suite: Path) -> None:
+    with pytest.raises(CliError) as exc_info:
+        cmd_eval(_make_args(model="unsloth/Qwen3-4B", suite=str(tmp_suite), in_container=True))
+    assert exc_info.value.code == 1
+    assert "--results-dir" in exc_info.value.remediation
+
+
+def test_missing_model_dir_is_still_an_error_not_a_repo_id(tmp_suite: Path, tmp_path: Path) -> None:
+    """A path-shaped --model that does not exist must still fail fast, never be
+    mistaken for a hub id."""
+    with pytest.raises(CliError) as exc_info:
+        cmd_eval(_make_args(model=str(tmp_path / "missing" / "dir"), suite=str(tmp_suite)))
+    assert exc_info.value.code == 1
+    assert "model directory not found" in exc_info.value.message
+
+
+def test_host_does_not_mount_a_repo_id_as_a_path(
+    tmp_suite: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def _capture_launch(sloth_args: list[str], **kwargs: Any) -> dict[str, Any]:
+        captured["sloth_args"] = sloth_args
+        captured.update(kwargs)
+        return dict(_FAKE_EVAL_SUMMARY)
+
+    monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
+    results_dir = tmp_path / "eval-base"
+
+    cmd_eval(
+        _make_args(model="unsloth/Qwen3-4B", suite=str(tmp_suite), results_dir=str(results_dir))
+    )
+    capsys.readouterr()
+
+    forwarded = captured["sloth_args"]
+    assert forwarded[forwarded.index("--model") + 1] == "unsloth/Qwen3-4B"
+    hosts = {host for host, _ in (captured.get("extra_mounts") or [])}
+    assert not any(host.endswith("unsloth") for host in hosts)
+
+
+def test_register_results_dir_flag() -> None:
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command")
+    register(sub)
+    args = parser.parse_args(
+        ["eval", "--adapter", "a", "--suite", "s.jsonl", "--results-dir", "out"]
+    )
+    assert args.results_dir == "out"
