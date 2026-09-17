@@ -289,6 +289,59 @@ def test_run_bench_without_a_results_file_exits_2(
 
 
 # ---------------------------------------------------------------------------
+# Argv validation (the injection guard in front of the lm_eval argv)
+# ---------------------------------------------------------------------------
+
+
+def test_run_bench_rejects_a_task_string_with_shell_characters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A --tasks spec carrying anything but task names never reaches the harness."""
+    merged = tmp_path / "merged16"
+    merged.mkdir()
+    calls: list[list[str]] = []
+    monkeypatch.setattr(bench, "_run", _fake_run_writing(_RESULTS_DOC, calls))
+
+    with pytest.raises(CliError) as excinfo:
+        bench.run_bench(merged, kind="model", tasks="mmlu; rm -rf /")
+
+    assert excinfo.value.code == 1
+    assert excinfo.value.remediation
+    assert calls == []  # the subprocess seam was never reached
+
+
+def test_run_bench_rejects_a_model_reference_that_is_neither_path_nor_repo_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A model reference forging a second --model_args fragment is a user error."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(bench, "_run", _fake_run_writing(_RESULTS_DOC, calls))
+
+    with pytest.raises(CliError) as excinfo:
+        bench.run_bench(tmp_path / "nope,peft=/etc", kind="model")
+
+    assert excinfo.value.code == 1
+    assert "," in excinfo.value.remediation
+    assert calls == []
+
+
+def test_run_bench_rejects_a_negative_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--limit`` must be a non-negative whole number."""
+    merged = tmp_path / "merged16"
+    merged.mkdir()
+    calls: list[list[str]] = []
+    monkeypatch.setattr(bench, "_run", _fake_run_writing(_RESULTS_DOC, calls))
+
+    with pytest.raises(CliError) as excinfo:
+        bench.run_bench(merged, kind="model", limit=-1)
+
+    assert excinfo.value.code == 1
+    assert calls == []
+
+
+# ---------------------------------------------------------------------------
 # Letter-choice scoring (sloth.tune._trainer scoring helpers)
 #
 # These live beside the benchmark tests rather than in test_tune_trainer.py
