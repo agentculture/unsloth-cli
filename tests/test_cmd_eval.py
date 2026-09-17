@@ -276,10 +276,11 @@ def test_eval_json_output_structure(
     assert rc in (None, 0)
     out = capsys.readouterr().out
     data = json.loads(out)
-    assert data["total"] == 2
-    assert data["exact_match"] == 2
-    assert data["exact_match_pct"] == 100.0
-    assert len(data["results"]) == 2
+    payload = data["suites"]["suite"]
+    assert payload["total"] == 2
+    assert payload["exact_match"] == 2
+    assert payload["exact_match_pct"] == 100.0
+    assert len(payload["results"]) == 2
 
 
 def test_eval_json_result_items(
@@ -293,7 +294,7 @@ def test_eval_json_result_items(
     args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), json=True, in_container=True)
     cmd_eval(args)
     data = json.loads(capsys.readouterr().out)
-    for item in data["results"]:
+    for item in data["suites"]["suite"]["results"]:
         assert "index" in item
         assert "task" in item
         assert "input" in item
@@ -343,9 +344,10 @@ def test_eval_json_partial_score(
     args = _make_args(adapter=str(tmp_adapter), suite=str(suite), json=True, in_container=True)
     cmd_eval(args)
     data = json.loads(capsys.readouterr().out)
-    assert data["exact_match"] == 0
-    assert data["exact_match_pct"] == 0.0
-    assert data["results"][0]["exact_match"] is False
+    payload = data["suites"]["suite"]
+    assert payload["exact_match"] == 0
+    assert payload["exact_match_pct"] == 0.0
+    assert payload["results"][0]["exact_match"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -529,14 +531,16 @@ def test_host_emits_launch_result_as_json(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The dict container.launch() returns is emitted verbatim as JSON on stdout
-    when the host's own --json flag is set."""
-    fake_result = {
+    """The dict container.launch() returns is emitted (already suite-keyed, since
+    the container's own cmd_eval always runs --json) as JSON on stdout when the
+    host's own --json flag is set."""
+    suite_payload = {
         "total": 2,
         "exact_match": 2,
         "exact_match_pct": 100.0,
         "results": [{"index": 0, "task": "reverse", "exact_match": True}],
     }
+    fake_result = {"suites": {"suite": suite_payload}}
     monkeypatch.setattr(eval_mod.container, "launch", lambda *a, **kw: dict(fake_result))
 
     args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), json=True, in_container=False)
@@ -552,14 +556,16 @@ def test_host_emits_launch_result_as_text(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """In text mode, the launch() result is rendered with the same renderer the
-    in-container path uses (_render_text) — host stdout is exactly that."""
-    fake_result = {
+    """In text mode, the launch() result (already suite-keyed) is rendered with
+    the same one-block-per-suite renderer the in-container path uses
+    (_render_named_report_text) — host stdout is exactly that."""
+    suite_payload = {
         "total": 2,
         "exact_match": 2,
         "exact_match_pct": 100.0,
         "results": [{"index": 0, "task": "reverse", "exact_match": True}],
     }
+    fake_result = {"suites": {"suite": suite_payload}}
     monkeypatch.setattr(eval_mod.container, "launch", lambda *a, **kw: dict(fake_result))
 
     args = _make_args(
@@ -569,7 +575,8 @@ def test_host_emits_launch_result_as_text(
 
     out = capsys.readouterr().out
     target = eval_mod._resolve_target(args)
-    expected = eval_mod._render_text(target, eval_mod._render_suite_label([tmp_suite]), fake_result)
+    named_suites = {"suite": [tmp_suite]}
+    expected = eval_mod._render_named_report_text(target, named_suites, {"suite": suite_payload})
     assert out == expected + "\n"
 
 
@@ -885,12 +892,13 @@ def test_in_container_model_calls_run_eval_model(
     assert calls == [(str(tmp_model), str(tmp_suite))]
 
     data = json.loads(capsys.readouterr().out)
-    assert data["total"] == 2
-    assert data["exact_match"] == 2
-    assert data["exact_match_pct"] == 100.0
-    assert data["model_dir"] == str(tmp_model)
-    assert data["quant_method"] == "compressed-tensors"
-    assert data["quant_format"] == "pack-quantized"
+    payload = data["suites"]["suite"]
+    assert payload["total"] == 2
+    assert payload["exact_match"] == 2
+    assert payload["exact_match_pct"] == 100.0
+    assert payload["model_dir"] == str(tmp_model)
+    assert payload["quant_method"] == "compressed-tensors"
+    assert payload["quant_format"] == "pack-quantized"
 
 
 def test_in_container_model_text_output(
@@ -1598,3 +1606,620 @@ def test_run_eval_model_signature_keeps_backward_compatible_keywords() -> None:
     params = inspect.signature(exporter_mod.run_eval_model).parameters
     for name in ("perplexity", "tool_call_family", "base_load_in_4bit"):
         assert params[name].default is None or params[name].default is False
+# t8 — repeated --suite by name, per-suite eval/<name>.json, --perplexity,
+# --tool-call-family, and the train/eval overlap refusal.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tmp_suite_b(tmp_path: Path) -> Path:
+    """A second, distinctly-named task-schema suite file."""
+    f = tmp_path / "b.jsonl"
+    f.write_text(
+        '{"task": "shout", "input": "hi", "expected_output": "HI"}\n',
+        encoding="utf-8",
+    )
+    return f
+
+
+def _fake_run_eval_suites_keyed(named: dict[str, dict[str, Any]]) -> Any:
+    """Build a fake ``run_eval``/``run_eval_model`` that returns ``{"suites": ...}``.
+
+    Stands in for the richer seam signature (t6) that reports true per-suite
+    results, keyed by the suite name this test expects.
+    """
+
+    def _fake(
+        target_path: str,
+        *,
+        suite_paths: list[Path],
+        quant: str | None = None,
+        batch_size: int = 8,
+        perplexity: bool = False,
+        tool_call_family: str | None = None,
+    ) -> dict[str, Any]:
+        return {"suites": dict(named)}
+
+    return _fake
+
+
+class TestNamedSuitesMultiInvocation:
+    """``--suite A --suite B`` in one invocation: named suites, one JSON file each."""
+
+    def test_json_output_lists_each_suite_by_name(
+        self,
+        tmp_adapter: Path,
+        tmp_suite: Path,
+        tmp_suite_b: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        payload_a = {"total": 2, "exact_match": 2, "exact_match_pct": 100.0, "results": []}
+        payload_b = {"total": 1, "exact_match": 0, "exact_match_pct": 0.0, "results": []}
+        monkeypatch.setattr(
+            eval_mod,
+            "run_eval",
+            _fake_run_eval_suites_keyed({"suite": payload_a, "b": payload_b}),
+        )
+
+        args = _make_args(
+            adapter=str(tmp_adapter),
+            suite=[str(tmp_suite), str(tmp_suite_b)],
+            json=True,
+            in_container=True,
+        )
+        rc = cmd_eval(args)
+        assert rc in (None, 0)
+
+        data = json.loads(capsys.readouterr().out)
+        assert set(data["suites"]) == {"suite", "b"}
+        assert data["suites"]["suite"]["total"] == 2
+        assert data["suites"]["b"]["exact_match_pct"] == 0.0
+
+    def test_text_output_prints_one_block_per_suite(
+        self,
+        tmp_adapter: Path,
+        tmp_suite: Path,
+        tmp_suite_b: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        payload_a = {"total": 2, "exact_match": 2, "exact_match_pct": 100.0, "results": []}
+        payload_b = {"total": 1, "exact_match": 0, "exact_match_pct": 0.0, "results": []}
+        monkeypatch.setattr(
+            eval_mod,
+            "run_eval",
+            _fake_run_eval_suites_keyed({"suite": payload_a, "b": payload_b}),
+        )
+
+        args = _make_args(
+            adapter=str(tmp_adapter),
+            suite=[str(tmp_suite), str(tmp_suite_b)],
+            in_container=True,
+        )
+        cmd_eval(args)
+        out = capsys.readouterr().out
+        assert "suite: suite" in out
+        assert "suite: b" in out
+        # two separate blocks, blank-line separated
+        assert out.count("total:") == 2
+
+    def test_writes_eval_json_per_suite_in_one_invocation(
+        self,
+        tmp_adapter: Path,
+        tmp_suite: Path,
+        tmp_suite_b: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        payload_a = {"total": 2, "exact_match": 2, "exact_match_pct": 100.0, "results": []}
+        payload_b = {"total": 1, "exact_match": 0, "exact_match_pct": 0.0, "results": []}
+        monkeypatch.setattr(
+            eval_mod,
+            "run_eval",
+            _fake_run_eval_suites_keyed({"suite": payload_a, "b": payload_b}),
+        )
+
+        args = _make_args(
+            adapter=str(tmp_adapter),
+            suite=[str(tmp_suite), str(tmp_suite_b)],
+            in_container=True,
+        )
+        cmd_eval(args)
+
+        suite_json = tmp_adapter / "eval" / "suite.json"
+        b_json = tmp_adapter / "eval" / "b.json"
+        assert suite_json.is_file()
+        assert b_json.is_file()
+        assert json.loads(suite_json.read_text())["total"] == 2
+        assert json.loads(b_json.read_text())["total"] == 1
+
+    def test_old_flat_seam_shape_is_wrapped_under_every_given_suite_name(
+        self,
+        tmp_adapter: Path,
+        tmp_suite: Path,
+        tmp_suite_b: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A seam still returning the old single-payload shape gets wrapped under
+        every suite name given — a graceful fallback, not a crash."""
+        monkeypatch.setattr(eval_mod, "run_eval", _fake_run_eval_perfect)
+
+        args = _make_args(
+            adapter=str(tmp_adapter),
+            suite=[str(tmp_suite), str(tmp_suite_b)],
+            json=True,
+            in_container=True,
+        )
+        cmd_eval(args)
+        data = json.loads(capsys.readouterr().out)
+        assert set(data["suites"]) == {"suite", "b"}
+        assert data["suites"]["suite"] == data["suites"]["b"]
+
+
+class TestSuiteNaming:
+    """Suite names derive from the path stem; collisions exit 1 with a hint."""
+
+    def test_name_derives_from_path_stem(
+        self, tmp_adapter: Path, tmp_suite: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        named = eval_mod._resolve_named_suites([str(tmp_suite)])
+        assert list(named) == ["suite"]
+        assert named["suite"] == [tmp_suite]
+
+    def test_two_entries_with_the_same_stem_collide(
+        self, tmp_adapter: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        d1 = tmp_path / "one"
+        d2 = tmp_path / "two"
+        d1.mkdir()
+        d2.mkdir()
+        f1 = d1 / "suite.jsonl"
+        f2 = d2 / "suite.jsonl"
+        for f in (f1, f2):
+            f.write_text('{"task": "t", "input": "x", "expected_output": "y"}\n', encoding="utf-8")
+
+        def _must_not_launch(*args: Any, **kwargs: Any) -> int:
+            raise AssertionError("container.launch called despite a suite-name collision")
+
+        monkeypatch.setattr(eval_mod.container, "launch", _must_not_launch)
+
+        args = _make_args(adapter=str(tmp_adapter), suite=[str(f1), str(f2)], in_container=False)
+        with pytest.raises(CliError) as exc_info:
+            cmd_eval(args)
+        err = exc_info.value
+        assert err.code == 1
+        assert "collision" in err.message.lower()
+        assert err.remediation
+
+
+class TestSuiteSchemaDetection:
+    """Every suite kind (chat/task/instruction/structured/toolcall) validates via detect_schema."""
+
+    def test_chat_suite_is_accepted(
+        self, tmp_adapter: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        suite = tmp_path / "chatsuite.jsonl"
+        suite.write_text(
+            json.dumps(
+                {
+                    "messages": [
+                        {"role": "user", "content": "hi"},
+                        {"role": "assistant", "content": "hello"},
+                    ]
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(eval_mod, "run_eval", _fake_run_eval_perfect)
+        args = _make_args(adapter=str(tmp_adapter), suite=str(suite), in_container=True)
+        rc = cmd_eval(args)
+        assert rc in (None, 0)
+
+    def test_instruction_suite_is_accepted(
+        self, tmp_adapter: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        suite = tmp_path / "instr.jsonl"
+        suite.write_text(
+            json.dumps(
+                {
+                    "task": "t",
+                    "input": "x",
+                    "expected_output": "y",
+                    "constraints": [{"max_words": 5}],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(eval_mod, "run_eval", _fake_run_eval_perfect)
+        args = _make_args(adapter=str(tmp_adapter), suite=str(suite), in_container=True)
+        rc = cmd_eval(args)
+        assert rc in (None, 0)
+
+    def test_structured_suite_is_accepted(
+        self, tmp_adapter: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        suite = tmp_path / "structured.jsonl"
+        suite.write_text(
+            json.dumps({"task": "t", "input": "x", "json_schema": {"type": "object"}}) + "\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(eval_mod, "run_eval", _fake_run_eval_perfect)
+        args = _make_args(adapter=str(tmp_adapter), suite=str(suite), in_container=True)
+        rc = cmd_eval(args)
+        assert rc in (None, 0)
+
+    def test_toolcall_suite_is_accepted(
+        self, tmp_adapter: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        suite = tmp_path / "toolcall.jsonl"
+        suite.write_text(
+            json.dumps(
+                {
+                    "task": "t",
+                    "input": "x",
+                    "expected_tool_call": {"name": "search", "arguments": {"q": "x"}},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(eval_mod, "run_eval", _fake_run_eval_perfect)
+        args = _make_args(adapter=str(tmp_adapter), suite=str(suite), in_container=True)
+        rc = cmd_eval(args)
+        assert rc in (None, 0)
+
+    def test_unrecognisable_suite_raises_before_launch(
+        self, tmp_adapter: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        suite = tmp_path / "mystery.jsonl"
+        suite.write_text(json.dumps({"foo": "bar"}) + "\n", encoding="utf-8")
+
+        def _must_not_launch(*args: Any, **kwargs: Any) -> int:
+            raise AssertionError("container.launch called for an undetectable suite schema")
+
+        monkeypatch.setattr(eval_mod.container, "launch", _must_not_launch)
+        args = _make_args(adapter=str(tmp_adapter), suite=str(suite), in_container=False)
+        with pytest.raises(CliError) as exc_info:
+            cmd_eval(args)
+        assert exc_info.value.code == 1
+
+
+class TestTrainEvalOverlapRefusal:
+    """--train-dataset (or training_metadata.json's dataset.path) gates the launch."""
+
+    def test_explicit_train_dataset_overlap_exits_1_before_launch(
+        self,
+        tmp_adapter: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        train = tmp_path / "train.jsonl"
+        train.write_text(
+            '{"task": "reverse", "input": "abc", "expected_output": "cba"}\n',
+            encoding="utf-8",
+        )
+        suite = tmp_path / "eval.jsonl"
+        suite.write_text(
+            '{"task": "reverse", "input": "abc", "expected_output": "cba"}\n',
+            encoding="utf-8",
+        )
+
+        launched: list[Any] = []
+
+        def _must_not_launch(*args: Any, **kwargs: Any) -> int:
+            launched.append(args)
+            raise AssertionError("container.launch called despite a train/eval overlap")
+
+        monkeypatch.setattr(eval_mod.container, "launch", _must_not_launch)
+
+        args = _make_args(
+            adapter=str(tmp_adapter),
+            suite=str(suite),
+            train_dataset=str(train),
+            in_container=False,
+        )
+        with pytest.raises(CliError) as exc_info:
+            cmd_eval(args)
+        err = exc_info.value
+        assert err.code == 1
+        assert not launched
+        assert "train.jsonl:1" in err.remediation
+        assert "eval.jsonl:1" in err.remediation
+
+    def test_no_overlap_proceeds_to_launch(
+        self,
+        tmp_adapter: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        train = tmp_path / "train.jsonl"
+        train.write_text(
+            '{"task": "reverse", "input": "abc", "expected_output": "cba"}\n',
+            encoding="utf-8",
+        )
+        suite = tmp_path / "eval.jsonl"
+        suite.write_text(
+            '{"task": "upper", "input": "hello", "expected_output": "HELLO"}\n',
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(eval_mod.container, "launch", lambda *a, **kw: dict(_FAKE_EVAL_SUMMARY))
+
+        args = _make_args(
+            adapter=str(tmp_adapter),
+            suite=str(suite),
+            train_dataset=str(train),
+            in_container=False,
+        )
+        rc = cmd_eval(args)
+        assert rc in (None, 0)
+
+    def test_training_metadata_dataset_used_when_no_train_dataset_flag(
+        self,
+        tmp_adapter: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import sloth.tune.metadata as metadata_mod
+
+        train = tmp_path / "train.jsonl"
+        train.write_text(
+            '{"task": "reverse", "input": "abc", "expected_output": "cba"}\n',
+            encoding="utf-8",
+        )
+        metadata_mod.write_metadata(
+            tmp_adapter,
+            model="unsloth/Qwen3-4B",
+            method="lora",
+            dataset_path=train,
+            hyperparameters={},
+            timestamp="2026-01-01T00:00:00+00:00",
+        )
+        suite = tmp_path / "eval.jsonl"
+        suite.write_text(
+            '{"task": "reverse", "input": "abc", "expected_output": "cba"}\n',
+            encoding="utf-8",
+        )
+
+        def _must_not_launch(*args: Any, **kwargs: Any) -> int:
+            raise AssertionError("container.launch called despite a train/eval overlap")
+
+        monkeypatch.setattr(eval_mod.container, "launch", _must_not_launch)
+
+        args = _make_args(adapter=str(tmp_adapter), suite=str(suite), in_container=False)
+        with pytest.raises(CliError) as exc_info:
+            cmd_eval(args)
+        assert exc_info.value.code == 1
+
+    def test_train_dataset_flag_overrides_training_metadata(
+        self,
+        tmp_adapter: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An explicit --train-dataset wins even when training_metadata.json points
+        elsewhere (and that elsewhere would have overlapped)."""
+        import sloth.tune.metadata as metadata_mod
+
+        metadata_train = tmp_path / "metadata_train.jsonl"
+        metadata_train.write_text(
+            '{"task": "reverse", "input": "abc", "expected_output": "cba"}\n',
+            encoding="utf-8",
+        )
+        metadata_mod.write_metadata(
+            tmp_adapter,
+            model="unsloth/Qwen3-4B",
+            method="lora",
+            dataset_path=metadata_train,
+            hyperparameters={},
+            timestamp="2026-01-01T00:00:00+00:00",
+        )
+
+        explicit_train = tmp_path / "explicit_train.jsonl"
+        explicit_train.write_text(
+            '{"task": "unrelated", "input": "zz", "expected_output": "qq"}\n',
+            encoding="utf-8",
+        )
+        suite = tmp_path / "eval.jsonl"
+        suite.write_text(
+            '{"task": "reverse", "input": "abc", "expected_output": "cba"}\n',
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(eval_mod.container, "launch", lambda *a, **kw: dict(_FAKE_EVAL_SUMMARY))
+
+        args = _make_args(
+            adapter=str(tmp_adapter),
+            suite=str(suite),
+            train_dataset=str(explicit_train),
+            in_container=False,
+        )
+        rc = cmd_eval(args)
+        assert rc in (None, 0)  # no overlap against the *explicit* train dataset
+
+    def test_neither_train_dataset_nor_metadata_skips_with_diagnostic(
+        self,
+        tmp_adapter: Path,
+        tmp_suite: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.setattr(eval_mod.container, "launch", lambda *a, **kw: dict(_FAKE_EVAL_SUMMARY))
+        args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), in_container=False)
+        rc = cmd_eval(args)
+        assert rc in (None, 0)
+        err = capsys.readouterr().err
+        assert "skipping" in err.lower()
+
+
+class TestPerplexityAndToolCallFamilyFlags:
+    """--perplexity / --tool-call-family register, forward in-container, and reach the seam."""
+
+    def test_flags_parse_and_default(self) -> None:
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="command")
+        register(sub)
+        args = parser.parse_args(["eval", "--adapter", "/a", "--suite", "/b.jsonl"])
+        assert args.perplexity is False
+        assert args.tool_call_family is None
+
+        args2 = parser.parse_args(
+            [
+                "eval",
+                "--adapter",
+                "/a",
+                "--suite",
+                "/b.jsonl",
+                "--perplexity",
+                "--tool-call-family",
+                "qwen",
+            ]
+        )
+        assert args2.perplexity is True
+        assert args2.tool_call_family == "qwen"
+
+    def test_forwarded_into_container_argv(
+        self,
+        tmp_adapter: Path,
+        tmp_suite: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        def _capture_launch(sloth_args: list[str], **kwargs: Any) -> dict[str, Any]:
+            captured["sloth_args"] = list(sloth_args)
+            return dict(_FAKE_EVAL_SUMMARY)
+
+        monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
+
+        args = _make_args(
+            adapter=str(tmp_adapter),
+            suite=str(tmp_suite),
+            perplexity=True,
+            tool_call_family="qwen",
+            in_container=False,
+        )
+        cmd_eval(args)
+
+        forwarded = captured["sloth_args"]
+        assert "--perplexity" in forwarded
+        assert "--tool-call-family" in forwarded
+        assert forwarded[forwarded.index("--tool-call-family") + 1] == "qwen"
+
+    def test_omitted_when_not_set(
+        self,
+        tmp_adapter: Path,
+        tmp_suite: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        def _capture_launch(sloth_args: list[str], **kwargs: Any) -> dict[str, Any]:
+            captured["sloth_args"] = list(sloth_args)
+            return dict(_FAKE_EVAL_SUMMARY)
+
+        monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
+
+        args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), in_container=False)
+        cmd_eval(args)
+
+        forwarded = captured["sloth_args"]
+        assert "--perplexity" not in forwarded
+        assert "--tool-call-family" not in forwarded
+
+    def test_forwarded_to_seam_when_signature_accepts_them(
+        self,
+        tmp_adapter: Path,
+        tmp_suite: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        calls: list[dict[str, Any]] = []
+
+        def _rich_run_eval(
+            adapter_path: str,
+            *,
+            suite_paths: list[Path],
+            quant: str | None = None,
+            batch_size: int = 8,
+            perplexity: bool = False,
+            tool_call_family: str | None = None,
+        ) -> dict[str, Any]:
+            calls.append({"perplexity": perplexity, "tool_call_family": tool_call_family})
+            return _fake_run_eval_perfect(adapter_path, suite_paths=suite_paths)
+
+        monkeypatch.setattr(eval_mod, "run_eval", _rich_run_eval)
+
+        args = _make_args(
+            adapter=str(tmp_adapter),
+            suite=str(tmp_suite),
+            perplexity=True,
+            tool_call_family="qwen",
+            in_container=True,
+        )
+        rc = cmd_eval(args)
+        assert rc in (None, 0)
+        assert calls == [{"perplexity": True, "tool_call_family": "qwen"}]
+
+    def test_dropped_when_seam_signature_lacks_them(
+        self,
+        tmp_adapter: Path,
+        tmp_suite: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A seam with the older, narrower signature (no perplexity/tool_call_family
+        params, no **kwargs) is called without those keywords — no TypeError."""
+
+        def _narrow_run_eval(
+            adapter_path: str,
+            *,
+            suite_paths: list[Path],
+            quant: str | None = None,
+            batch_size: int = 8,
+        ) -> dict[str, Any]:
+            return _fake_run_eval_perfect(adapter_path, suite_paths=suite_paths)
+
+        monkeypatch.setattr(eval_mod, "run_eval", _narrow_run_eval)
+
+        args = _make_args(
+            adapter=str(tmp_adapter),
+            suite=str(tmp_suite),
+            perplexity=True,
+            tool_call_family="qwen",
+            in_container=True,
+        )
+        rc = cmd_eval(args)
+        assert rc in (None, 0)  # no TypeError: unexpected keyword argument
+
+
+class TestBatchSizeRecordedInResult:
+    """--batch-size is recorded in every written eval/<name>.json result."""
+
+    def test_batch_size_recorded_in_every_suite_file(
+        self,
+        tmp_adapter: Path,
+        tmp_suite: Path,
+        tmp_suite_b: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        payload_a = {"total": 2, "exact_match": 2, "exact_match_pct": 100.0, "results": []}
+        payload_b = {"total": 1, "exact_match": 0, "exact_match_pct": 0.0, "results": []}
+        monkeypatch.setattr(
+            eval_mod,
+            "run_eval",
+            _fake_run_eval_suites_keyed({"suite": payload_a, "b": payload_b}),
+        )
+
+        args = _make_args(
+            adapter=str(tmp_adapter),
+            suite=[str(tmp_suite), str(tmp_suite_b)],
+            batch_size=4,
+            in_container=True,
+        )
+        cmd_eval(args)
+
+        for name in ("suite", "b"):
+            record = json.loads((tmp_adapter / "eval" / f"{name}.json").read_text())
+            assert record["batch_size"] == 4
