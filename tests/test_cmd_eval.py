@@ -1174,36 +1174,6 @@ def test_directory_suite_validated_before_launch_on_malformed_file(
     assert "line 2" in err.message
 
 
-def test_directory_suite_all_valid_expands_and_launches(
-    tmp_adapter: Path,
-    tmp_suite_dir_valid: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A directory of valid *.jsonl files expands to one --suite flag per file,
-    sorted, and launches the container."""
-    captured: dict[str, Any] = {}
-
-    def _capture_launch(sloth_args: list[str], **kwargs: Any) -> int:
-        captured["sloth_args"] = list(sloth_args)
-        return dict(_FAKE_EVAL_SUMMARY)
-
-    monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
-
-    args = _make_args(
-        adapter=str(tmp_adapter), suite=[str(tmp_suite_dir_valid)], in_container=False
-    )
-    rc = cmd_eval(args)
-    assert rc in (None, 0)
-
-    forwarded = captured["sloth_args"]
-    suite_flags_idx = [i for i, tok in enumerate(forwarded) if tok == "--suite"]
-    assert len(suite_flags_idx) == 2, f"expected 2 --suite flags, forwarded={forwarded}"
-    suite_values = [forwarded[i + 1] for i in suite_flags_idx]
-    assert suite_values == sorted(suite_values), "directory files must be forwarded sorted"
-    assert str((tmp_suite_dir_valid / "a.jsonl").resolve()) in suite_values
-    assert str((tmp_suite_dir_valid / "b.jsonl").resolve()) in suite_values
-
-
 def test_single_jsonl_suite_still_works_unchanged(
     tmp_adapter: Path,
     tmp_suite: Path,
@@ -2506,3 +2476,166 @@ def test_run_eval_model_accepts_a_remote_hf_repo_id(tmp_path: Path, monkeypatch)
     assert result["quant_method"] is None
     assert not (tmp_path / "eval").exists()
     assert not (tmp_path / "eval.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Qodo r1 — a directory --suite keeps the name it was asked for
+# ---------------------------------------------------------------------------
+
+
+class TestDirectorySuiteKeepsItsRequestedName:
+    """A directory ``--suite`` is forwarded to the container AS THE DIRECTORY.
+
+    The host flattening it into files before launch made the container name one
+    suite per child file (``eval/a.json``, ``eval/b.json``) instead of the one
+    suite the caller asked for (``eval/<dirname>.json``). The original entries
+    are forwarded instead; the in-container run expands and names them exactly
+    as the host did.
+    """
+
+    def test_container_argv_carries_the_directory_entry(
+        self,
+        tmp_adapter: Path,
+        tmp_suite_dir_valid: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        def _capture_launch(sloth_args: list[str], **kwargs: Any) -> dict[str, Any]:
+            captured["sloth_args"] = list(sloth_args)
+            captured["kwargs"] = kwargs
+            return dict(_FAKE_EVAL_SUMMARY)
+
+        monkeypatch.setattr(eval_mod.container, "launch", _capture_launch)
+        args = _make_args(
+            adapter=str(tmp_adapter), suite=[str(tmp_suite_dir_valid)], in_container=False
+        )
+        assert cmd_eval(args) in (None, 0)
+
+        forwarded = captured["sloth_args"]
+        suite_values = [forwarded[i + 1] for i, tok in enumerate(forwarded) if tok == "--suite"]
+        assert suite_values == [str(tmp_suite_dir_valid.resolve())]
+        mounts = [host for host, _ in captured["kwargs"]["extra_mounts"]]
+        assert str(tmp_suite_dir_valid.resolve().parent) in mounts
+
+    def test_malformed_file_inside_the_directory_still_fails_before_launch(
+        self,
+        tmp_adapter: Path,
+        tmp_suite_dir_malformed: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Host-side validation of every file survives the argv change."""
+
+        def _must_not_launch(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("container.launch called despite a malformed suite file")
+
+        monkeypatch.setattr(eval_mod.container, "launch", _must_not_launch)
+        args = _make_args(
+            adapter=str(tmp_adapter), suite=[str(tmp_suite_dir_malformed)], in_container=False
+        )
+        with pytest.raises(CliError) as exc_info:
+            cmd_eval(args)
+        assert exc_info.value.code == 1
+        assert "z_bad.jsonl" in exc_info.value.message
+
+    def test_in_container_directory_suite_writes_one_named_result(
+        self,
+        tmp_adapter: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        suite_dir = tmp_path / "holdout"
+        suite_dir.mkdir()
+        (suite_dir / "a.jsonl").write_text(
+            '{"task": "reverse", "input": "abc", "expected_output": "cba"}\n', encoding="utf-8"
+        )
+        (suite_dir / "b.jsonl").write_text(
+            '{"task": "upper", "input": "hi", "expected_output": "HI"}\n', encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            eval_mod,
+            "run_eval",
+            lambda adapter_path, **kwargs: _fake_run_eval_perfect(
+                adapter_path, suite_paths=kwargs.get("suite_paths")
+            ),
+        )
+        args = _make_args(adapter=str(tmp_adapter), suite=[str(suite_dir)], in_container=True)
+        assert cmd_eval(args) in (None, 0)
+
+        written = sorted(p.name for p in (tmp_adapter / "eval").glob("*.json"))
+        assert written == ["holdout.json"]
+
+
+# ---------------------------------------------------------------------------
+# Qodo r7 — a hub training dataset never silently skips the overlap check
+# ---------------------------------------------------------------------------
+
+
+class TestHubTrainingDatasetOverlapDiagnostic:
+    def test_hub_dataset_without_train_dataset_flag_says_the_check_was_skipped(
+        self,
+        tmp_adapter: Path,
+        tmp_suite: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        import sloth.tune.metadata as metadata_mod
+
+        metadata_mod.write_metadata(
+            tmp_adapter,
+            model="unsloth/Qwen3-4B",
+            method="lora",
+            dataset_path="hf:org/corpus:train",
+            hyperparameters={},
+            timestamp="2026-01-01T00:00:00+00:00",
+        )
+        monkeypatch.setattr(eval_mod.container, "launch", lambda *a, **kw: dict(_FAKE_EVAL_SUMMARY))
+        args = _make_args(adapter=str(tmp_adapter), suite=str(tmp_suite), in_container=False)
+        assert cmd_eval(args) in (None, 0)
+
+        err = capsys.readouterr().err
+        assert "org/corpus" in err
+        assert "skipped" in err.lower()
+        assert "--train-dataset" in err
+
+    def test_holdout_train_path_is_preferred_over_dataset_path(
+        self,
+        tmp_adapter: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """r12: when the run split off a holdout, the rows actually trained on are
+        ``holdout.train_path`` — that is what the eval suite must not overlap."""
+        import sloth.tune.metadata as metadata_mod
+
+        full = tmp_path / "full.jsonl"
+        full.write_text(
+            '{"task": "unrelated", "input": "zz", "expected_output": "qq"}\n', encoding="utf-8"
+        )
+        train_split = tmp_path / "train_split.jsonl"
+        train_split.write_text(
+            '{"task": "reverse", "input": "abc", "expected_output": "cba"}\n', encoding="utf-8"
+        )
+        metadata_mod.write_metadata(
+            tmp_adapter,
+            model="unsloth/Qwen3-4B",
+            method="lora",
+            dataset_path=full,
+            hyperparameters={},
+            timestamp="2026-01-01T00:00:00+00:00",
+            holdout={"fraction": 0.1, "seed": 0, "train_path": str(train_split)},
+        )
+        suite = tmp_path / "eval.jsonl"
+        suite.write_text(
+            '{"task": "reverse", "input": "abc", "expected_output": "cba"}\n', encoding="utf-8"
+        )
+
+        def _must_not_launch(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("container.launch called despite a train/eval overlap")
+
+        monkeypatch.setattr(eval_mod.container, "launch", _must_not_launch)
+        args = _make_args(adapter=str(tmp_adapter), suite=str(suite), in_container=False)
+        with pytest.raises(CliError) as exc_info:
+            cmd_eval(args)
+        assert exc_info.value.code == 1
+        assert str(train_split) in exc_info.value.message

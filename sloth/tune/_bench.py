@@ -54,6 +54,7 @@ from typing import Any, Sequence
 
 from sloth.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 from sloth.cli._output import emit_diagnostic
+from sloth.tune.metadata import resolve_load_in_4bit
 
 #: The lm-evaluation-harness console script, as installed by the container's
 #: benchmark dep layer. Named (not a ``python -m`` invocation) so the composed
@@ -172,9 +173,13 @@ def resolve_adapter_target(adapter_dir: str | Path) -> tuple[str, bool]:
 
     Both come from the adapter's ``training_metadata.json`` (written by
     :func:`sloth.tune.metadata.write_metadata`): ``model`` names the base the
-    adapter was trained against, and ``hyperparameters.load_in_4bit`` says
-    whether it was a QLoRA run — which is exactly what decides whether
-    ``load_in_4bit=True`` is added to ``--model_args``.
+    adapter was trained against, and the *effective* 4-bit flag decides whether
+    ``load_in_4bit=True`` is added to ``--model_args``. That flag is
+    ``resolved.load_in_4bit`` when the record carries one, else
+    :func:`sloth.tune.metadata.resolve_load_in_4bit` of the recorded ``method``
+    and ``hyperparameters.load_in_4bit`` — a ``qlora`` run trains in 4-bit even
+    when the raw hyperparameter is ``false``, and benching it in full precision
+    would measure a model that was never trained.
 
     Falls back to ``adapter_config.json``'s ``base_model_name_or_path`` when the
     metadata file is missing or carries no ``model``, so an adapter produced
@@ -195,8 +200,17 @@ def resolve_adapter_target(adapter_dir: str | Path) -> tuple[str, bool]:
     if metadata is not None:
         base = metadata.get("model")
         hyperparameters = metadata.get("hyperparameters")
-        if isinstance(hyperparameters, dict):
-            load_in_4bit = hyperparameters.get("load_in_4bit")
+        # Training forces 4-bit for a `qlora` method, whatever the configured
+        # flag says, so the raw hyperparameter alone would bench a QLoRA adapter
+        # at the wrong precision. `resolved.load_in_4bit` (written since the
+        # fix) is the effective value and wins whenever it is present.
+        load_in_4bit = resolve_load_in_4bit(
+            str(metadata.get("method") or ""),
+            hyperparameters if isinstance(hyperparameters, dict) else None,
+        )
+        resolved = metadata.get("resolved")
+        if isinstance(resolved, dict) and "load_in_4bit" in resolved:
+            load_in_4bit = resolved["load_in_4bit"]
 
     if not isinstance(base, str) or not base:
         adapter_config = _read_json(directory / "adapter_config.json") or {}

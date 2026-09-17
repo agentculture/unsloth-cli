@@ -275,6 +275,42 @@ def sanitize_suite_name(suite: str | Path) -> str:
     return sanitized or "suite"
 
 
+def _canonical_path(value: Any) -> Any:
+    """Resolve one recorded suite path to an absolute path, or return it as-is."""
+    if not isinstance(value, str) or not value:
+        return value
+    return str(Path(value).resolve())
+
+
+def canonicalize_result_paths(record: dict[str, Any]) -> dict[str, Any]:
+    """Resolve every suite path *record* carries to an absolute path, in place.
+
+    A result file records which suite files it was scored over — ``files[].path``
+    (per-file entries), ``suite_paths`` (the legacy flat layout) and a bare
+    ``path`` (a single-file payload). ``sloth compare --base`` reads them back
+    to re-score the base model over the same rows, and it is generally run from
+    a different working directory than the eval was, so a relative path recorded
+    at score time would resolve to nothing (or, worse, to a different file).
+    Resolving at **write** time makes the record self-contained.
+    """
+    files = record.get("files")
+    if isinstance(files, list):
+        record["files"] = [
+            (
+                {**entry, "path": _canonical_path(entry["path"])}
+                if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+                else entry
+            )
+            for entry in files
+        ]
+    suite_paths = record.get("suite_paths")
+    if isinstance(suite_paths, list):
+        record["suite_paths"] = [_canonical_path(p) for p in suite_paths]
+    if "path" in record:
+        record["path"] = _canonical_path(record["path"])
+    return record
+
+
 def write_eval_json(
     directory: Path,
     suite_or_payload: str | Path | dict[str, Any],
@@ -309,6 +345,12 @@ def write_eval_json(
     *different* suite name writes a sibling file and leaves the first one
     untouched — each suite owns its own result file.
 
+    Both shapes record **absolute** suite paths: every ``files[].path``,
+    ``suite_paths`` entry and bare ``path`` is resolved at write time (see
+    :func:`canonicalize_result_paths`) so a later reader — ``sloth compare
+    --base``, which re-scores the base model over the same files from a
+    different working directory — finds them.
+
     The two shapes are told apart by whether *payload* was supplied: passing
     only two positional arguments is the legacy shape (the second argument is
     the result payload itself); passing three is the new shape (the second
@@ -324,8 +366,8 @@ def write_eval_json(
                 "write_eval_json(directory, payload, *, suite_paths=..., target=...) "
                 "requires payload to be a dict when called with two positional arguments"
             )
-        record = dict(legacy_payload)
-        record["suite_paths"] = [str(p) for p in suite_paths]
+        record = canonicalize_result_paths(dict(legacy_payload))
+        record["suite_paths"] = [_canonical_path(str(p)) for p in suite_paths]
         record["target"] = target
         record["written_at"] = when.isoformat()
         destination = directory / EVAL_JSON_NAME
@@ -333,7 +375,7 @@ def write_eval_json(
         return destination
 
     suite_name = sanitize_suite_name(suite_or_payload)
-    record = dict(payload)
+    record = canonicalize_result_paths(dict(payload))
     record["schema_version"] = SCHEMA_VERSION
     record["suite"] = suite_name
     record["batch_size"] = batch_size

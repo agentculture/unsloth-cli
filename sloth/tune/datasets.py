@@ -388,13 +388,33 @@ def _check_schema_required(schema: dict, line_no: int, path: str) -> None:
 
 
 def _check_schema_additional_properties(schema: dict, line_no: int, path: str) -> None:
-    """``"additionalProperties"`` must be a boolean in this subset."""
-    if "additionalProperties" in schema and not isinstance(schema["additionalProperties"], bool):
-        raise CliError(
-            code=EXIT_USER_ERROR,
-            message=f'line {line_no}: {path}["additionalProperties"] must be a boolean',
-            remediation='"additionalProperties" must be true or false.',
-        )
+    """``"additionalProperties"`` must be a boolean or a nested schema object.
+
+    This mirrors what :func:`sloth.tune.scorers.check_json_subset` actually
+    evaluates at scoring time: ``False`` forbids extra properties, ``True``
+    allows them, and a schema object validates every extra property against
+    it. A nested object recurses through the same subset check, so an
+    unsupported keyword inside it is still rejected here — before any GPU spend.
+    """
+    if "additionalProperties" not in schema:
+        return
+    additional = schema["additionalProperties"]
+    if isinstance(additional, bool):
+        return
+    if isinstance(additional, dict):
+        _validate_json_schema_subset(additional, line_no, f'{path}["additionalProperties"]')
+        return
+    raise CliError(
+        code=EXIT_USER_ERROR,
+        message=(
+            f'line {line_no}: {path}["additionalProperties"] must be a boolean '
+            f"or a schema object, got {type(additional).__name__}"
+        ),
+        remediation=(
+            '"additionalProperties" must be true, false, or a nested '
+            "JSON-Schema-subset object validating every extra property."
+        ),
+    )
 
 
 def _check_schema_enum(schema: dict, line_no: int, path: str) -> None:
@@ -867,6 +887,11 @@ def _chat_record_to_task_row(record: dict) -> dict:
     return {"task": "chat-holdout", "input": prompt, "expected_output": expected_output}
 
 
+#: Smallest dataset a holdout split can work on — one record cannot produce
+#: both a non-empty train set and a non-empty holdout set.
+_MIN_SPLIT_RECORDS = 2
+
+
 def split_holdout(
     path: str | os.PathLike,
     fraction: float,
@@ -902,8 +927,12 @@ def split_holdout(
     Raises
     ------
     CliError(code=1)
-        If *fraction* is not strictly between 0 and 1, or the source schema
-        cannot be detected.
+        If *fraction* is not strictly between 0 and 1, the source schema
+        cannot be detected, or the dataset holds fewer than
+        :data:`_MIN_SPLIT_RECORDS` records (a split cannot leave both sides
+        non-empty). The holdout count is otherwise clamped to
+        ``1..len(records) - 1``, so a rounding-to-zero fraction still yields
+        one holdout row.
     CliError(code=1|2)
         Propagated from :func:`validate_dataset` for a malformed or missing
         source file.
@@ -948,12 +977,29 @@ def split_holdout(
 
     records = validate_dataset(file_path, probe_schema)
 
+    if len(records) < _MIN_SPLIT_RECORDS:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=(
+                f"cannot split {file_path} into a train and holdout set: it has "
+                f"{len(records)} record(s), and a split needs at least "
+                f"{_MIN_SPLIT_RECORDS}"
+            ),
+            remediation=(
+                f"Add records until the dataset has at least {_MIN_SPLIT_RECORDS}, "
+                "or skip the holdout split and pass a separate eval suite."
+            ),
+        )
+
     indices = list(range(len(records)))
     # Deterministic dataset shuffling, not a security/cryptographic use of
     # randomness — reproducibility (same seed -> same split) is the goal.
     random.Random(seed).shuffle(indices)  # nosec B311  # NOSONAR
+    # Clamp to 1..len-1 so neither partition can come out empty: a fraction
+    # that rounds to 0 (tiny fraction / small dataset) still yields one holdout
+    # row, and one that rounds to len(records) still leaves one training row.
     holdout_count = round(len(records) * fraction)
-    holdout_count = max(0, min(holdout_count, len(records)))
+    holdout_count = max(1, min(holdout_count, len(records) - 1))
     holdout_index_set = set(indices[:holdout_count])
 
     if probe_schema == "chat":

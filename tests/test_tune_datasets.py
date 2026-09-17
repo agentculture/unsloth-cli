@@ -406,6 +406,51 @@ class TestSplitHoldout:
         with pytest.raises(CliError):
             split_holdout(path, fraction=0.0, seed=1)
 
+    # --- small-dataset guards (Qodo r1): neither side may come out empty ----
+
+    def test_single_record_dataset_raises(self, tmp_path: Path) -> None:
+        """One record cannot yield two non-empty partitions — a user error."""
+        path = write_jsonl(tmp_path, self._task_records(1))
+        with pytest.raises(CliError) as exc_info:
+            split_holdout(path, fraction=0.5, seed=1)
+        assert exc_info.value.code == 1
+        assert "2" in exc_info.value.message
+        assert exc_info.value.remediation
+
+    def test_two_records_tiny_fraction_still_splits(self, tmp_path: Path) -> None:
+        """A fraction that rounds to 0 is clamped up to a one-record holdout."""
+        path = write_jsonl(tmp_path, self._task_records(2))
+        result = split_holdout(path, fraction=0.01, seed=1)
+        assert result["holdout_count"] == 1
+        assert result["train_count"] == 1
+
+    def test_two_records_huge_fraction_still_splits(self, tmp_path: Path) -> None:
+        """A fraction that rounds to len(records) is clamped down to len-1."""
+        path = write_jsonl(tmp_path, self._task_records(2))
+        result = split_holdout(path, fraction=0.99, seed=1)
+        assert result["holdout_count"] == 1
+        assert result["train_count"] == 1
+
+    def test_tiny_fraction_on_larger_dataset_keeps_one_holdout(self, tmp_path: Path) -> None:
+        path = write_jsonl(tmp_path, self._task_records(10))
+        result = split_holdout(path, fraction=0.01, seed=1)
+        assert result["holdout_count"] == 1
+        assert result["train_count"] == 9
+
+    def test_huge_fraction_on_larger_dataset_keeps_one_train(self, tmp_path: Path) -> None:
+        path = write_jsonl(tmp_path, self._task_records(10))
+        result = split_holdout(path, fraction=0.99, seed=1)
+        assert result["holdout_count"] == 9
+        assert result["train_count"] == 1
+
+    def test_both_partitions_written_non_empty(self, tmp_path: Path) -> None:
+        path = write_jsonl(tmp_path, self._task_records(2))
+        result = split_holdout(path, fraction=0.01, seed=1)
+        train_text = Path(result["train_path"]).read_text(encoding="utf-8").strip()
+        holdout_text = Path(result["holdout_path"]).read_text(encoding="utf-8").strip()
+        assert train_text
+        assert holdout_text
+
 
 # ---------------------------------------------------------------------------
 # overlap_check — cross-schema duplicate detection between train and suites
@@ -630,6 +675,66 @@ class TestStructuredSchema:
         path = write_jsonl(tmp_path, [record])
         with pytest.raises(CliError):
             validate_dataset(path, "structured")
+
+    # --- additionalProperties as a nested schema (Qodo r2) -----------------
+
+    def test_additional_properties_schema_object_accepted(self, tmp_path: Path) -> None:
+        """A nested schema object is valid, matching scorers.check_json_subset."""
+        record = {
+            "task": "t",
+            "input": "i",
+            "json_schema": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "additionalProperties": {"type": "string"},
+            },
+        }
+        path = write_jsonl(tmp_path, [record])
+        assert validate_dataset(path, "structured") == [record]
+
+    def test_additional_properties_nested_schema_is_validated(self, tmp_path: Path) -> None:
+        """The nested schema recurses — an unsupported keyword inside it is rejected."""
+        record = {
+            "task": "t",
+            "input": "i",
+            "json_schema": {
+                "type": "object",
+                "additionalProperties": {"type": "string", "pattern": "^a"},
+            },
+        }
+        path = write_jsonl(tmp_path, [record])
+        with pytest.raises(CliError) as exc_info:
+            validate_dataset(path, "structured")
+        assert "pattern" in exc_info.value.message
+
+    def test_additional_properties_deeply_nested_schema_accepted(self, tmp_path: Path) -> None:
+        record = {
+            "task": "t",
+            "input": "i",
+            "json_schema": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {"id": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            },
+        }
+        path = write_jsonl(tmp_path, [record])
+        assert validate_dataset(path, "structured") == [record]
+
+    def test_additional_properties_wrong_type_rejected(self, tmp_path: Path) -> None:
+        record = {
+            "task": "t",
+            "input": "i",
+            "json_schema": {"type": "object", "additionalProperties": "nope"},
+        }
+        path = write_jsonl(tmp_path, [record])
+        with pytest.raises(CliError) as exc_info:
+            validate_dataset(path, "structured")
+        assert "additionalProperties" in exc_info.value.message
+        assert exc_info.value.remediation
 
 
 # ---------------------------------------------------------------------------

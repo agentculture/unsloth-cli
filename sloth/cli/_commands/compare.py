@@ -16,9 +16,13 @@ Two modes:
     for, then reports per-suite, per-metric deltas and checks them against the
     ``[eval.thresholds]`` gate. The two models are evaluated in **two separate,
     sequential container invocations** — the adapter first, the base second —
-    so the two are never resident on the GPU at the same time. The base run's
-    results land under ``<adapter-dir>/eval-base/<suite>.json`` (via ``sloth
-    eval --results-dir``), leaving the adapter's own ``eval/`` untouched.
+    so the two are never resident on the GPU at the same time. Neither run
+    touches the adapter's own ``eval/``: it is the record the suite list comes
+    from. Both write through ``sloth eval --results-dir`` into a sibling
+    directory of their own — the adapter's re-eval to
+    ``<adapter-dir>/eval-compare/<suite>.json``, the base's to
+    ``<adapter-dir>/eval-base/<suite>.json`` — each emptied of stale ``*.json``
+    immediately before its run.
 
 This is a **global** verb (a sibling of ``train``/``eval``/``export``), not
 nested under a noun.
@@ -36,6 +40,7 @@ from sloth.cli._errors import EXIT_USER_ERROR, CliError
 from sloth.cli._output import emit_result
 from sloth.tune import container
 from sloth.tune.config import ThresholdsConfig, load_config
+from sloth.tune.metrics import EVAL_JSON_DIR
 from sloth.tune.registry import resolve_target
 from sloth.tune.summary import build_eval_summary, build_summary, read_eval
 
@@ -142,6 +147,31 @@ def _eval_deltas(summary_a: dict[str, Any], summary_b: dict[str, Any]) -> dict[s
     return {"eval": {"a": proj_a, "b": proj_b, "suites": suite_deltas}}
 
 
+def _dataset_identity(dataset: dict[str, Any] | None) -> Any:
+    """Return a normalized identity for a metadata ``dataset`` record.
+
+    Two runs' datasets are "the same" when their identities compare equal:
+
+    * a **local** file is identified by its ``sha256`` — the digest
+      :func:`sloth.tune.metadata.write_metadata` embedded;
+    * a **hub** dataset (``dataset.hf_id`` present, or ``dataset.source ==
+      "hf"``) carries no digest at all, so it is identified by the
+      ``(hf_id, split, revision)`` tuple that determines which rows
+      ``load_dataset`` returns. Comparing ``sha256`` alone read every pair of
+      hub datasets as identical (``None == None``), so a run that switched
+      split or revision reported no dataset delta.
+
+    Anything else (a record with neither) falls back to the record itself, so
+    two differing shapes still compare unequal rather than silently matching.
+    """
+    ds = dataset or {}
+    if ds.get("hf_id") or ds.get("source") == "hf":
+        return ("hf", ds.get("hf_id"), ds.get("split"), ds.get("revision"))
+    if ds.get("sha256") is not None:
+        return ("sha256", ds.get("sha256"))
+    return ("raw", sorted((str(k), str(v)) for k, v in ds.items()))
+
+
 def _config_deltas(meta_a: dict[str, Any] | None, meta_b: dict[str, Any] | None) -> dict[str, Any]:
     """Return ``{key: {"a": val, "b": val}}`` for every top-level, dataset, or
     hyperparameter key that differs between the two metadata dicts.
@@ -149,6 +179,9 @@ def _config_deltas(meta_a: dict[str, Any] | None, meta_b: dict[str, Any] | None)
     A key absent on one side compares against ``None``. Missing metadata on
     either side (``None``) is treated as an empty record, so a delta report is
     still produced (naming what *is* known) rather than raised as an error.
+    The ``dataset`` key is compared on a normalized identity
+    (:func:`_dataset_identity`) so a changed hub split/revision is reported
+    just like a changed local-file digest.
     """
     a_top = meta_a or {}
     b_top = meta_b or {}
@@ -160,7 +193,7 @@ def _config_deltas(meta_a: dict[str, Any] | None, meta_b: dict[str, Any] | None)
 
     a_ds = (meta_a or {}).get("dataset") or {}
     b_ds = (meta_b or {}).get("dataset") or {}
-    if a_ds.get("sha256") != b_ds.get("sha256"):
+    if _dataset_identity(a_ds) != _dataset_identity(b_ds):
         deltas["dataset"] = {"a": a_ds, "b": b_ds}
 
     return deltas
@@ -173,6 +206,12 @@ def _config_deltas(meta_a: dict[str, Any] | None, meta_b: dict[str, Any] | None)
 #: Directory (under the adapter) the base model's per-suite results are written
 #: to, so they never collide with the adapter's own ``eval/``.
 BASE_EVAL_DIR = "eval-base"
+
+#: Directory (under the adapter) this comparison's ADAPTER re-eval is written
+#: to. The adapter's own ``eval/`` is the suite list the comparison is built
+#: from — overwriting it with the re-run would destroy the record the next
+#: comparison reads (and lose results scored with other settings).
+ADAPTER_EVAL_DIR = "eval-compare"
 
 #: The accuracy metric a regression-tagged suite is gated on (percentage points).
 _ACCURACY_KEY = "exact_match_pct"
@@ -221,6 +260,41 @@ def _suite_files(payload: dict[str, Any]) -> list[str]:
     return [path] if isinstance(path, str) and path else []
 
 
+def _resolve_recorded_suite(raw: str, adapter_dir: Path) -> str:
+    """Return the absolute path of a suite path recorded in an eval result file.
+
+    New result files record canonical absolute paths (see
+    :func:`sloth.tune.metrics.canonicalize_result_paths`), which resolve to
+    themselves. A **legacy** file may hold a path relative to whatever directory
+    the eval was run from; it is looked for next to the result file
+    (``<adapter>/eval/``), then under the adapter directory, then against the
+    current working directory.
+
+    Raises ``CliError(code=1)`` when nothing exists at any candidate: mounting a
+    nonexistent path into the container would fail obscurely an hour later,
+    whereas re-running ``sloth eval`` re-records the path canonically.
+    """
+    path = Path(raw)
+    candidates = (
+        [path]
+        if path.is_absolute()
+        else [adapter_dir / EVAL_JSON_DIR / raw, adapter_dir / raw, Path.cwd() / raw]
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate.resolve())
+    raise CliError(
+        code=EXIT_USER_ERROR,
+        message=f"a recorded eval suite file no longer exists: {raw}",
+        remediation=(
+            f"The eval results under {adapter_dir} name a suite file that cannot be found "
+            f"(looked in {', '.join(str(c) for c in candidates)}). Re-run "
+            f"`sloth eval --adapter {adapter_dir} --suite <suite.jsonl>` so the result "
+            "files record the suite paths as they exist now, then compare again."
+        ),
+    )
+
+
 def _adapter_suites(adapter_dir: Path) -> tuple[list[str], int | None]:
     """Return ``(suite files, batch size)`` describing what the adapter was scored on.
 
@@ -229,8 +303,12 @@ def _adapter_suites(adapter_dir: Path) -> tuple[list[str], int | None]:
     so both sides see exactly the same rows. The recorded ``batch_size`` is
     reused for both runs so the latency comparison is apples-to-apples.
 
-    Raises ``CliError(code=1)`` when the adapter has no eval results, or when
-    none of them record which files they were scored over.
+    Every recorded path is resolved to an absolute, existing file
+    (:func:`_resolve_recorded_suite`) before it is handed to a container mount.
+
+    Raises ``CliError(code=1)`` when the adapter has no eval results, when none
+    of them record which files they were scored over, or when a recorded file
+    no longer exists.
     """
     suites = read_eval(adapter_dir)
     if not suites:
@@ -247,7 +325,8 @@ def _adapter_suites(adapter_dir: Path) -> tuple[list[str], int | None]:
     files: list[str] = []
     batch_size: int | None = None
     for payload in suites.values():
-        for path in _suite_files(payload):
+        for raw in _suite_files(payload):
+            path = _resolve_recorded_suite(raw, adapter_dir)
             if path not in files:
                 files.append(path)
         recorded = payload.get("batch_size")
@@ -265,8 +344,24 @@ def _adapter_suites(adapter_dir: Path) -> tuple[list[str], int | None]:
     return files, batch_size
 
 
+def _clear_results_dir(results_dir: Path) -> None:
+    """Remove every ``*.json`` under *results_dir* before a run writes into it.
+
+    The report must describe **this** invocation only. A suite that was scored
+    by an earlier comparison (different suites, different base model, different
+    batch size) and is not re-scored now would otherwise still be read back and
+    silently gated against the fresh other side. Unremovable files are left
+    alone — the run that follows overwrites what it rewrites anyway.
+    """
+    for stale in results_dir.glob("*.json"):
+        try:
+            stale.unlink()
+        except OSError:  # pragma: no cover - defensive; the writability check precedes this
+            pass
+
+
 def _ensure_writable_results_dir(base_dir: Path) -> None:
-    """Create ``<adapter>/eval-base/`` AS THE HOST USER and require it writable.
+    """Create a results directory AS THE HOST USER and require it writable.
 
     Docker creates a bind-mounted host path that does not exist yet as *root*,
     and the container runs as the host uid, so its writer would get EACCES on
@@ -286,6 +381,20 @@ def _ensure_writable_results_dir(base_dir: Path) -> None:
                 "then re-run."
             ),
         )
+
+
+def _resolve_base_reference(base: str) -> str:
+    """Return what ``--base`` should be forwarded to the container as.
+
+    A **local** path is resolved to an absolute one: the container runs with a
+    different working directory than the host, so a relative ``--base ./base``
+    would resolve inside the container to something else (or to nothing), and
+    the identity mount is computed from the same path. A **Hugging Face repo
+    id** (nothing local answers to that name) is passed through verbatim —
+    resolving it would turn ``org/name`` into a nonexistent local path.
+    """
+    path = Path(base)
+    return str(path.resolve()) if path.exists() else base
 
 
 def _launch_eval(
@@ -522,7 +631,8 @@ def _render_base_text(report: dict[str, Any]) -> str:
 def _cmd_compare_base(args: argparse.Namespace) -> int:
     """Handler for ``sloth compare --base <hf-id-or-dir> <adapter-dir>``.
 
-    Two sequential container invocations — the adapter, then the base — then a
+    Two sequential container invocations — the adapter (into ``eval-compare/``),
+    then the base (into ``eval-base/``), leaving ``eval/`` untouched — then a
     per-suite, per-metric delta report gated on ``[eval.thresholds]``. The
     report is emitted on stdout **before** any threshold failure is raised, so
     ``--json`` consumers get the numbers and the applied thresholds even on the
@@ -541,47 +651,60 @@ def _cmd_compare_base(args: argparse.Namespace) -> int:
 
     adapter_dir = resolve_target(args.a, args.runs_root)
     thresholds, source = _resolve_thresholds(getattr(args, "config", None))
+    base_ref = _resolve_base_reference(args.base)
     suite_files, batch_size = _adapter_suites(adapter_dir)
     base_dir = adapter_dir / BASE_EVAL_DIR
+    compare_dir = adapter_dir / ADAPTER_EVAL_DIR
+    # base_dir first: a leftover root-owned eval-base/ is the r15 trap, and its
+    # message is the one that names the directory to remove.
     _ensure_writable_results_dir(base_dir)
+    _ensure_writable_results_dir(compare_dir)
 
-    # Sequential, one model at a time: the adapter is re-scored first (its
-    # results stay under <adapter>/eval/), then the base (under eval-base/).
-    # A failure on the second run leaves the first run's results on disk.
+    # Sequential, one model at a time: the adapter is re-scored first (into
+    # eval-compare/, leaving the eval/ record this comparison's suite list came
+    # from untouched), then the base (into eval-base/). Each directory is
+    # emptied of *.json immediately before its run, so only this invocation's
+    # artifacts are read back. A failure on the second run leaves the first
+    # run's results on disk.
+    _clear_results_dir(compare_dir)
     _launch_eval(
         "--adapter",
         str(adapter_dir.resolve()),
         suite_files,
-        results_dir=None,
+        results_dir=compare_dir,
         batch_size=batch_size,
         workdir=adapter_dir.resolve(),
     )
     # Created as the host user (and checked writable) before the adapter run —
     # see _ensure_writable_results_dir.
+    _clear_results_dir(base_dir)
     _launch_eval(
         "--model",
-        args.base,
+        base_ref,
         suite_files,
         results_dir=base_dir,
         batch_size=batch_size,
         workdir=adapter_dir.resolve(),
     )
 
-    eval_b = build_eval_summary(adapter_dir) or {}
+    eval_b = build_eval_summary(adapter_dir, subdir=ADAPTER_EVAL_DIR) or {}
     eval_a = build_eval_summary(adapter_dir, subdir=BASE_EVAL_DIR) or {}
     if not (eval_a.get("suites") or {}):
         raise CliError(
             code=EXIT_USER_ERROR,
-            message=f"the base evaluation of {args.base} produced no results under {base_dir}",
+            message=f"the base evaluation of {base_ref} produced no results under {base_dir}",
             remediation=(
                 "The second container run wrote nothing readable (check its stderr above "
                 "for 'could not write' notes or a load error); a compare with no base side "
                 "cannot pass. Re-run, or evaluate the base with "
-                f"`sloth eval --model {args.base} --results-dir {base_dir} ...` first."
+                f"`sloth eval --model {base_ref} --results-dir {base_dir} ...` first."
             ),
         )
-    summary_a = {"model": args.base, "output_dir": str(base_dir), "eval": eval_a or None}
+    summary_a = {"model": base_ref, "output_dir": str(base_dir), "eval": eval_a or None}
     summary_b = build_summary(adapter_dir)
+    # The adapter side of the report is THIS comparison's re-eval, not whatever
+    # <adapter>/eval/ happens to hold from an older run.
+    summary_b["eval"] = eval_b or None
 
     suites_a = eval_a.get("suites") or {}
     suites_b = eval_b.get("suites") or {}
@@ -695,8 +818,9 @@ def register(sub: argparse._SubParsersAction) -> None:
         help=(
             "Compare <a> (an adapter directory) against this base model — a Hugging "
             "Face repo id or a local model directory — on every suite the adapter "
-            "already has results for. Two sequential container runs; the base "
-            "model's results land under <adapter>/eval-base/."
+            "already has results for. Two sequential container runs; the adapter's "
+            "re-eval lands under <adapter>/eval-compare/ and the base model's under "
+            "<adapter>/eval-base/, leaving <adapter>/eval/ untouched."
         ),
     )
     p.add_argument(

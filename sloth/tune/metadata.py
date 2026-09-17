@@ -79,15 +79,38 @@ _DEFAULT_HF_SPLIT = "train"
 _DEFAULT_HF_REVISION = "main"
 
 
+#: ``dataset.source`` values. A hub dataset carries no ``dataset.path``, so a
+#: consumer keying off the path alone (the eval-side train/eval overlap check)
+#: silently skipped hub runs; the field states the dataset's kind outright.
+HF_DATASET_SOURCE = "hf"
+FILE_DATASET_SOURCE = "file"
+
+
 def _hf_dataset_record(dataset_spec: str, *, hf_revision: str | None) -> dict[str, Any]:
-    """Return the ``{"hf_id", "split", "revision"}`` record for a ``hf:`` spec."""
+    """Return the ``{"hf_id", "split", "revision", "source"}`` record for a ``hf:`` spec."""
     body = dataset_spec[len(_HF_DATASET_PREFIX) :]
     hf_id, _, split = body.partition(":")
     return {
         "hf_id": hf_id,
         "split": split or _DEFAULT_HF_SPLIT,
         "revision": hf_revision or _DEFAULT_HF_REVISION,
+        "source": HF_DATASET_SOURCE,
     }
+
+
+def resolve_load_in_4bit(method: str, hyperparameters: dict[str, Any] | None) -> bool:
+    """Return the *effective* 4-bit flag for a run.
+
+    ``hyperparameters["load_in_4bit"]`` is the raw config value; training forces
+    4-bit whenever ``method == "qlora"``, so the raw value alone understates the
+    precision a QLoRA adapter was trained at (and a downstream benchmark reading
+    it would load the adapter at the wrong precision).
+    """
+    if str(method).lower() == "qlora":
+        return True
+    if isinstance(hyperparameters, dict):
+        return bool(hyperparameters.get("load_in_4bit"))
+    return False
 
 
 #: Keys a ``log_history`` entry may use for the *training* loss. ``"loss"`` is
@@ -173,9 +196,14 @@ def write_metadata(
         count are computed and embedded in the metadata), or a
         ``"hf:<org>/<name>[:split]"`` string naming a Hugging Face Hub dataset
         — recorded instead as ``{"hf_id", "split", "revision"}`` (no sha256:
-        the dataset is not a fixed local file).
+        the dataset is not a fixed local file). Either record also carries
+        ``source`` (``"file"`` or ``"hf"``) so a reader can tell the two apart
+        without inferring it from which keys are present.
     hyperparameters:
-        Mapping of training hyperparameters (rank, lora_alpha, epochs, …).
+        Mapping of training hyperparameters (rank, lora_alpha, epochs, …). The
+        record additionally carries ``resolved.load_in_4bit`` — the *effective*
+        precision (see :func:`resolve_load_in_4bit`), which a ``qlora`` run
+        forces on regardless of the configured flag.
     timestamp:
         ISO-8601 string to stamp the record.  When ``None`` (the default) the
         current UTC time is used.  Pass an explicit value in tests for a
@@ -213,6 +241,7 @@ def write_metadata(
             "path": dataset_str,
             "sha256": sha256,
             "line_count": line_count,
+            "source": FILE_DATASET_SOURCE,
         }
 
     if timestamp is None:
@@ -223,6 +252,7 @@ def write_metadata(
         "method": method,
         "dataset": dataset_record,
         "hyperparameters": hyperparameters,
+        "resolved": {"load_in_4bit": resolve_load_in_4bit(method, hyperparameters)},
         "timestamp": timestamp,
     }
     if log_history is not None:
